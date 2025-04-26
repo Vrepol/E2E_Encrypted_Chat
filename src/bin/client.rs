@@ -141,10 +141,10 @@ async fn main() -> Result<()> {
                     );
 
                     // 第二行：└─$ body
-                    let msg_line = Span::styled(format!("└─∅ {}", body)
+                    let msg_line = Span::styled(format!("└─⁂ {}", body)
                         , Style::default()
                             .fg(name_color)
-                            .add_modifier(Modifier::DIM));
+                            .add_modifier(Modifier::BOLD));
 
                     // 用两个 Spans 构造一个 ListItem（即两行）
                     ListItem::new(vec![
