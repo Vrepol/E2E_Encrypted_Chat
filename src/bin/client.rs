@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     }
 
     // ——连接服务器——
-    let stream = match TcpStream::connect("100.89.77.120:6655").await {
+    let stream = match TcpStream::connect("100.97.92.19:6655").await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("连接服务器失败: {e}. 按回车退出 …");
@@ -127,13 +127,29 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = messages
                 .iter()
                 .map(|raw| {
-                    // 尝试提取 "[name] ..."
+                    // 提取用户名和消息体
                     let (name, body) = parse_name_body(raw);
+                    // 根据是不是自己决定颜色
                     let name_color = if name == username { Color::Blue } else { Color::Red };
 
+                    // 第一行：┌──[name]
+                    let name_line = Span::styled(
+                        format!("┌──[{}]", name),
+                        Style::default()
+                            .fg(name_color)
+                            .add_modifier(Modifier::BOLD),
+                    );
+
+                    // 第二行：└─$ body
+                    let msg_line = Span::styled(format!("└─∅ {}", body)
+                        , Style::default()
+                            .fg(name_color)
+                            .add_modifier(Modifier::DIM));
+
+                    // 用两个 Spans 构造一个 ListItem（即两行）
                     ListItem::new(vec![
-                        Spans::from(Span::styled(name, Style::default().fg(name_color).add_modifier(Modifier::BOLD))),
-                        Spans::from(Span::raw(body)),
+                        Spans::from(name_line),
+                        Spans::from(msg_line),
                     ])
                 })
                 .collect();
