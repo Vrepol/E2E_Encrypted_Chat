@@ -23,7 +23,7 @@ use tui::{
 
 use rust_chat::client::utils::parse_name_body;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
-
+use rust_chat::client::receiver::drain_messages;
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
 enum Event<I> {
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
                 .borders(Borders::ALL)
                 .title("Chat")
                 .style(Style::default().fg(Color::Rgb(0, 135, 0))))
-                .highlight_symbol("⩥ ");
+                .highlight_symbol("☠️ ");
             f.render_stateful_widget(chat, chunks[0], &mut list_state);
 
             // 输入框
@@ -199,22 +199,7 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
-        while let Ok(line) = net_rx.try_recv() {
-            if line.contains("$$ping$$") {
-                continue;
-            }
-            let at_bottom = list_state
-                .selected()
-                .map(|i| i + 1 == messages.len())
-                .unwrap_or(true);
-            messages.push(line);
-            if at_bottom {
-                list_state.select(Some(messages.len().saturating_sub(1)));
-            }
-            if messages.len() > 500 {
-                messages.drain(..100);
-            }
-        }
+        drain_messages(&mut net_rx, &mut messages, &mut list_state);
     }
 
     /* ---------- 8. 清理退出 ---------- */

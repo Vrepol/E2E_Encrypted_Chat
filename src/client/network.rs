@@ -6,6 +6,8 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
     time::{interval, sleep, Duration},
 };
+use super::crypto::seal;
+
 
 /// 启动网络任务：负责连接、心跳、读写和自动重连
 ///
@@ -49,7 +51,8 @@ pub async fn run(
 
                         // 2) 写从 UI 发过来的消息
                         Some(msg) = out_rx.recv() => {
-                            if writer.write_all(msg.as_bytes()).await.is_err() {
+                            let cipher_line = seal(&msg);
+                            if writer.write_all(cipher_line.as_bytes()).await.is_err() {
                                 eprintln!("⚠️ 写入失败，连接中断");
                                 break;
                             }

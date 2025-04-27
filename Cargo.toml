@@ -13,3 +13,6 @@ crossterm = "0.24"
 rand ="0.9.1"
 futures-util = "0.3"
 base64 = "0.22.1"
+chacha20 = "0.9"          # 纯 Rust，无 SIMD 依赖
+cipher   = "0.4.4"          # trait，只几 KB
+sha2     = "0.10"         # 可选：若想用口令派生 32 字节密钥
