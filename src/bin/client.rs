@@ -20,10 +20,11 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
-
+use unicode_width::UnicodeWidthStr;
 use rust_chat::client::utils::parse_name_body;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::drain_messages;
+use textwrap::wrap;
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
 enum Event<I> {
@@ -109,7 +110,7 @@ async fn main() -> Result<()> {
     let mut messages: Vec<String> = Vec::new();
     let mut input = String::new();
     let mut list_state = ListState::default();
-
+    const MAX_WIDTH: usize = 34;
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
         // ——— 绘制 ———
@@ -129,16 +130,27 @@ async fn main() -> Result<()> {
                     let color = if name == username { Color::Blue } else { Color::Red };
                     let indent = if name == username { "───" } else { "" };
                     let symbol = if name == username { "⁂" } else { "※" };
-                    ListItem::new(vec![
-                        Spans::from(Span::styled(
+
+                    // 1) 首行：┌──[name]
+                    let mut spans = vec![
+                        Spans::from( Span::styled(
                             format!("┌──{}[{}]", indent, name),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )),
-                        Spans::from(Span::styled(
-                            format!("└─{}{} {}", indent, symbol, body),
+                        ))
+                    ];
+
+                    // 2) body 多行
+                    let wrapped_lines = wrap(&body, MAX_WIDTH);
+                    for (i, line) in wrapped_lines.iter().enumerate() {
+                        // 首 body 行 用 └─，后续用空格对齐
+                        let prefix = if i==wrapped_lines.len()-1 { "└─" } else { "│ " };
+                        spans.push( Spans::from( Span::styled(
+                            format!("{}{} {}", prefix, symbol, line),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )),
-                    ])
+                        )));
+                    }
+
+                    ListItem::new(spans)
                 })
                 .collect();
 
@@ -159,7 +171,8 @@ async fn main() -> Result<()> {
                     .style(Style::default().fg(Color::Rgb(0, 135, 0))),
             );
             f.render_widget(input_box, chunks[1]);
-            f.set_cursor(chunks[1].x + input.len() as u16 + 2, chunks[1].y + 1);
+            let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
+            f.set_cursor(chunks[1].x + display_width + 1, chunks[1].y + 1);
         })?;
 
         // ——— 处理键盘事件 ———
