@@ -18,3 +18,4 @@ cipher   = "0.4.4"          # trait，只几 KB
 sha2     = "0.10"         # 可选：若想用口令派生 32 字节密钥
 unicode-width = "0.1.14"
 textwrap      = "0.16"
+winresource = "0.1"

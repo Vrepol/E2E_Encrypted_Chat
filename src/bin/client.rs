@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
         "100.97.92.19:6655",
         "192.168.1.8:6655",
         "8.153.67.166:6655",
+        "100.123.171.94:6655"
     ];
     println!("Available Server:");
     for (i, s) in servers.iter().enumerate() {
@@ -110,7 +111,7 @@ async fn main() -> Result<()> {
     let mut messages: Vec<String> = Vec::new();
     let mut input = String::new();
     let mut list_state = ListState::default();
-    const MAX_WIDTH: usize = 34;
+    const MAX_WIDTH: usize = 40;
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
         // ——— 绘制 ———
