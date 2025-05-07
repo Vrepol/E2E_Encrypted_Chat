@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
-        drain_messages(&mut net_rx, &mut messages, &mut list_state);
+        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username);
     }
 
     /* ---------- 8. 清理退出 ---------- */
