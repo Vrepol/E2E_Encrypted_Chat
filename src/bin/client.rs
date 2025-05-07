@@ -25,6 +25,15 @@ use rust_chat::client::utils::parse_name_body;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::drain_messages;
 use textwrap::wrap;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// 第 n 个字形单元（grapheme）在字符串中的字节偏移
+fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
+    s.grapheme_indices(true)
+     .nth(n)
+     .map(|(idx, _)| idx)
+     .unwrap_or_else(|| s.len())
+}
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
 enum Event<I> {
@@ -110,6 +119,7 @@ async fn main() -> Result<()> {
     /* ---------- 6. 应用状态 ---------- */
     let mut messages: Vec<String> = Vec::new();
     let mut input = String::new();
+    let mut cursor = 0usize;
     let mut list_state = ListState::default();
     const MAX_WIDTH: usize = 40;
     /* ---------- 7. 主循环 ---------- */
@@ -122,7 +132,6 @@ async fn main() -> Result<()> {
                 .margin(1)
                 .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
                 .split(size);
-
             // 聊天记录
             let items: Vec<ListItem> = messages
                 .iter()
@@ -135,7 +144,7 @@ async fn main() -> Result<()> {
                     // 1) 首行：┌──[name]
                     let mut spans = vec![
                         Spans::from( Span::styled(
-                            format!("┌──{}[{}]", indent, name),
+                            format!("┌──{}[{}]",indent, name),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ))
                     ];
@@ -172,16 +181,45 @@ async fn main() -> Result<()> {
                     .style(Style::default().fg(Color::Rgb(0, 135, 0))),
             );
             f.render_widget(input_box, chunks[1]);
-            let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
-            f.set_cursor(chunks[1].x + display_width + 1, chunks[1].y + 1);
+            //let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
+            let byte_idx = nth_grapheme_byte_idx(&input, cursor);
+            let prefix = &input[..byte_idx];                       // 光标左侧内容
+            let display_width = UnicodeWidthStr::width(prefix) as u16;
+            f.set_cursor(chunks[1].x + display_width + 1, chunks[1].y + 1);  
         })?;
 
         // ——— 处理键盘事件 ———
         match ev_rx.recv() {
             Ok(Event::Input(key)) => match key.code {
-                KeyCode::Char(c) => input.push(c),
+                KeyCode::Char(c) => {
+                    let byte_idx = nth_grapheme_byte_idx(&input, cursor);
+                    input.insert(byte_idx, c);
+                    cursor += 1;
+                }
+            
+                // ←  向左
+                KeyCode::Left => {
+                    if cursor > 0 {
+                        cursor -= 1;
+                    }
+                }
+            
+                // →  向右
+                KeyCode::Right => {
+                    let total = input.graphemes(true).count();
+                    if cursor < total {
+                        cursor += 1;
+                    }
+                }
+            
+                // Backspace：删掉光标左侧 1 个字符
                 KeyCode::Backspace => {
-                    input.pop();
+                    if cursor > 0 {
+                        let start = nth_grapheme_byte_idx(&input, cursor - 1);
+                        let end   = nth_grapheme_byte_idx(&input, cursor);
+                        input.replace_range(start..end, "");
+                        cursor -= 1;
+                    }
                 }
                 KeyCode::Enter => {
                     let msg = input.trim();
