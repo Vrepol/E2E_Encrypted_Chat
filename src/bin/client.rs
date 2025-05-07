@@ -227,6 +227,7 @@ async fn main() -> Result<()> {
                         // 把输入通过 out_tx 发给网络任务
                         let _ = out_tx.send(msg.to_string());
                         input.clear();
+                        cursor = 0;
                     }
                 }
                 KeyCode::Up => {
