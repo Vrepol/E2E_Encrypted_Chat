@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
                     let wrapped_lines = wrap(&body, MAX_WIDTH);
                     for (i, line) in wrapped_lines.iter().enumerate() {
                         // 首 body 行 用 └─，后续用空格对齐
-                        let prefix = if i==wrapped_lines.len()-1 { "+--" } else { "| " };
+                        let prefix = if i==wrapped_lines.len()-1 { "+--" } else { "+  " };
                         spans.push( Spans::from( Span::styled(
                             format!("{}{} {}", prefix, symbol, line),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
