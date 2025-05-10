@@ -56,9 +56,8 @@ async fn main() -> Result<()> {
 
     let servers = vec![
         "100.97.92.19:6655",
-        "192.168.1.8:6655",
+        "100.123.171.94:6655",
         "8.153.67.166:6655",
-        "100.123.171.94:6655"
     ];
     println!("Available Server:");
     for (i, s) in servers.iter().enumerate() {
@@ -139,12 +138,12 @@ async fn main() -> Result<()> {
                     let (name,time, body) = parse_name_body(raw);
                     let color = if name == username { Color::Blue } else { Color::Red };
                     let indent = if name == username { "" } else { "" };
-                    let symbol = if name == username { "$" } else { "#" };
+                    let symbol = if name == username { "$" } else { "$" };
 
                     // 1) 首行：┌──[name]
                     let mut spans = vec![
                         Spans::from( Span::styled(
-                            format!("+-[{}]-{}[{}]",name,indent, time),
+                            format!("+-[{}]-{}#{}",name,indent, time),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ))
                     ];

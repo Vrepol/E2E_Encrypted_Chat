@@ -8,7 +8,7 @@ pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<String>,
     list_state: &mut ListState,
-    my_name: &str,                   // ← 新参数
+    my_name: &str,
 ) {
     while let Ok(line) = net_rx.try_recv() {
         if line.contains("$$ping$$") {
@@ -16,7 +16,7 @@ pub fn drain_messages(
         }
 
         // ★ 提醒：别人发的才提醒
-        let (sender, _ ,_) = parse_name_body(&line);   // 解析一次就够
+        let (sender, _ ,_) = parse_name_body(&line);
         if sender != my_name {
             notifier::notify();
         }
