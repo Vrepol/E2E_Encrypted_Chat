@@ -3,7 +3,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tui::widgets::ListState;
 use crate::client::utils::parse_name_body;
 use super::notifier;
-
+use chrono::Local;
 pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<String>,
@@ -16,7 +16,7 @@ pub fn drain_messages(
         }
 
         // ★ 提醒：别人发的才提醒
-        let (sender, _) = parse_name_body(&line);   // 解析一次就够
+        let (sender, _ ,_) = parse_name_body(&line);   // 解析一次就够
         if sender != my_name {
             notifier::notify();
         }
@@ -27,7 +27,19 @@ pub fn drain_messages(
             .map(|i| i + 1 == messages.len())
             .unwrap_or(true);
 
-        messages.push(line);
+        let now = Local::now();
+        let hms = now.format("%H:%M:%S").to_string();
+        let formatted = if let Some(pos) = line.find(']') {
+            // split_at(pos+1) 保证 left 包含 ']'，right 以空格开头
+            let (left, right) = line.split_at(pos + 1);
+            format!("{} [{}]{}", left, hms, right)
+        } else {
+            // 如果没有找到 ']'，就简单地在最前面加
+            format!("[{}] {}", hms, line)
+        };
+
+        // 3. 推入带时间戳的新行
+        messages.push(formatted);
 
         if at_bottom {
             list_state.select(Some(messages.len().saturating_sub(1)));

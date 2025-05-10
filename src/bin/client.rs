@@ -136,15 +136,15 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = messages
                 .iter()
                 .map(|raw| {
-                    let (name, body) = parse_name_body(raw);
+                    let (name,time, body) = parse_name_body(raw);
                     let color = if name == username { Color::Blue } else { Color::Red };
-                    let indent = if name == username { "───" } else { "" };
-                    let symbol = if name == username { "⁂" } else { "※" };
+                    let indent = if name == username { "" } else { "" };
+                    let symbol = if name == username { "$" } else { "#" };
 
                     // 1) 首行：┌──[name]
                     let mut spans = vec![
                         Spans::from( Span::styled(
-                            format!("┌──{}[{}]",indent, name),
+                            format!("+-[{}]-{}[{}]",name,indent, time),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ))
                     ];
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
                     let wrapped_lines = wrap(&body, MAX_WIDTH);
                     for (i, line) in wrapped_lines.iter().enumerate() {
                         // 首 body 行 用 └─，后续用空格对齐
-                        let prefix = if i==wrapped_lines.len()-1 { "└─" } else { "│ " };
+                        let prefix = if i==wrapped_lines.len()-1 { "+--" } else { "| " };
                         spans.push( Spans::from( Span::styled(
                             format!("{}{} {}", prefix, symbol, line),
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
                 .borders(Borders::ALL)
                 .title("Chat")
                 .style(Style::default().fg(Color::Rgb(0, 135, 0))))
-                .highlight_symbol("☠️ ");
+                .highlight_symbol(">");
             f.render_stateful_widget(chat, chunks[0], &mut list_state);
 
             // 输入框
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 KeyCode::Up => {
-                    let step = 10;
+                    let step = 5;
                     // 按 ↑，选中上一条
                     if let Some(i) = list_state.selected() {
                         list_state.select(Some(i.saturating_sub(step)));
