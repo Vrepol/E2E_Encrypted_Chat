@@ -43,17 +43,17 @@ enum Event<I> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    /* ---------- 1. 询问昵称、选择服务器 ---------- */
+    /* ---------- 询问昵称 ---------- */
     print!("Your Nickname: ");
-    io::stdout().flush()?;
+    io::stdout().flush()?; //展示出来
     let mut username = String::new();
-    io::stdin().read_line(&mut username)?;
+    io::stdin().read_line(&mut username)?; //创建变量后，输入进来
     let username = username.trim().to_owned();
     if username.is_empty() {
         eprintln!("Nickname cannot be empty.");
         return Ok(());
     }
-
+    /* ---------- 选择服务器 ---------- */
     let servers = vec![
         "100.97.92.19:6655",
         "100.123.171.94:6655",
@@ -72,6 +72,8 @@ async fn main() -> Result<()> {
     let server_addr = servers[idx.min(servers.len() - 1)];
     println!("Connecting {} …", server_addr);
 
+    //需要在这里插入房间选择与验证，让服务端分配客户至某个房间
+    
     /* ---------- 2. 网络 <-> UI 的通道 ---------- */
     let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>(); // 网络 → UI
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
@@ -237,7 +239,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 KeyCode::Down => {
-                    let step = 10;
+                    let step = 5;
                     // 按 ↓，选中下一条
                     if let Some(i) = list_state.selected() {
                         let next = (i + step).min(messages.len().saturating_sub(1));
