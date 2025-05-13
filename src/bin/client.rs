@@ -6,7 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
-    io::{self, Write},
+    io::{self},
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -26,7 +26,8 @@ use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod netw
 use rust_chat::client::receiver::drain_messages;
 use textwrap::wrap;
 use unicode_segmentation::UnicodeSegmentation;
-
+use rust_chat::client::initialization::initial;
+use rust_chat::client::handshake;
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
@@ -43,46 +44,37 @@ enum Event<I> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    /* ---------- 询问昵称 ---------- */
-    print!("Your Nickname: ");
-    io::stdout().flush()?; //展示出来
-    let mut username = String::new();
-    io::stdin().read_line(&mut username)?; //创建变量后，输入进来
-    let username = username.trim().to_owned();
-    if username.is_empty() {
-        eprintln!("Nickname cannot be empty.");
-        return Ok(());
-    }
-    /* ---------- 选择服务器 ---------- */
-    let servers = vec![
-        "100.97.92.19:6655",
-        "100.123.171.94:6655",
-        "8.153.67.166:6655",
-    ];
-    println!("Available Server:");
-    for (i, s) in servers.iter().enumerate() {
-        println!("  {}. {}", i + 1, s);
-    }
-    print!("Choose from (1-{}): ", servers.len());
-    io::stdout().flush()?;
-
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
-    let idx = choice.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
-    let server_addr = servers[idx.min(servers.len() - 1)];
-    println!("Connecting {} …", server_addr);
-
-    //需要在这里插入房间选择与验证，让服务端分配客户至某个房间
+    /* ---------- 1. 在这里初始化用户名和服务器 ---------- */
+    let (username,server_addr) =initial()?;
     
     /* ---------- 2. 网络 <-> UI 的通道 ---------- */
     let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>(); // 网络 → UI
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
 
+    
+    //非异步函数，返还的是服务器当前的房间列表
+    //在这个函数中需要在这里插入房间选择与验证，让服务端分配客户至某个房间
+    let (lines, writer, _room_id) = loop {
+        match handshake::connect_and_login(server_addr, &username).await {
+            Ok((lines, writer, room_id)) => {
+                break (lines, writer, room_id);
+            }
+            Err(e) if e.to_string().contains("BadCredential") => {
+                // 这里捕获到服务器返回 ERR BadCredential
+                eprintln!("==================================\n");
+                eprintln!("❌ 密码错误，请重新输入房间号和密码。\n");
+                continue;
+            }
+            Err(other) => {
+                // 其它错误直接向上抛
+                return Err(other);
+            }
+        }
+    };
     /* ---------- 3. 启动网络任务（自动重连 + 心跳） ---------- */
-    let net_username = username.clone(); // 给网络任务一份拷贝
     tokio::spawn(async move {
-        if let Err(e) = network::run(server_addr, &net_username, net_tx, out_rx).await {
-            eprintln!("network::run error: {e}");
+        if let Err(e) = network::chat_loop(lines, writer, net_tx, out_rx).await {
+            eprintln!("chat_loop error: {e}");
         }
     });
 

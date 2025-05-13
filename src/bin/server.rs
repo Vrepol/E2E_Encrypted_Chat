@@ -1,37 +1,40 @@
 use anyhow::Result;
-use std::panic::AssertUnwindSafe;
+use futures_util::FutureExt;
+use std::{
+    collections::HashMap,
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::broadcast,
 };
-use futures_util::FutureExt; // 为 catch_unwind 引入扩展方法
+
+struct RoomInfo {
+    tx: broadcast::Sender<String>,
+    credential: String,
+}
+type Rooms = Arc<Mutex<HashMap<String, RoomInfo>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. 监听端口
     let listener = TcpListener::bind("0.0.0.0:6655").await?;
-    println!("🛰️  Chat-Server listening on 6655");
+    println!("🛰️  Chat‑Server listening on 6655");
 
-    // 2. 广播通道：所有客户端共享
-    let (tx, _rx) = broadcast::channel::<String>(500);
+    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
-        // 接受新连接
         let (socket, addr) = listener.accept().await?;
-        println!("⇄ 新连接：{}", addr);
+        let rooms_clone = rooms.clone();
 
-        let tx = tx.clone();
-        let mut rx = tx.subscribe();
-
-        // 3. 在 spawn 中使用 catch_unwind，避免子任务 panic 影响整个运行时
         tokio::spawn(
             AssertUnwindSafe(async move {
-                if let Err(e) = handle_client(socket, tx, &mut rx).await {
+                if let Err(e) = handle_client(socket, rooms_clone).await {
                     eprintln!("客户端 {} 出错：{:#}", addr, e);
                 }
             })
-            .catch_unwind() // 捕获 panic
+            .catch_unwind()
             .map(move |res| {
                 if let Err(panic) = res {
                     eprintln!("子任务 for {} panic 已捕获：{:?}", addr, panic);
@@ -41,36 +44,104 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_client(
-    socket: TcpStream,
-    tx: broadcast::Sender<String>,
-    rx: &mut broadcast::Receiver<String>,
-) -> Result<()> {
+async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    // ——握手阶段：读取第一行作为昵称——
-    let nickname = match lines.next_line().await? {
-        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-        _ => return Ok(()),
+    /* ---------- ① 发送房间列表 ---------- */
+    let room_line = {
+        let map = rooms.lock().unwrap();
+        let mut line = String::from("ROOMS");
+        for id in map.keys() {
+            line.push(' ');
+            line.push_str(id);
+        }
+        line.push('\n');
+        line
     };
-    tx.send(format!("⚡ [{}] joined.\n", nickname))?;
+    writer.write_all(room_line.as_bytes()).await?;
 
-    // ——正式消息循环——
+    /* ---------- ② 读取客户端指令 ---------- */
+    let cmd = match lines.next_line().await? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    let mut parts = cmd.split_whitespace();
+    let action   = parts.next().unwrap_or_default();
+    let room_id  = parts.next().unwrap_or_default().to_string();
+    let cred     = parts.next().unwrap_or_default().to_string();
+    let nickname = parts.next().unwrap_or_default().to_string();
+
+    if room_id.is_empty() || cred.is_empty() || nickname.is_empty() {
+        writer.write_all(b"ERR InvalidCmd\n").await?;
+        return Ok(());
+    }
+
+    /* ---------- ③ 同步处理房间表（无 await） ---------- */
+    enum Handshake {
+        Ok(broadcast::Sender<String>),
+        Err(&'static str),
+    }
+    let handshake = {
+        let mut map = rooms.lock().unwrap();
+        match action {
+            "CREATE" => {
+                if map.contains_key(&room_id) {
+                    Handshake::Err("RoomExists")
+                } else {
+                    let (tx, _) = broadcast::channel::<String>(500);
+                    map.insert(
+                        room_id.clone(),
+                        RoomInfo { tx: tx.clone(), credential: cred.clone() },
+                    );
+                    Handshake::Ok(tx)
+                }
+            }
+            "JOIN" => {
+                if let Some(info) = map.get(&room_id) {
+                    if info.credential == cred {
+                        Handshake::Ok(info.tx.clone())
+                    } else {
+                        Handshake::Err("BadCredential")
+                    }
+                } else {
+                    Handshake::Err("NoSuchRoom")
+                }
+            }
+            _ => Handshake::Err("UnknownAction"),
+        }
+    };
+
+    /* ---------- ④ 发送握手结果 ---------- */
+    let room_tx = match handshake {
+        Handshake::Ok(tx) => {
+            writer.write_all(b"OK\n").await?;
+            tx
+        }
+        Handshake::Err(why) => {
+            writer.write_all(format!("ERR {why}\n").as_bytes()).await?;
+            return Ok(());
+        }
+    };
+    let mut room_rx = room_tx.subscribe();
+
+    /* ---------- ⑤ 正式聊天循环 ---------- */
+    let _ = room_tx.send(format!("⚡ [{}] joined.\n", nickname));
     loop {
         tokio::select! {
-            // ① 本客户端发来新消息
             result = lines.next_line() => {
                 match result? {
                     Some(line) => {
-                        let msg = format!("[{}] {}\n", nickname, line);
-                        let _ = tx.send(msg);
+                        if line == "$$ping$$" {
+                            let _ = writer.write_all(b"/ping_ack\n").await;
+                            continue;
+                        }
+                        let _ = room_tx.send(format!("[{}] {}\n", nickname, line));
                     }
-                    None => break, // EOF
+                    None => break,
                 }
             }
-            // ② 接收其它客户端的广播
-            Ok(msg) = rx.recv() => {
+            Ok(msg) = room_rx.recv() => {
                 if writer.write_all(msg.as_bytes()).await.is_err() {
                     break;
                 }
@@ -78,7 +149,14 @@ async fn handle_client(
         }
     }
 
-    // ——离开——
-    let _ = tx.send(format!("⚡ [{}] left.\n", nickname));
+    /* ---------- ⑥ 离开 & 房间回收 ---------- */
+    let _ = room_tx.send(format!("⚡ [{}] left.\n", nickname));
+
+    let mut map = rooms.lock().unwrap();
+    if let Some(info) = map.get(&room_id) {
+        if info.tx.receiver_count() == 1 {
+            map.remove(&room_id);
+        }
+    }
     Ok(())
 }
