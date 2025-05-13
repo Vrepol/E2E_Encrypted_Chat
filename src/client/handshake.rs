@@ -35,7 +35,7 @@ pub async fn connect_and_login(
     }
     let rooms: Vec<String> = first.split_whitespace().skip(1).map(|s| s.to_owned()).collect();
     if rooms.is_empty() {
-        println!("{}","— 服务器当前没有房间 —".yellow().bold());
+        println!("{}","— 服务器当前没有房间 —".green().bold());
     } else {
         println!("— 可加入的房间 — \n {}", rooms.join("; "));
     }

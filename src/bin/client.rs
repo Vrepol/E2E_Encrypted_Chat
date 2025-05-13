@@ -1,7 +1,7 @@
 // src/bin/client.rs
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
+    event::{self, EnableMouseCapture, Event as CEvent, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -20,6 +20,7 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
+use colored::*;
 use unicode_width::UnicodeWidthStr;
 use rust_chat::client::utils::parse_name_body;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
@@ -44,9 +45,10 @@ enum Event<I> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    
     /* ---------- 1. 在这里初始化用户名和服务器 ---------- */
     let (username,server_addr) =initial()?;
-    
+    loop {
     /* ---------- 2. 网络 <-> UI 的通道 ---------- */
     let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>(); // 网络 → UI
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
@@ -254,8 +256,13 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        //DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+    println!("{}","❌已退出聊天室".red());
+    println!("{}","================================================".green().bold());
+    println!("Your nickname: {}",&username.to_string().blue());
+    continue;
+    }
     Ok(())
 }
