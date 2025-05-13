@@ -17,10 +17,33 @@ struct RoomInfo {
 }
 type Rooms = Arc<Mutex<HashMap<String, RoomInfo>>>;
 
+/// 离开清理 guard：Drop 时发送离开消息并回收空房间
+struct RoomGuard {
+    rooms: Rooms,
+    room_id: String,
+    nickname: String,
+    tx: broadcast::Sender<String>,
+}
+
+impl Drop for RoomGuard {
+    fn drop(&mut self) {
+        // 发送离开广播
+        let _ = self.tx.send(format!("⚡ [{}] left.\n", self.nickname));
+        // 回收空房间
+        let mut map = self.rooms.lock().unwrap();
+        if let Some(info) = map.get(&self.room_id) {
+            // 只有自己一个订阅者时，移除房间
+            if info.tx.receiver_count() <= 0 {
+                map.remove(&self.room_id);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:6655").await?;
-    println!("🛰️  Chat‑Server listening on 6655");
+    println!("🛰️  Chat-Server listening on 6655");
 
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
@@ -112,7 +135,7 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
         }
     };
 
-    /* ---------- ④ 发送握手结果 ---------- */
+    /* ---------- ④ 发送握手结果 & 创建清理 guard ---------- */
     let room_tx = match handshake {
         Handshake::Ok(tx) => {
             writer.write_all(b"OK\n").await?;
@@ -123,10 +146,20 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
             return Ok(());
         }
     };
+
+    // 把 guard 放在这里，确保后续任何退出都会调用它的 Drop
+    let _guard = RoomGuard {
+        rooms: rooms.clone(),
+        room_id: room_id.clone(),
+        nickname: nickname.clone(),
+        tx: room_tx.clone(),
+    };
+
+    // 发送加入通知
+    let _ = room_tx.send(format!("⚡ [{}] joined.\n", nickname));
     let mut room_rx = room_tx.subscribe();
 
     /* ---------- ⑤ 正式聊天循环 ---------- */
-    let _ = room_tx.send(format!("⚡ [{}] joined.\n", nickname));
     loop {
         tokio::select! {
             result = lines.next_line() => {
@@ -149,14 +182,6 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
         }
     }
 
-    /* ---------- ⑥ 离开 & 房间回收 ---------- */
-    let _ = room_tx.send(format!("⚡ [{}] left.\n", nickname));
-
-    let mut map = rooms.lock().unwrap();
-    if let Some(info) = map.get(&room_id) {
-        if info.tx.receiver_count() == 1 {
-            map.remove(&room_id);
-        }
-    }
+    // 注意：不需要手动发送离开或回收房间，_guard 会在此作用域结束时自动执行
     Ok(())
 }

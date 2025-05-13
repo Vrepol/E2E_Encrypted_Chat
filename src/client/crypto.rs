@@ -3,7 +3,7 @@
 
 use base64::{engine::general_purpose as b64, Engine};
 use chacha20::{cipher::{KeyIvInit, StreamCipher}, ChaCha20};
-
+use rand::RngCore;
 // ----------------- 常量 -----------------
 static mut ROOM_KEY: [u8; 32] = [0u8; 32]; // 自行替换
 pub fn set_room_key(md5_hex: &str) {
@@ -23,8 +23,8 @@ fn current_key() -> &'static [u8; 32] {
 // ----------------- 公共 API -----------------
 pub fn seal(plain: &str) -> String {
     // 生成随机 12 字节 nonce（IV）
-    let iv = [0u8; 12];
-
+    let mut iv = [0u8; 12];
+    rand::rng().fill_bytes(&mut iv);
     // 加密
     let mut data = plain.as_bytes().to_vec();
     ChaCha20::new(current_key().into(), &iv.into()).apply_keystream(&mut data);

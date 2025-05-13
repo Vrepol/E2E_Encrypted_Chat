@@ -10,6 +10,8 @@ use tokio::{
 
 use super::crypto;
 use colored::*;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 /// 返回已经握手成功、可以直接进入聊天循环的
 /// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
 pub async fn connect_and_login(
@@ -69,7 +71,10 @@ pub async fn connect_and_login(
     // ① 把 md5 设置为本房间的会话密钥
     crypto::set_room_key(&md5_hex);
     // ② 用它把 “Hello” 包装成密文，作为凭据
-    let credential = crypto::seal("Hello");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
+    mac.update(b"Hello");
+    let tag = mac.finalize().into_bytes();
+    let credential = hex::encode(tag);
 
     // 4. 发送指令：<ACTION> <ROOM> <CRED> <NICK>
     let cmd = format!("{action} {room_id} {credential} {nickname}\n");
