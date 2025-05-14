@@ -158,12 +158,12 @@ async fn main() -> Result<()> {
                     ListItem::new(spans)
                 })
                 .collect();
-
+            let title = format!("Room: {}", _room_id.clone());
             let chat = List::new(items)
                 .block(
                     Block::default()
                 .borders(Borders::ALL)
-                .title("Chat")
+                .title(title)
                 .style(Style::default().fg(Color::Rgb(0, 135, 0))))
                 .highlight_symbol(">");
             f.render_stateful_widget(chat, chunks[0], &mut list_state);
@@ -260,8 +260,7 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
     println!("{} [{}]","❌ 退出房间",_room_id);
-    println!("{}","===================================".green().bold());
-    println!("Your nickname: {}",&username.to_string().blue());
+    println!("{}","========Press Crtl + C to quit========".red().bold());
     continue;
     }
     Ok(())
