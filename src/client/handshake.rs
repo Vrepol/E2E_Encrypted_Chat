@@ -37,29 +37,29 @@ pub async fn connect_and_login(
     if rooms.is_empty() {
         println!("{}","— 服务器当前没有房间 —".green().bold());
     } else {
-        println!("— 可加入的房间 — \n {}", rooms.join("; "));
+        println!("{} \n {}","— 可加入的房间 —".green().bold(), rooms.join("; "));
     }
 
     // 2. 本地交互：输入房间号 & 密码
     let (room_id, pwd, action) = loop {
-        println!("{}","留空则为大厅".yellow().bold());
+        print!("{}","留空则为大厅,".yellow().bold());
         print!("{}","输入房间号：".blue());
         io::stdout().flush()?;
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
         let id = if id.trim().is_empty() {"Public"} else {id.trim()} ;
         if id != "Public" {
-            println!("{}","输入密码时不会显示".yellow().bold());
+            print!("{}","输入密码时不会显示,".yellow().bold());
             print!("{}","输入密码：".red());
             io::stdout().flush()?;
             let pwd = read_password()?;
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            println!("→ {} 房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
+            println!("🚀 {}房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
             break (id.to_owned(), pwd, act);
         } else {
             let pwd = String::from("");
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            println!("→ {} 房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
+            println!("🚀 {}房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
             break (id.to_owned(), pwd, act);
         }
         
@@ -88,6 +88,6 @@ pub async fn connect_and_login(
     if resp.trim() != "OK" {
         return Err(anyhow!("server refused: {}", resp));
     }
-    println!("✅ 进入房间 [{}] 成功！", room_id);
+    println!("✅ 进入房间 [{}]", room_id);
     Ok((lines, writer, room_id))
 }

@@ -1,18 +1,24 @@
 use std::io::{self, Write};
-
+use fake::Fake;
+use fake::locales::{FR_FR};
+use fake::faker::name::raw::*;
+use colored::*;
 
 pub fn initial() -> io::Result<(String, &'static str)> {
     // ---------- 询问昵称 ----------
     let username = loop {
-        print!("Your Nickname: ");
-        io::stdout().flush()?;             // 确保提示先刷到屏幕
+        println!("{}","Continue with fake name".purple());
+        print!("{}","      Or customize here: ".purple());
+        io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         let name = input.trim();
         if !name.is_empty() {
-            break name.to_owned();         // 非空就跳出循环，把结果赋给 username
+            break name.to_owned();
+        } else {
+            let name: String = FirstName(FR_FR).fake();
+            break name.to_owned()
         }
-        eprintln!("Nickname cannot be empty. Please enter a nickname.");  // 为空就提示，然后继续 loop
     };
     /* 
     // ---------- 选择服务器 ----------
@@ -35,7 +41,7 @@ pub fn initial() -> io::Result<(String, &'static str)> {
     let server_addr = servers[idx.min(servers.len() - 1)];
     */
     let server_addr = "8.153.67.166:6655";
-    println!("Connecting {} …", server_addr);
+    //println!("Connecting {} …", server_addr);
     // 把 &str 转成 String，和签名统一
     Ok((username, &server_addr))
 }

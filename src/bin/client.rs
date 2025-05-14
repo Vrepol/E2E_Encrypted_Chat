@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
             }
             Err(e) if e.to_string().contains("BadCredential") => {
                 // 这里捕获到服务器返回 ERR BadCredential
-                eprintln!("==================================\n");
+                println!("{}","===================================".green().bold());
                 eprintln!("❌ 密码错误，请重新输入房间号和密码。\n");
                 continue;
             }
@@ -259,8 +259,8 @@ async fn main() -> Result<()> {
         //DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    println!("{}","❌已退出聊天室".red());
-    println!("{}","================================================".green().bold());
+    println!("{} [{}]","❌ 退出房间",_room_id);
+    println!("{}","===================================".green().bold());
     println!("Your nickname: {}",&username.to_string().blue());
     continue;
     }
