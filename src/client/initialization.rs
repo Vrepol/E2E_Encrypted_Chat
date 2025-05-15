@@ -20,6 +20,7 @@ pub fn initial() -> io::Result<(String, &'static str)> {
             break name.to_owned()
         }
     };
+    println!("{} {}","Enjoy youself, ".green(),username.clone().to_string().green());
     /* 
     // ---------- 选择服务器 ----------
     let servers = vec![

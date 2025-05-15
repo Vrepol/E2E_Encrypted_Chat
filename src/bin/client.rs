@@ -125,7 +125,11 @@ async fn main() -> Result<()> {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
-                .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(3),  // 新增的状态栏
+                    Constraint::Length(3),  // 输入框
+                ].as_ref())
                 .split(size);
             // 聊天记录
             let items: Vec<ListItem> = messages
@@ -158,7 +162,7 @@ async fn main() -> Result<()> {
                     ListItem::new(spans)
                 })
                 .collect();
-            let title = format!("Room: {}", _room_id.clone());
+            let title = format!("<Room: {}>", _room_id.clone());
             let chat = List::new(items)
                 .block(
                     Block::default()
@@ -167,7 +171,16 @@ async fn main() -> Result<()> {
                 .style(Style::default().fg(Color::Rgb(0, 135, 0))))
                 .highlight_symbol(">");
             f.render_stateful_widget(chat, chunks[0], &mut list_state);
+            
 
+            let status_chunk = chunks[1];
+            let status = Paragraph::new("这里要接受服务端发来的/member_list 信息")
+                .block(
+                    Block::default().borders(Borders::ALL).title("Members")
+                    .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                );
+            f.render_widget(status, status_chunk);
+                    
             // 输入框
             let input_box = Paragraph::new(input.as_ref()).block(
                 Block::default()
@@ -175,12 +188,12 @@ async fn main() -> Result<()> {
                     .title(format!("{} >", username))
                     .style(Style::default().fg(Color::Rgb(0, 135, 0))),
             );
-            f.render_widget(input_box, chunks[1]);
+            f.render_widget(input_box, chunks[2]);
             //let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
             let byte_idx = nth_grapheme_byte_idx(&input, cursor);
             let prefix = &input[..byte_idx];                       // 光标左侧内容
             let display_width = UnicodeWidthStr::width(prefix) as u16;
-            f.set_cursor(chunks[1].x + display_width + 1, chunks[1].y + 1);  
+            f.set_cursor(chunks[2].x + display_width + 1, chunks[2].y + 1);  
         })?;
 
         // ——— 处理键盘事件 ———
