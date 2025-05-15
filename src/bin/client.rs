@@ -29,6 +29,9 @@ use textwrap::wrap;
 use unicode_segmentation::UnicodeSegmentation;
 use rust_chat::client::initialization::initial;
 use rust_chat::client::handshake;
+use base64::Engine as _;
+use rust_chat::client::clipboard::{self, ClipData};
+use crossterm::event::KeyModifiers;
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
@@ -199,12 +202,40 @@ async fn main() -> Result<()> {
         // ——— 处理键盘事件 ———
         match ev_rx.recv() {
             Ok(Event::Input(key)) => match key.code {
-                KeyCode::Char(c) => {
+                // 1) Ctrl + V 贴入
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match clipboard::get() {
+                        Ok(ClipData::Text(txt)) => {
+                            // 插到光标处
+                            let byte_idx = nth_grapheme_byte_idx(&input, cursor);
+                            input.insert_str(byte_idx, &txt);
+                            cursor += txt.graphemes(true).count();
+                        }
+                        Ok(ClipData::Image(img)) => {
+                            // TODO: 把 img.bytes 转 base64，构造占位符发送
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(img.bytes);
+                            let placeholder = format!("/img:{}:{}", img.width, img.height);
+                            // 这里直接发送占位符，后续可改成真正的图片协议
+                            let _ = out_tx.send(format!("{}{}", placeholder, b64));
+                        }
+                        Err(e) => eprintln!("⚠️ 粘贴失败: {e}"),
+                    }
+                },
+                
+                // 2) Ctrl + C 复制选中行
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(sel) = list_state.selected() {
+                        let (_, _, body) = parse_name_body(&messages[sel]);  // 去掉前缀
+                        if let Err(e) = clipboard::set_text(&body) {
+                            eprintln!("⚠️ 复制失败: {e}");
+                        }
+                    }
+                },
+                KeyCode::Char(ch) if key.modifiers.is_empty() => {
                     let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-                    input.insert(byte_idx, c);
+                    input.insert(byte_idx, ch);
                     cursor += 1;
-                }
-            
+                },
                 // ←  向左
                 KeyCode::Left => {
                     if cursor > 0 {
@@ -239,14 +270,14 @@ async fn main() -> Result<()> {
                     }
                 }
                 KeyCode::Up => {
-                    let step = 5;
+                    let step = 1;
                     // 按 ↑，选中上一条
                     if let Some(i) = list_state.selected() {
                         list_state.select(Some(i.saturating_sub(step)));
                     }
                 }
                 KeyCode::Down => {
-                    let step = 5;
+                    let step = 1;
                     // 按 ↓，选中下一条
                     if let Some(i) = list_state.selected() {
                         let next = (i + step).min(messages.len().saturating_sub(1));
