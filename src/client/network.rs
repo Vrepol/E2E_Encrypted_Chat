@@ -40,16 +40,31 @@ pub async fn chat_loop(
                     }
                 }
             }
-
             // 2) 写
-            Some(msg) = out_rx.recv() => {
-                let cipher_line = seal(&msg);
-                if writer.write_all(cipher_line.as_bytes()).await.is_err() {
-                    eprintln!("⚠️ 写入失败");
-                    break;
+            msg = out_rx.recv() => {
+                match msg {
+                    Some(text) if text == "/leave" => {
+                        // 然后再 shutdown 写端，发 FIN
+                        writer.shutdown().await?;
+                        break;  // 结束 chat_loop
+                    }
+                    Some(text) => {
+                        // 正常聊天消息
+                        let cipher_line = seal(&text);
+                        if writer.write_all(cipher_line.as_bytes()).await.is_err() {
+                            eprintln!("⚠️ 写入失败");
+                            break;
+                        }
+                        let _ = writer.write_all(b"\n").await;
+                    }
+                    None => {
+                        // 通道关闭了，也退出
+                        writer.shutdown().await?;
+                        break;
+                    }
                 }
-                let _ = writer.write_all(b"\n").await;
             }
+            
 
             // 3) 心跳
             _ = hb.tick() => {

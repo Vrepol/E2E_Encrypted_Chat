@@ -240,8 +240,14 @@ async fn main() -> Result<()> {
                         list_state.select(Some(next));
                     }
                 }
-                KeyCode::Esc => break 'ui,
+                KeyCode::Esc => {
+                    let _ = out_tx.send("/leave".to_string());
+                    drop(out_tx);
+                    break 'ui;
+                    
+                }
                 _ => {}
+                
             },
             _ => {}
         }
