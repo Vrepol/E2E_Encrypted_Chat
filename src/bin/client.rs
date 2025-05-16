@@ -231,11 +231,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 },
-                KeyCode::Char(ch) if key.modifiers.is_empty() => {
-                    let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-                    input.insert(byte_idx, ch);
-                    cursor += 1;
-                },
+                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) 
+                    =>{
+                        // 1 个 Unicode grapheme 当做一个 char 插入
+                        let s = ch.to_string();
+                        let byte_idx = nth_grapheme_byte_idx(&input, cursor);
+                        input.insert_str(byte_idx, &s);
+                        cursor += 1;
+                    },
                 // ←  向左
                 KeyCode::Left => {
                     if cursor > 0 {
