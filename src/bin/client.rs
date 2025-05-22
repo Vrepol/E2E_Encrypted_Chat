@@ -22,7 +22,7 @@ use tui::{
 };
 use colored::*;
 use unicode_width::UnicodeWidthStr;
-use rust_chat::client::utils::parse_name_body;
+use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png};
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use textwrap::wrap;
@@ -211,7 +211,7 @@ async fn main() -> Result<()> {
         match ev_rx.recv() {
             Ok(Event::Input(key)) => match key.code {
                 // 1) Ctrl + V 贴入
-                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     match clipboard::get() {
                         Ok(ClipData::Text(txt)) => {
                             // 插到光标处
@@ -220,13 +220,20 @@ async fn main() -> Result<()> {
                             cursor += txt.graphemes(true).count();
                         }
                         Ok(ClipData::Image(img)) => {
+                            let png_buf = encode_rgba_as_png(&img.bytes,
+                                img.width.try_into().unwrap(),
+                                img.height.try_into().unwrap(),)?;
                             // TODO: 把 img.bytes 转 base64，构造占位符发送
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(img.bytes);
-                            let placeholder = format!("/img:{}:{}", img.width, img.height);
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
+                            let placeholder = format!("/IMGDATA");
                             // 这里直接发送占位符，后续可改成真正的图片协议
                             let _ = out_tx.send(format!("{}{}", placeholder, b64));
                         }
-                        Err(e) => eprintln!("⚠️ 粘贴失败: {e}"),
+                        Err(e) => {
+                            // 如果既不是文本也不是图片，也把错误发到聊天框
+                            let tip = format!("⚠️ 读取剪贴板失败: {}", e);
+                            let _ = out_tx.send(tip);
+                        },
                     }
                 },
                 

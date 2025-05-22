@@ -127,3 +127,26 @@ pub async fn get_plaintext(msg: &str) -> Result<String> {
         Ok(msg.to_string())
     }
 }
+use image::{
+    codecs::png::PngEncoder,
+    ColorType,
+    ImageEncoder,              // ★ 一定要引入这个 trait
+};
+
+pub fn encode_rgba_as_png(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+
+    // `write_image` 由 ImageEncoder trait 提供
+    PngEncoder::new(&mut buf).write_image(
+        rgba,
+        w,
+        h,
+        ColorType::Rgba8.into(),   // 注意要 `.into()` → ExtendedColorType
+    )?;
+
+    Ok(buf)
+}
