@@ -1,5 +1,5 @@
 // src/client/receiver.rs
-use std::fs::{create_dir_all, File};
+use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -10,6 +10,7 @@ use uuid::Uuid;
 use base64::{engine::general_purpose, Engine as _};
 use crate::client::utils::parse_text_img;
 use super::notifier;
+use std::path::Path;
 
 /// 区分文本消息和图片消息
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub fn drain_messages(
     messages: &mut Vec<ChatMessage>,
     list_state: &mut ListState,
     my_name: &str,
+    img_dir: &Path,
 ) {
     while let Ok(line) = net_rx.try_recv() {
         if line.contains("$$ping$$") {
@@ -58,22 +60,14 @@ pub fn drain_messages(
             match general_purpose::STANDARD.decode(b64_data) {
                 Ok(bytes) => {
                     // 临时目录 ./rust_chat_images
-                    let mut dir = std::env::temp_dir();
-                    dir.push("rust_chat_images");
-                    let _ = create_dir_all(&dir);
-
-                    // 文件名：img_<timestamp>_<uuid>.png
-                    let file_name = format!("img_{}.png", Uuid::new_v4());
-                    dir.push(file_name);
-
-                    if let Ok(mut file) = File::create(&dir) {
+                    let file_path = img_dir.join(format!("img_{}.png", Uuid::new_v4()));
+                    if let Ok(mut file) = File::create(&file_path) {
                         let _ = file.write_all(&bytes);
-                        messages.push(
-                            ChatMessage::Image { 
-                                path: dir.clone() ,
-                                sender:sender.clone(),
-                                ts: hms.clone()}
-                        );
+                        messages.push(ChatMessage::Image {
+                            path:   file_path,      // 已是 PathBuf
+                            sender: sender.clone(),
+                            ts:     hms.clone(),
+                        });
                     } else {
                         // 写文件失败，退回为文本显示
                         let fallback = format!("[{}] <图片保存失败>", hms);

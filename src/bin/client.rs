@@ -32,6 +32,7 @@ use rust_chat::client::handshake;
 use base64::Engine as _;
 use rust_chat::client::clipboard::{self, ClipData};
 use crossterm::event::KeyModifiers;
+use tempfile;
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
@@ -124,6 +125,9 @@ async fn main() -> Result<()> {
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
     const MAX_WIDTH: usize = 40;
+    let img_tempdir = tempfile::Builder::new()
+        .prefix("rust_chat_images")
+        .tempdir()?;
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
         // ——— 绘制 ———
@@ -314,7 +318,7 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
-        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username);
+        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path());
     }
 
     /* ---------- 8. 清理退出 ---------- */
