@@ -3,7 +3,7 @@ use fake::Fake;
 use fake::locales::{FR_FR};
 use fake::faker::name::raw::*;
 use colored::*;
-
+use std::collections::HashMap;
 pub fn initial() -> io::Result<(String, &'static str)> {
     // ---------- 询问昵称 ----------
     let username = loop {
@@ -21,27 +21,32 @@ pub fn initial() -> io::Result<(String, &'static str)> {
         }
     };
     println!("{} {}","Enjoy youself, ".green(),username.clone().to_string().green());
-    /* 
-    // ---------- 选择服务器 ----------
-    let servers = vec![
-        "100.97.92.19:6655",
-        "100.123.171.94:6655",
-        "8.153.67.166:6655",
-        "192.168.1.4:6655",
-    ];
-    println!("Available Server:");
-    for (i, s) in servers.iter().enumerate() {
-        println!("  {}. {}", i + 1, s);
+    let mut servers: HashMap<&str, &str> = HashMap::new();
+    servers.insert("Public server", "8.153.67.166:6655");
+    servers.insert("Tailscale server", "100.123.171.94:6655");
+
+    // 2. 打印名称列表
+    println!("Avaliable Severs:");
+    let names: Vec<&str> = servers.keys().copied().collect();
+    for (i, name) in names.iter().enumerate() {
+        println!("  {}. {}", i + 1, name);
     }
-    print!("Choose from (1-{}): ", servers.len());
+    print!("Choose From (1-{}): ", names.len());
     io::stdout().flush()?;
 
+    // 3. 读取用户输入并映射到地址
     let mut choice = String::new();
     io::stdin().read_line(&mut choice)?;
-    let idx = choice.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
-    let server_addr = servers[idx.min(servers.len() - 1)];
-    */
-    let server_addr = "8.153.67.166:6655";
+    let idx = choice.trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| if n >= 1 && n <= names.len() { Some(n - 1) } else { None })
+        .unwrap_or(0);
+
+    let server_name = names[idx];
+    let server_addr = servers.get(server_name).unwrap();
+
+    //let server_addr = "8.153.67.166:6655";
     //println!("Connecting {} …", server_addr);
     // 把 &str 转成 String，和签名统一
     Ok((username, &server_addr))

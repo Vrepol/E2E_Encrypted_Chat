@@ -54,12 +54,10 @@ pub async fn connect_and_login(
             io::stdout().flush()?;
             let pwd = read_password()?;
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            println!("🚀 {}房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
             break (id.to_owned(), pwd, act);
         } else {
             let pwd = String::from("");
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            println!("🚀 {}房间 [{}]", if act == "JOIN" { "加入" } else { "创建" }, id);
             break (id.to_owned(), pwd, act);
         }
         
@@ -88,6 +86,5 @@ pub async fn connect_and_login(
     if resp.trim() != "OK" {
         return Err(anyhow!("server refused: {}", resp));
     }
-    println!("✅ 进入房间 [{}]", room_id);
     Ok((lines, writer, room_id))
 }
