@@ -8,7 +8,7 @@ use tokio::{
     time::{interval, Duration},
 };
 use super::crypto::seal;
-
+use super::utils::get_plaintext;
 pub async fn chat_loop(
     mut lines: Lines<BufReader<OwnedReadHalf>>,  // ← 和 connect_and_login 返回的一致
     mut writer: OwnedWriteHalf,                  // ← stream.into_split() 给的就是这个
@@ -49,8 +49,9 @@ pub async fn chat_loop(
                         break;  // 结束 chat_loop
                     }
                     Some(text) => {
+                        let plain = get_plaintext(&text).await?;
                         // 正常聊天消息
-                        let cipher_line = seal(&text);
+                        let cipher_line = seal(&plain);
                         if writer.write_all(cipher_line.as_bytes()).await.is_err() {
                             eprintln!("⚠️ 写入失败");
                             break;

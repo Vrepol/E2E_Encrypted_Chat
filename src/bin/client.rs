@@ -24,7 +24,7 @@ use colored::*;
 use unicode_width::UnicodeWidthStr;
 use rust_chat::client::utils::parse_name_body;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
-use rust_chat::client::receiver::drain_messages;
+use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use textwrap::wrap;
 use unicode_segmentation::UnicodeSegmentation;
 use rust_chat::client::initialization::initial;
@@ -38,6 +38,10 @@ fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
      .nth(n)
      .map(|(idx, _)| idx)
      .unwrap_or_else(|| s.len())
+}
+fn open_image(path: &std::path::Path) -> anyhow::Result<()> {
+    open::that(path)?;
+    Ok(())
 }
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
@@ -115,7 +119,7 @@ async fn main() -> Result<()> {
     });
 
     /* ---------- 6. 应用状态 ---------- */
-    let mut messages: Vec<String> = Vec::new();
+    let mut messages: Vec<ChatMessage> = Vec::new();
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
@@ -138,7 +142,7 @@ async fn main() -> Result<()> {
             let items: Vec<ListItem> = messages
                 .iter()
                 .map(|raw| {
-                    let (name,time, body) = parse_name_body(raw);
+                    let (name,time, display_body) = parse_name_body(raw);
                     let color = if name == username { Color::Blue } else { Color::Red };
                     let indent = if name == username { "" } else { "" };
                     let symbol = if name == username { "$" } else { "$" };
@@ -152,7 +156,7 @@ async fn main() -> Result<()> {
                     ];
 
                     // 2) body 多行
-                    let wrapped_lines = wrap(&body, MAX_WIDTH);
+                    let wrapped_lines = wrap(&display_body, MAX_WIDTH);
                     for (i, line) in wrapped_lines.iter().enumerate() {
                         // 首 body 行 用 └─，后续用空格对齐
                         let prefix = if i==wrapped_lines.len()-1 { "└--" } else { "|  " };
@@ -285,6 +289,16 @@ async fn main() -> Result<()> {
                     if let Some(i) = list_state.selected() {
                         let next = (i + step).min(messages.len().saturating_sub(1));
                         list_state.select(Some(next));
+                    }
+                }
+                KeyCode::Tab => {
+                    if let Some(selected) = list_state.selected() {
+                        // 假设 images 是 Vec<Option<PathBuf>>
+                        if let ChatMessage::Image { path, .. } = &messages[selected] {
+                            if let Err(e) = open_image(path) {
+                                eprintln!("无法打开图片: {e}");
+                            }
+                        }
                     }
                 }
                 KeyCode::Esc => {
