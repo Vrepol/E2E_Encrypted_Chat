@@ -30,10 +30,19 @@ pub fn drain_messages(
     list_state: &mut ListState,
     my_name: &str,
     img_dir: &Path,
+    members:    &mut Vec<String>, 
 ) {
     while let Ok(line) = net_rx.try_recv() {
-        if line.contains("$$ping$$") {
-            continue;
+        if line.starts_with("/member_list ") {
+                members.clear();
+                members.extend(
+                    line["/member_list ".len()..]
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
+                );
+                continue;
         }
 
         // 拆分发送者、原始时间戳（这里不再用）和 body

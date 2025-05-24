@@ -23,7 +23,7 @@ pub async fn chat_loop(
             res = lines.next_line() => {
                 match res {
                     Ok(Some(line)) => {
-                        if line == "/ping_ack" {
+                        if line == "/ping_ack" || line == "$$ping$$" {
                             // 只是心跳确认，忽略它
                             continue;
                         }

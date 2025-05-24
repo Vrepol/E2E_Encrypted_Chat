@@ -23,6 +23,7 @@ pub fn initial() -> io::Result<(String, &'static str)> {
     let servers = vec![
     ("Public server", "8.153.67.166:6655"),
     ("Tailscale server", "100.123.171.94:6655"),
+    ("local server", "127.0.0.1:6655"),
     ];
 
     // 2. 打印名称列表

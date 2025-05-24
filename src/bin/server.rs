@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures_util::FutureExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
 };
@@ -10,10 +10,14 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
 };
-
+fn broadcast_member_list(info: &RoomInfo) {
+        let names: Vec<_> = info.members.iter().cloned().collect();
+        let _ = info.tx.send(format!("/member_list {}\n", names.join(",")));
+}
 struct RoomInfo {
     tx: broadcast::Sender<String>,
     credential: String,
+    members: HashSet<String>,
 }
 type Rooms = Arc<Mutex<HashMap<String, RoomInfo>>>;
 
@@ -31,10 +35,12 @@ impl Drop for RoomGuard {
         let _ = self.tx.send(format!("⚡ [{}] left.\n", self.nickname));
         // 回收空房间
         let mut map = self.rooms.lock().unwrap();
-        if let Some(info) = map.get(&self.room_id) {
+        if let Some(info) = map.get_mut(&self.room_id) {
             // 只有自己一个订阅者时，移除房间
-            if info.tx.receiver_count() <= 0 {
-                map.remove(&self.room_id);
+            info.members.remove(&self.nickname);
+                        broadcast_member_list(info);              // ← 推送最新名单
+                        if info.members.is_empty() {
+                            map.remove(&self.room_id);
             }
         }
     }
@@ -113,16 +119,17 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
                     Handshake::Err("RoomExists")
                 } else {
                     let (tx, _) = broadcast::channel::<String>(500);
-                    map.insert(
-                        room_id.clone(),
-                        RoomInfo { tx: tx.clone(), credential: cred.clone() },
-                    );
+                    let mut set = HashSet::new();
+                    set.insert(nickname.clone());
+                    let info = RoomInfo { tx: tx.clone(), credential: cred.clone(), members: set };
+                    map.insert(room_id.clone(), info);
                     Handshake::Ok(tx)
                 }
             }
             "JOIN" => {
-                if let Some(info) = map.get(&room_id) {
+                if let Some(info) = map.get_mut(&room_id) {
                     if info.credential == cred {
+                        info.members.insert(nickname.clone());
                         Handshake::Ok(info.tx.clone())
                     } else {
                         Handshake::Err("BadCredential")
@@ -158,7 +165,12 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     // 发送加入通知
     let _ = room_tx.send(format!("⚡ [{}] joined.\n", nickname));
     let mut room_rx = room_tx.subscribe();
-
+    {
+        let map = rooms.lock().unwrap();
+        if let Some(info) = map.get(&room_id) {
+            broadcast_member_list(info);   // <-- 现在新客户端已经订阅，一定能收到
+        }
+    }
     /* ---------- ⑤ 正式聊天循环 ---------- */
     loop {
         tokio::select! {

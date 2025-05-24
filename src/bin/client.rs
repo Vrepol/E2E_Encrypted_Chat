@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
 
     /* ---------- 6. 应用状态 ---------- */
     let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut member_list: Vec<String>   = Vec::new();
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
@@ -185,7 +186,12 @@ async fn main() -> Result<()> {
             
 
             let status_chunk = chunks[1];
-            let status = Paragraph::new("这里要接受服务端发来的/member_list 信息")
+            let status_text = if member_list.is_empty() {
+                        "<空>".to_string()
+                    } else {
+                        member_list.join(", ")
+                    };
+                let status = Paragraph::new(status_text)
                 .block(
                     Block::default().borders(Borders::ALL).title("Members")
                     .style(Style::default().fg(Color::Rgb(0, 135, 0))),
@@ -325,7 +331,7 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
-        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path());
+        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path(),&mut member_list,);
     }
 
     /* ---------- 8. 清理退出 ---------- */
