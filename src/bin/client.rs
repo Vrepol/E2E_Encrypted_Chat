@@ -261,13 +261,24 @@ async fn main() -> Result<()> {
                         cursor += 1;
                     },
                 // ←  向左
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if cursor > 0 {
+                        cursor = 0;
+                    }
+                }
                 KeyCode::Left => {
                     if cursor > 0 {
                         cursor -= 1;
                     }
                 }
-            
+                
                 // →  向右
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let total = input.graphemes(true).count();
+                    if cursor < total {
+                        cursor = total;
+                    }
+                }
                 KeyCode::Right => {
                     let total = input.graphemes(true).count();
                     if cursor < total {
@@ -293,6 +304,14 @@ async fn main() -> Result<()> {
                         cursor = 0;
                     }
                 }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let step = 5;
+                    // 按 ↑，选中上一条
+                    if let Some(i) = list_state.selected() {
+                        list_state.select(Some(i.saturating_sub(step)));
+                    }
+                }
+                
                 KeyCode::Up => {
                     let step = 1;
                     // 按 ↑，选中上一条
@@ -300,6 +319,11 @@ async fn main() -> Result<()> {
                         list_state.select(Some(i.saturating_sub(step)));
                     }
                 }
+
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    list_state.select(Some(messages.len()-1));
+                }
+
                 KeyCode::Down => {
                     let step = 1;
                     // 按 ↓，选中下一条
