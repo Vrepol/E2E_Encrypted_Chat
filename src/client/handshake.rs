@@ -19,7 +19,7 @@ pub async fn connect_and_login(
     nickname: &str,
 ) -> Result<(Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
             tokio::net::tcp::OwnedWriteHalf,
-            String)> {
+            String,String)> {
     // 0. TCP 连接
     let stream = TcpStream::connect(server_addr).await?;
     let (reader, mut writer) = stream.into_split();
@@ -86,5 +86,5 @@ pub async fn connect_and_login(
     if resp.trim() != "OK" {
         return Err(anyhow!("server refused: {}", resp));
     }
-    Ok((lines, writer, room_id))
+    Ok((lines, writer, room_id,pwd))
 }

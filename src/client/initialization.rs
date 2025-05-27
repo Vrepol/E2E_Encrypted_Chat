@@ -47,7 +47,6 @@ pub fn initial() -> io::Result<(String, &'static str)> {
     let (server_name, server_addr) = servers[idx];
     println!("Connecting to {} …", server_name);
 
-    //let server_addr = "8.153.67.166:6655";
     //println!("Connecting {} …", server_addr);
     // 把 &str 转成 String，和签名统一
     Ok((username, &server_addr))

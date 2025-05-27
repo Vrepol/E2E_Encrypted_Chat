@@ -22,7 +22,7 @@ use tui::{
 };
 use colored::*;
 use unicode_width::UnicodeWidthStr;
-use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png};
+use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation};
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use textwrap::wrap;
@@ -64,10 +64,10 @@ async fn main() -> Result<()> {
     
     //非异步函数，返还的是服务器当前的房间列表
     //在这个函数中需要在这里插入房间选择与验证，让服务端分配客户至某个房间
-    let (lines, writer, _room_id) = loop {
+    let (lines, writer, room_id,pwd) = loop {
         match handshake::connect_and_login(server_addr, &username).await {
-            Ok((lines, writer, room_id)) => {
-                break (lines, writer, room_id);
+            Ok((lines, writer, room_id,pwd)) => {
+                break (lines, writer, room_id,pwd);
             }
             Err(e) if e.to_string().contains("BadCredential") => {
                 // 这里捕获到服务器返回 ERR BadCredential
@@ -174,7 +174,7 @@ async fn main() -> Result<()> {
                     ListItem::new(spans)
                 })
                 .collect();
-            let title = format!("<Room: {}>", _room_id.clone());
+            let title = format!("<Room: {}>", room_id.clone());
             let chat = List::new(items)
                 .block(
                     Block::default()
@@ -260,6 +260,22 @@ async fn main() -> Result<()> {
                         input.insert_str(byte_idx, &s);
                         cursor += 1;
                     },
+                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL)
+                =>{
+                    let result = create_invitation(server_addr.to_string().clone(),room_id.clone(),pwd.clone());
+                    // 2) 解包 Result
+                    match result {
+                        Ok(code) => {
+                            // code 是 String，正好可以发出去
+                            let _ = out_tx.send(format!("/INVITE {}", code));
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send("生成邀请码失败".to_string());
+                            // 根据业务决定：提示、log、忽略……
+                            eprintln!("生成邀请码失败：{}", err);
+                            },
+                        }
+                    }
                 // ←  向左
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if cursor > 0 {
@@ -367,7 +383,7 @@ async fn main() -> Result<()> {
         //DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    println!("{} [{}]","❌ 退出房间",_room_id);
+    println!("{} [{}]","❌ 退出房间",room_id);
     println!("{}","========Press Crtl + C to quit========".red().bold());
     continue;
     }

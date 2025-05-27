@@ -150,3 +150,56 @@ pub fn encode_rgba_as_png(
 
     Ok(buf)
 }
+use chacha20::{
+    cipher::{KeyIvInit, StreamCipher},
+    ChaCha20,
+};
+use serde::{Serialize, Deserialize};
+use chrono::Utc;
+use rand::RngCore;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD};
+#[derive(Serialize, Deserialize)]
+struct Invite {
+    server:   String,
+    room_id:  String,
+    room_key: String,
+}
+const PERIOD_SECS: i64 = 3600;
+fn derive_invite_key() -> [u8; 32] {
+    let period_id = Utc::now().timestamp() / PERIOD_SECS;
+    let bytes = period_id.to_be_bytes(); // 8 bytes
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = bytes[i % bytes.len()];
+    }
+    key
+}
+pub fn create_invitation(server_addr:String,room_id:String,pwd:String) -> Result<String, Box<dyn std::error::Error>>{
+    let key = derive_invite_key();
+    // 随机 12 字节 nonce
+    let mut nonce = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+
+    // 序列化明文
+    let inv = Invite {
+        server:   server_addr,
+        room_id,
+        room_key: pwd,
+    };
+
+    // 4. 序列化为 JSON bytes
+    let mut buf = serde_json::to_vec(&inv)?;
+    // 用 ChaCha20 加密（in-place）
+    let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+    cipher.apply_keystream(&mut buf);
+
+    // 拼接 nonce || 密文，然后 hex 编码
+    let mut out = Vec::with_capacity(nonce.len() + buf.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&buf);
+    Ok(URL_SAFE_NO_PAD.encode(out))
+}
+
+// pub fn parse_invitation(invite:String)  -> (String,String,String){
+    
+// }
