@@ -164,7 +164,7 @@ struct Invite {
     room_id:  String,
     room_key: String,
 }
-const PERIOD_SECS: i64 = 3600;
+const PERIOD_SECS: i64 = 500;
 fn derive_invite_key() -> [u8; 32] {
     let period_id = Utc::now().timestamp() / PERIOD_SECS;
     let bytes = period_id.to_be_bytes(); // 8 bytes
@@ -200,6 +200,32 @@ pub fn create_invitation(server_addr:String,room_id:String,pwd:String) -> Result
     Ok(URL_SAFE_NO_PAD.encode(out))
 }
 
-// pub fn parse_invitation(invite:String)  -> (String,String,String){
-    
-// }
+pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {
+    let raw = inv.strip_prefix("/INVITE:")?;   // 非邀请码直接 None
+
+    // ---------- A. 尝试 URL-safe Base64 ----------
+    let bytes = match URL_SAFE_NO_PAD.decode(raw) {
+        Ok(v) => v,
+        Err(_) => {
+            // ---------- B. 回退到 hex ----------
+            if raw.chars().all(|c| c.is_ascii_hexdigit()) {
+                hex::decode(raw).ok()?
+            } else {
+                return None;
+            }
+        }
+    };
+
+    // === 下面和以前完全一致 ===
+    if bytes.len() < 12 { return None; }           // 12-byte nonce
+    let (nonce, cipher) = bytes.split_at(12);
+
+    let key = derive_invite_key();                 // ★ 见第 3 节安全提示
+    let mut buf = cipher.to_vec();
+    let mut chacha = ChaCha20::new(&key.into(), nonce.into());
+    chacha.apply_keystream(&mut buf);
+
+    serde_json::from_slice::<Invite>(&buf)
+        .map(|v| (v.server, v.room_id, v.room_key))
+        .ok()
+}

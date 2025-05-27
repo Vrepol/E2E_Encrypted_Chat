@@ -7,7 +7,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
 };
-
+use super::utils::parse_invitation;
 use super::crypto;
 use colored::*;
 use hmac::{Hmac, Mac};
@@ -15,13 +15,52 @@ use sha2::Sha256;
 /// 返回已经握手成功、可以直接进入聊天循环的
 /// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
 pub async fn connect_and_login(
-    server_addr: &str,
+    server_addr_or_invite: &str,
     nickname: &str,
 ) -> Result<(Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
             tokio::net::tcp::OwnedWriteHalf,
             String,String)> {
+            if server_addr_or_invite.starts_with("/INVITE:") {
+                // 1) 解码
+                let (server_addr, room_id, pwd) = match parse_invitation(server_addr_or_invite) {
+                    Some(t) => t,
+                    None => {
+                        // 直接返回带中文提示的 anyhow 错误
+                        return Err(anyhow!("邀请码无效或已过期"));
+                    }
+                };
+        
+                // 2) 先连 TCP
+                let stream = TcpStream::connect(&server_addr).await?;
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+        
+                // 与原流程相同：读取 "ROOMS ..." 横幅
+                let first = lines.next_line().await?
+                    .ok_or_else(|| anyhow!("server closed during handshake"))?;
+                if !first.starts_with("ROOMS") {
+                    return Err(anyhow!("unexpected banner: {}", first));
+                }
+        
+                // 3) 直接拼 JOIN 指令，无需交互
+                let digest = Md5::digest(format!("{room_id}{pwd}"));
+                crypto::set_room_key(&hex::encode(digest));
+                let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
+                mac.update(b"Hello");
+                let credential = hex::encode(mac.finalize().into_bytes());
+                let cmd = format!("JOIN {room_id} {credential} {nickname}\n");
+                writer.write_all(cmd.as_bytes()).await?;
+        
+                // 4) 等待服务器 OK
+                let resp = lines.next_line().await?
+                    .ok_or_else(|| anyhow!("server closed during handshake-2"))?;
+                if resp.trim() != "OK" {
+                    return Err(anyhow!("server refused: {}", resp));
+                }
+                return Ok((lines, writer, room_id,pwd));
+            }
     // 0. TCP 连接
-    let stream = TcpStream::connect(server_addr).await?;
+    let stream = TcpStream::connect(server_addr_or_invite).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 

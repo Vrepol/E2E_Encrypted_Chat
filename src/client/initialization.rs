@@ -3,7 +3,7 @@ use fake::Fake;
 use fake::locales::{FR_FR};
 use fake::faker::name::raw::*;
 use colored::*;
-pub fn initial() -> io::Result<(String, &'static str)> {
+pub fn initial_name() -> io::Result<String> {
     // ---------- 询问昵称 ----------
     let username = loop {
         println!("{}","Continue with fake name".purple());
@@ -20,34 +20,50 @@ pub fn initial() -> io::Result<(String, &'static str)> {
         }
     };
     println!("{} {}","Enjoy youself, ".green(),username.clone().to_string().green());
+    Ok(username)
+}
+pub fn initial() -> io::Result<String> {
+
     let servers = vec![
-    ("Public server", "8.153.67.166:6655"),
-    ("Tailscale server", "100.123.171.94:6655"),
+        ("Public server", "8.153.67.166:6655"),
+        ("Tailscale server", "100.123.171.94:6655"),
     ];
 
-    // 2. 打印名称列表
-    println!("Avaliable Severs:");
-    for (i, (name, _addr)) in servers.iter().enumerate() {
-        println!("  {}. {}", i + 1, name);
-    }
-    print!("Choose From (1-{}): ", servers.len());
-    io::stdout().flush()?;
+    // 交互循环直到拿到合法输入
+    let chosen = loop {
+        println!("\nAvaliable Servers:");
+        for (i, (name, _)) in servers.iter().enumerate() {
+            println!("  {}. {}", i + 1, name);
+        }
+        print!("Choice / IP:Port / /INVITE:…  ➜ ");
+        io::stdout().flush()?;
 
-    // 3. 读取用户输入并映射到地址
-    let mut choice = String::new();
-    io::stdin().read_line(&mut choice)?;
-    let idx = choice.trim()
-        .parse::<usize>()
-        .ok()
-        .filter(|&n| n >= 1 && n <= servers.len())
-        .map(|n| n - 1)
-        .unwrap_or(0);
+        let mut inp = String::new();
+        io::stdin().read_line(&mut inp)?;
+        let s = inp.trim();
+        if s.is_empty() {
+            println!("Default Choice : {}", servers[0].0);
+            break servers[0].1.to_string();
+        }
+        // 1️⃣ 数字
+        if let Ok(idx) = s.parse::<usize>() {
+            if (1..=servers.len()).contains(&idx) {
+                break servers[idx - 1].1.to_string();
+            }
+        }
+        // 2️⃣ IP:Port  (简单正则校验 0-255.0-255.0-255.0-255:数字)
+        if regex::Regex::new(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
+            .unwrap()
+            .is_match(s)
+        {
+            break s.to_string();
+        }
+        // 3️⃣ 邀请码
+        if s.starts_with("/INVITE:") {
+            break s.to_string();
+        }
+        println!("输入无效，请重来！");
+    };
 
-    // 4. 直接解构拿到服务器名和地址
-    let (server_name, server_addr) = servers[idx];
-    println!("Connecting to {} …", server_name);
-
-    //println!("Connecting {} …", server_addr);
-    // 把 &str 转成 String，和签名统一
-    Ok((username, &server_addr))
+    Ok(chosen)
 }
