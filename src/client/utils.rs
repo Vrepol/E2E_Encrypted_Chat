@@ -101,7 +101,7 @@ pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
     }
 }
 use anyhow::Result;
-use std::path::Path;
+use std::{fmt::format, path::Path};
 use tokio::fs;
 use base64::{engine::general_purpose, Engine as _};
 
@@ -228,4 +228,13 @@ pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {
     serde_json::from_slice::<Invite>(&buf)
         .map(|v| (v.server, v.room_id, v.room_key))
         .ok()
+}
+
+pub fn inviation_clear(inv: &str) -> String{
+    if inv.starts_with("/INVITE:"){
+        format!("")
+    } else {
+        inv.to_string()
+    }
+    
 }

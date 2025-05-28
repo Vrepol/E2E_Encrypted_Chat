@@ -74,18 +74,21 @@ pub async fn connect_and_login(
     }
     let rooms: Vec<String> = first.split_whitespace().skip(1).map(|s| s.to_owned()).collect();
     if rooms.is_empty() {
-        println!("{}","— 服务器当前没有房间 —".green().bold());
+        println!("\n{}","— 服务器当前没有房间 —".green().bold());
     } else {
-        println!("{} \n {}","— 可加入的房间 —".green().bold(), rooms.join("; "));
+        println!("\n{} \n {}","— 可加入的房间 —".green().bold(), rooms.join("; "));
     }
 
     // 2. 本地交互：输入房间号 & 密码
     let (room_id, pwd, action) = loop {
-        print!("{}","留空则为大厅,".yellow().bold());
+        print!("{}","输入 \"/q\" 退出连接, 留空则为大厅,".yellow().bold());
         print!("{}","输入房间号：".blue());
         io::stdout().flush()?;
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
+
+        if id.trim()=="/q"{return Err(anyhow!("断开服务器"));}
+
         let id = if id.trim().is_empty() {"Public"} else {id.trim()} ;
         if id != "Public" {
             print!("{}","输入密码时不会显示,".yellow().bold());

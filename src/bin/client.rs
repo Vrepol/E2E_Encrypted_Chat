@@ -22,7 +22,7 @@ use tui::{
 };
 use colored::*;
 use unicode_width::UnicodeWidthStr;
-use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation};
+use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation,inviation_clear};
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use textwrap::wrap;
@@ -54,30 +54,35 @@ enum Event<I> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let username = initial_name()?;
+    let mut server_addr =initial_serveraddr()?;
     /* ---------- 1. 在这里初始化用户名和服务器 ---------- */
     loop {
     //如果用户是通过邀请码进入的房间退出房间后会回到选择服务器界面
     //TODO：用户在选择房间界面，能否按下Esc回到服务器选择界面
     //因为用户一旦连接上了某个服务器后就无法使用邀请码进入房间了
-    let mut server_addr =initial_serveraddr()?;
+    
     /* ---------- 2. 网络 <-> UI 的通道 ---------- */
     let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>(); // 网络 → UI
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
 
-    
-    //非异步函数，返还的是服务器当前的房间列表
-    //在这个函数中需要在这里插入房间选择与验证，让服务端分配客户至某个房间
+    //得到服务器地址后开始握手
     let (lines, writer, room_id,pwd) = loop {
+        if server_addr.is_empty() {
+            let new_addr = initial_serveraddr()?;
+            server_addr = new_addr;
+        }
         match handshake::connect_and_login(&server_addr, &username).await {
             Ok((lines, writer, room_id,pwd)) => {
                 break (lines, writer, room_id,pwd);
             }
             Err(e) if e.to_string().contains("邀请码无效") => {
                 eprintln!("❌ 邀请码无效或已过期，请重新选择服务器或输入新的邀请码。\n");
-                // 关键：清空 server_addr ⇒ 下一圈会重新调用 initialization::initial()
                 server_addr.clear();
             }
-    
+            Err(e) if e.to_string().contains("断开服务器") => {
+                eprintln!("断开服务器... \n");
+                server_addr.clear();
+            }
             // 其它网络 / IO 错误，也让用户重选
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -85,11 +90,11 @@ async fn main() -> Result<()> {
             }
             
         }
-        if server_addr.is_empty() {
-            let new_addr = initial_serveraddr()?;
-            server_addr = new_addr;
-        }
+        
     };
+    //特性：受邀请者退出房间后回到服务器选择界面，而且在房间中无法生成正确的邀请码
+    server_addr=inviation_clear(&server_addr);
+
     /* ---------- 3. 启动网络任务（自动重连 + 心跳） ---------- */
     tokio::spawn(async move {
         if let Err(e) = network::chat_loop(lines, writer, net_tx, out_rx).await {

@@ -41,10 +41,10 @@ pub fn initial_serveraddr() -> io::Result<String> {
         let mut inp = String::new();
         io::stdin().read_line(&mut inp)?;
         let s = inp.trim();
-        // if s.is_empty() {
-        //     println!("Default Choice : {}", servers[0].0);
-        //     break servers[0].1.to_string();
-        // }
+        if s.is_empty() {
+            println!("Default Choice : {}", servers[0].0);
+            break servers[0].1.to_string();
+        }
         // 1️⃣ 数字
         if let Ok(idx) = s.parse::<usize>() {
             if (1..=servers.len()).contains(&idx) {
