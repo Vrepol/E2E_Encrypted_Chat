@@ -7,3 +7,4 @@ pub mod sounds;
 pub mod initialization;
 pub mod handshake;
 pub mod clipboard;
+pub mod keyboard;

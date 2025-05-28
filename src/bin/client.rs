@@ -33,6 +33,7 @@ use base64::Engine as _;
 use rust_chat::client::clipboard::{self, ClipData};
 use crossterm::event::KeyModifiers;
 use tempfile;
+use rust_chat::client::keyboard::{OpKind,UndoMgr};
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
@@ -50,6 +51,7 @@ enum Event<I> {
     Input(I),
     Tick,
 }
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -143,6 +145,7 @@ async fn main() -> Result<()> {
     let img_tempdir = tempfile::Builder::new()
         .prefix("rust_chat_images")
         .tempdir()?;
+    let mut undo_mgr = UndoMgr::new();
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
         // ——— 绘制 ———
@@ -230,11 +233,11 @@ async fn main() -> Result<()> {
         // ——— 处理键盘事件 ———
         match ev_rx.recv() {
             Ok(Event::Input(key)) => match key.code {
-                // 1) Ctrl + V 贴入
-                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     match clipboard::get() {
                         Ok(ClipData::Text(txt)) => {
                             // 插到光标处
+                            undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                             let byte_idx = nth_grapheme_byte_idx(&input, cursor);
                             input.insert_str(byte_idx, &txt);
                             cursor += txt.graphemes(true).count();
@@ -268,6 +271,7 @@ async fn main() -> Result<()> {
                 },
                 KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) 
                     =>{
+                        undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                         let s = ch.to_string();
                         let byte_idx = nth_grapheme_byte_idx(&input, cursor);
                         input.insert_str(byte_idx, &s);
@@ -313,6 +317,7 @@ async fn main() -> Result<()> {
                 // Backspace：删掉光标左侧 1 个字符
                 KeyCode::Backspace => {
                     if cursor > 0 {
+                        undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                         let start = nth_grapheme_byte_idx(&input, cursor - 1);
                         let end   = nth_grapheme_byte_idx(&input, cursor);
                         input.replace_range(start..end, "");
@@ -320,6 +325,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 KeyCode::Enter => {
+                    undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                     let msg = input.trim();
                     if !msg.is_empty() {
                         // 把输入通过 out_tx 发给网络任务
@@ -329,8 +335,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 //清空输入框
-                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL)
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL)
                 =>{
+                    undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                     input.clear();
                     cursor = 0;
                     }
@@ -341,7 +348,9 @@ async fn main() -> Result<()> {
                         list_state.select(Some(i.saturating_sub(step)));
                     }
                 }
-                
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    undo_mgr.undo(&mut input, &mut cursor);
+                }
                 KeyCode::Up => {
                     let step = 1;
                     // 按 ↑，选中上一条
