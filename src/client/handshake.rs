@@ -12,6 +12,7 @@ use super::crypto;
 use colored::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use rand::{distr::Alphanumeric, Rng};
 /// 返回已经握手成功、可以直接进入聊天循环的
 /// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
 pub async fn connect_and_login(
@@ -87,7 +88,28 @@ pub async fn connect_and_login(
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
 
-        if id.trim()=="/q"{return Err(anyhow!("断开服务器"));}
+        if id.trim()=="/q"{
+            return Err(anyhow!("断开服务器"));
+        } else if id.trim() =="'" {
+            let room_id: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(9)                                // 8‒10 都行，这里用 9
+                .map(char::from)
+                .collect();
+
+            // 2. 随机密码（16 字符，含部分符号提升复杂度）
+            const CHARSET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                abcdefghijklmnopqrstuvwxyz\
+                0123456789-_@#";
+            let pwd: String = (0..16)
+                .map(|_| {
+                    let idx = rand::rng().random_range(0..CHARSET.len());
+                    CHARSET[idx] as char
+                })
+                .collect();
+            break (room_id, pwd, "CREATE");
+        }
 
         let id = if id.trim().is_empty() {"Public"} else {id.trim()} ;
         if id != "Public" {
@@ -98,9 +120,9 @@ pub async fn connect_and_login(
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
             break (id.to_owned(), pwd, act);
         } else {
-            let pwd = String::from("");
-            let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            break (id.to_owned(), pwd, act);
+        let pwd = String::from("");
+        let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
+        break (id.to_owned(), pwd, act);
         }
         
     };

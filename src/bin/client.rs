@@ -268,7 +268,6 @@ async fn main() -> Result<()> {
                 },
                 KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) 
                     =>{
-                        // 1 个 Unicode grapheme 当做一个 char 插入
                         let s = ch.to_string();
                         let byte_idx = nth_grapheme_byte_idx(&input, cursor);
                         input.insert_str(byte_idx, &s);
@@ -277,24 +276,19 @@ async fn main() -> Result<()> {
                     KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL)
                 =>{
                     let result = create_invitation(server_addr.to_string().clone(),room_id.clone(),pwd.clone());
-                    // 2) 解包 Result
                     match result {
                         Ok(code) => {
-                            // code 是 String，正好可以发出去
                             let _ = out_tx.send(format!("/INVITE:{}", code));
                         }
                         Err(err) => {
                             let _ = out_tx.send("生成邀请码失败".to_string());
-                            // 根据业务决定：提示、log、忽略……
                             eprintln!("生成邀请码失败：{}", err);
                             },
                         }
                     }
                 // ←  向左
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor > 0 {
-                        cursor = 0;
-                    }
+                    cursor = cursor.saturating_sub(3);
                 }
                 KeyCode::Left => {
                     if cursor > 0 {

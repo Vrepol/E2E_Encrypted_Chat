@@ -101,7 +101,7 @@ pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
     }
 }
 use anyhow::Result;
-use std::{fmt::format, path::Path};
+use std::{path::Path};
 use tokio::fs;
 use base64::{engine::general_purpose, Engine as _};
 
