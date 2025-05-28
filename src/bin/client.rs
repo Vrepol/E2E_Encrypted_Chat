@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             }
             // 其它网络 / IO 错误，也让用户重选
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("HandShake Error: {}", e);
                 server_addr.clear();
             }
             
@@ -279,7 +279,11 @@ async fn main() -> Result<()> {
                     },
                     KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL)
                 =>{
-                    let result = create_invitation(server_addr.to_string().clone(),room_id.clone(),pwd.clone());
+                    let mut iter = server_addr.splitn(2, '&');
+                    let server = iter.next().unwrap_or("");
+                    let server_pwd = iter.next().unwrap_or("");
+                    let result = create_invitation(server.to_string().clone(),server_pwd.to_string().clone()
+                                ,room_id.clone(),pwd.clone());
                     match result {
                         Ok(code) => {
                             let _ = out_tx.send(format!("/INVITE:{}", code));

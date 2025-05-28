@@ -14,6 +14,21 @@ fn broadcast_member_list(info: &RoomInfo) {
         let names: Vec<_> = info.members.iter().cloned().collect();
         let _ = info.tx.send(format!("/member_list {}\n", names.join(",")));
 }
+use clap::Parser;
+use once_cell::sync::OnceCell;
+use rust_chat::client::crypto::{pwd_hash, dec_auth};
+
+#[derive(Parser)]
+struct Args {
+    /// 监听端口
+    #[arg(short, long, default_value_t = 6655)]
+    port: u16,
+    /// 服务器口令（必填）
+    #[arg(short = 'k', default_value = "Vrepol")]
+    password: String,
+}
+
+static SERVER_PWD_HASH: OnceCell<[u8; 32]> = OnceCell::new();
 struct RoomInfo {
     tx: broadcast::Sender<String>,
     credential: String,
@@ -48,8 +63,12 @@ impl Drop for RoomGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:6655").await?;
-    println!("🛰️  Chat-Server listening on 6655");
+    let args = Args::parse();
+    SERVER_PWD_HASH.set(pwd_hash(&args.password)).unwrap();
+
+    let bind_addr = format!("0.0.0.0:{}", args.port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    println!("🛰️  Chat-Server listening on {}", bind_addr);
 
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
@@ -76,7 +95,21 @@ async fn main() -> Result<()> {
 async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
-
+    /* ---------- ②-a 等待客户端 AUTH ---------- */
+    let auth_line = match lines.next_line().await? {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    if !auth_line.starts_with("AUTH ") {
+        writer.write_all(b"ERR NeedAUTH\n").await?;
+        return Ok(());
+    }
+    let auth_ok = dec_auth(&auth_line[5..], SERVER_PWD_HASH.get().unwrap());
+    if !auth_ok {
+        writer.write_all(b"ERR BadAuth\n").await?;
+        return Ok(());
+    }
+    writer.write_all(b"OK\n").await?;
     /* ---------- ① 发送房间列表 ---------- */
     let room_line = {
         let map = rooms.lock().unwrap();

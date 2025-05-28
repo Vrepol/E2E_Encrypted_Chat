@@ -161,6 +161,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD};
 #[derive(Serialize, Deserialize)]
 struct Invite {
     server:   String,
+    enc_pwd:  Vec<u8>,
     room_id:  String,
     room_key: String,
 }
@@ -174,15 +175,18 @@ fn derive_invite_key() -> [u8; 32] {
     }
     key
 }
-pub fn create_invitation(server_addr:String,room_id:String,pwd:String) -> Result<String, Box<dyn std::error::Error>>{
+pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd:String) 
+        -> Result<String, Box<dyn std::error::Error>>{
     let key = derive_invite_key();
     // 随机 12 字节 nonce
     let mut nonce = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce);
-
+    use super::crypto::{chacha_once,pwd_hash};
+    let auth = chacha_once(b"OK", &pwd_hash(&server_pwd));
     // 序列化明文
     let inv = Invite {
         server:   server_addr,
+        enc_pwd:  auth,
         room_id,
         room_key: pwd,
     };
@@ -200,7 +204,7 @@ pub fn create_invitation(server_addr:String,room_id:String,pwd:String) -> Result
     Ok(URL_SAFE_NO_PAD.encode(out))
 }
 
-pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {
+pub fn parse_invitation(inv: &str) -> Option<(String, Vec<u8>, String, String)> {
     let raw = inv.strip_prefix("/INVITE:")?;   // 非邀请码直接 None
 
     // ---------- A. 尝试 URL-safe Base64 ----------
@@ -226,7 +230,7 @@ pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {
     chacha.apply_keystream(&mut buf);
 
     serde_json::from_slice::<Invite>(&buf)
-        .map(|v| (v.server, v.room_id, v.room_key))
+        .map(|v| (v.server,v.enc_pwd , v.room_id, v.room_key))
         .ok()
 }
 

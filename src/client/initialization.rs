@@ -43,12 +43,21 @@ pub fn initial_serveraddr() -> io::Result<String> {
         let s = inp.trim();
         if s.is_empty() {
             println!("Default Choice : {}", servers[0].0);
-            break servers[0].1.to_string();
+            let key = String::from("Vrepol");
+            break format!("{}&{}",servers[0].1.to_string(),key);
         }
         // 1️⃣ 数字
         if let Ok(idx) = s.parse::<usize>() {
             if (1..=servers.len()).contains(&idx) {
-                break servers[idx - 1].1.to_string();
+                print!("Server Password: ");
+                io::stdout().flush()?;
+                let mut inp = String::new();
+                io::stdin().read_line(&mut inp)?;
+                let mut key = inp.trim();
+                if key.is_empty() {
+                    key = "Vrepol"
+                }
+                break format!("{}&{}",servers[idx - 1].1.to_string(),key.to_string());
             }
         }
         // 2️⃣ IP:Port  (简单正则校验 0-255.0-255.0-255.0-255:数字)
@@ -56,7 +65,15 @@ pub fn initial_serveraddr() -> io::Result<String> {
             .unwrap()
             .is_match(s)
         {
-            break s.to_string();
+            print!("Server Password: ");
+            io::stdout().flush()?;
+            let mut inp = String::new();
+            io::stdin().read_line(&mut inp)?;
+            let mut key = inp.trim();
+            if key.is_empty() {
+                key = "Vrepol"
+            }
+            break format!("{}&{}",s.to_string(),key.to_string());
         }
         // 3️⃣ 邀请码
         if s.starts_with("/INVITE:") {

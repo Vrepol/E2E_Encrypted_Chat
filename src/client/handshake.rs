@@ -23,19 +23,39 @@ pub async fn connect_and_login(
             String,String)> {
             if server_addr_or_invite.starts_with("/INVITE:") {
                 // 1) 解码
-                let (server_addr, room_id, pwd) = match parse_invitation(server_addr_or_invite) {
+                let (server_addr,enc_pwd, room_id, pwd) = match parse_invitation(server_addr_or_invite) {
                     Some(t) => t,
                     None => {
                         // 直接返回带中文提示的 anyhow 错误
                         return Err(anyhow!("邀请码无效或已过期"));
                     }
                 };
-        
+                //return Err(anyhow!("s:{},sk:{:?},r:{},rk:{}",server_addr,enc_pwd, room_id, pwd));
                 // 2) 先连 TCP
                 let stream = TcpStream::connect(&server_addr).await?;
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
-        
+                let auth = {
+                    // enc_pwd1 是 Base64(layer-1)
+                    use super::crypto::{period_key};
+                    use chrono::Utc;
+                    use base64::Engine;
+                    // 再包第二层
+                    let outer = {
+                        let now = Utc::now().timestamp();
+                        super::crypto::chacha_once(&enc_pwd, &period_key(now))
+                    };
+                    base64::engine::general_purpose::STANDARD.encode(outer)
+                };
+                writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
+                // 等待 OK
+                let resp = lines.next_line().await?
+                    .ok_or_else(|| anyhow!("server closed during auth"))?;
+                if resp.trim() != "OK" {
+                    return Err(anyhow!("服务器拒绝：{}", resp));
+                }
+
+
                 // 与原流程相同：读取 "ROOMS ..." 横幅
                 let first = lines.next_line().await?
                     .ok_or_else(|| anyhow!("server closed during handshake"))?;
@@ -61,9 +81,25 @@ pub async fn connect_and_login(
                 return Ok((lines, writer, room_id,pwd));
             }
     // 0. TCP 连接
-    let stream = TcpStream::connect(server_addr_or_invite).await?;
+    use super::crypto::enc_auth;
+
+    let mut iter = server_addr_or_invite.splitn(2, '&');
+    let server = iter.next().unwrap_or("");
+    let password = iter.next().unwrap_or("");
+
+    let stream = TcpStream::connect(server).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+    let auth = enc_auth(password);        // server_pwd = 用户输入的服务器口令
+
+
+    writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
+    // 等待 OK
+    let resp = lines.next_line().await?
+        .ok_or_else(|| anyhow!("server closed during auth"))?;
+    if resp.trim() != "OK" {
+        return Err(anyhow!("服务器拒绝：{}", resp));
+    }
 
     // 1. 服务器首条消息：房间列表
     let first = lines
