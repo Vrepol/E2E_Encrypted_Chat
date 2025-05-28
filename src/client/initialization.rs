@@ -22,7 +22,7 @@ pub fn initial_name() -> io::Result<String> {
     println!("{} {}","Enjoy youself, ".green(),username.clone().to_string().green());
     Ok(username)
 }
-pub fn initial() -> io::Result<String> {
+pub fn initial_serveraddr() -> io::Result<String> {
 
     let servers = vec![
         ("Public server", "8.153.67.166:6655"),
@@ -41,10 +41,10 @@ pub fn initial() -> io::Result<String> {
         let mut inp = String::new();
         io::stdin().read_line(&mut inp)?;
         let s = inp.trim();
-        if s.is_empty() {
-            println!("Default Choice : {}", servers[0].0);
-            break servers[0].1.to_string();
-        }
+        // if s.is_empty() {
+        //     println!("Default Choice : {}", servers[0].0);
+        //     break servers[0].1.to_string();
+        // }
         // 1️⃣ 数字
         if let Ok(idx) = s.parse::<usize>() {
             if (1..=servers.len()).contains(&idx) {
@@ -62,7 +62,7 @@ pub fn initial() -> io::Result<String> {
         if s.starts_with("/INVITE:") {
             break s.to_string();
         }
-        println!("输入无效，请重来！");
+        println!("输入选项或邀请码！");
     };
 
     Ok(chosen)

@@ -27,7 +27,7 @@ use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod netw
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use textwrap::wrap;
 use unicode_segmentation::UnicodeSegmentation;
-use rust_chat::client::initialization::{initial,initial_name};
+use rust_chat::client::initialization::{initial_serveraddr,initial_name};
 use rust_chat::client::handshake;
 use base64::Engine as _;
 use rust_chat::client::clipboard::{self, ClipData};
@@ -56,7 +56,10 @@ async fn main() -> Result<()> {
     let username = initial_name()?;
     /* ---------- 1. 在这里初始化用户名和服务器 ---------- */
     loop {
-    let mut server_addr =initial()?;
+    //如果用户是通过邀请码进入的房间退出房间后会回到选择服务器界面
+    //TODO：用户在选择房间界面，能否按下Esc回到服务器选择界面
+    //因为用户一旦连接上了某个服务器后就无法使用邀请码进入房间了
+    let mut server_addr =initial_serveraddr()?;
     /* ---------- 2. 网络 <-> UI 的通道 ---------- */
     let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>(); // 网络 → UI
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
@@ -83,7 +86,7 @@ async fn main() -> Result<()> {
             
         }
         if server_addr.is_empty() {
-            let new_addr = initial()?;
+            let new_addr = initial_serveraddr()?;
             server_addr = new_addr;
         }
     };
@@ -390,7 +393,7 @@ async fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
     println!("{} [{}]","❌ 退出房间",room_id);
-    println!("{}","========Press Crtl + C to quit========".red().bold());
+    println!("{}","========Press Crtl + C to quit========\n".red().bold());
     continue;
     }
     Ok(())
