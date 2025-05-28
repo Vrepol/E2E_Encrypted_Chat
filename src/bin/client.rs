@@ -328,6 +328,12 @@ async fn main() -> Result<()> {
                         cursor = 0;
                     }
                 }
+                //清空输入框
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL)
+                =>{
+                    input.clear();
+                    cursor = 0;
+                    }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let step = 5;
                     // 按 ↑，选中上一条
