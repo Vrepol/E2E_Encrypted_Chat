@@ -182,7 +182,7 @@ pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd
     let mut nonce = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce);
     use super::crypto::{chacha_once,pwd_hash};
-    let auth = chacha_once(b"OK", &pwd_hash(&server_pwd));
+    let auth = chacha_once(b"OKYOUARECORRECT", &pwd_hash(&server_pwd));
     // 序列化明文
     let inv = Invite {
         server:   server_addr,

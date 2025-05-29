@@ -81,7 +81,7 @@ pub fn chacha_once(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
 /// 生成 AUTH 的二层密文（→ Base64）
 pub fn enc_auth(pwd: &str) -> String {
     let now = Utc::now().timestamp();
-    let inner = chacha_once(b"OK", &pwd_hash(pwd));      // layer-1
+    let inner = chacha_once(b"OKYOUARECORRECT", &pwd_hash(pwd));      // layer-1
     let outer = chacha_once(&inner, &period_key(now));            // layer-2
     b64::STANDARD.encode(outer)
 }
@@ -94,7 +94,7 @@ pub fn dec_auth(auth_b64: &str, pwd_hash: &[u8; 32]) -> bool {
         let outer_key = period_key(now + delta);
         let stage1 = chacha_once(&cipher, &outer_key);            // remove layer-2
         let plain  = chacha_once(&stage1, pwd_hash);              // remove layer-1
-        if plain == b"OK" { return true; }                       // 明文用固定串“OK”
+        if plain == b"OKYOUARECORRECT" { return true; }                       // 明文用固定串“OK”
     }
     false
 }
