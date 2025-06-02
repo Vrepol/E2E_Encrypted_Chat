@@ -1,7 +1,7 @@
 // src/bin/client.rs
 use anyhow::Result;
 use crossterm::{
-    event::{self, EnableMouseCapture, Event as CEvent, KeyCode},
+    event::{self, EnableMouseCapture, Event as CEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,29 +18,15 @@ use tui::{
     Terminal,
 };
 use colored::*;
-use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation,
-    inviation_clear,HELP_TEXT};
+use rust_chat::client::utils::inviation_clear;
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
-use unicode_segmentation::UnicodeSegmentation;
 use rust_chat::client::initialization::{initial_serveraddr,initial_name};
 use rust_chat::client::handshake;
-use base64::Engine as _;
-use rust_chat::client::clipboard::{self, ClipData};
-use crossterm::event::KeyModifiers;
 use tempfile;
-use rust_chat::client::keyboard::{OpKind,UndoMgr};
+use rust_chat::client::keyboard::UndoMgr;
+use rust_chat::client::keyboard::{handle_key, KeyCtx, ControlFlow};
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
-fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
-    s.grapheme_indices(true)
-     .nth(n)
-     .map(|(idx, _)| idx)
-     .unwrap_or_else(|| s.len())
-}
-fn open_image(path: &std::path::Path) -> anyhow::Result<()> {
-    open::that(path)?;
-    Ok(())
-}
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
 enum Event<I> {
@@ -166,173 +152,24 @@ async fn main() -> Result<()> {
         })?;
         // ——— 处理键盘事件 ———
         match ev_rx.recv() {
-            Ok(Event::Input(key)) => match key.code {
-                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    match clipboard::get() {
-                        Ok(ClipData::Text(txt)) => {
-                            // 插到光标处
-                            undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
-                            let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-                            input.insert_str(byte_idx, &txt);
-                            cursor += txt.graphemes(true).count();
-                        }
-                        Ok(ClipData::Image(img)) => {
-                            let png_buf = encode_rgba_as_png(&img.bytes,
-                                img.width.try_into().unwrap(),
-                                img.height.try_into().unwrap(),)?;
-                            // TODO: 把 img.bytes 转 base64，构造占位符发送
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
-                            let placeholder = format!("/IMGDATA");
-                            // 这里直接发送占位符，后续可改成真正的图片协议
-                            let _ = out_tx.send(format!("{}{}", placeholder, b64));
-                        }
-                        Err(e) => {
-                            // 如果既不是文本也不是图片，也把错误发到聊天框
-                            let tip = format!("⚠️ 读取剪贴板失败: {}", e);
-                            let _ = out_tx.send(tip);
-                        },
-                    }
-                },
-                
-                // 2) Ctrl + C 复制选中行
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(sel) = list_state.selected() {
-                        let (_, _, body) = parse_name_body(&messages[sel]);  // 去掉前缀
-                        if let Err(e) = clipboard::set_text(&body) {
-                            eprintln!("⚠️ 复制失败: {e}");
-                        }
-                    }
-                },
-
-                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = out_tx.send(format!("{}", HELP_TEXT));
-                },
-                KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) 
-                    =>{
-                        undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
-                        let s = ch.to_string();
-                        let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-                        input.insert_str(byte_idx, &s);
-                        cursor += 1;
-                    },
-                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL)
-                =>{
-                    let mut iter = server_addr.splitn(2, '&');
-                    let server = iter.next().unwrap_or("");
-                    let server_pwd = iter.next().unwrap_or("");
-                    let result = create_invitation(server.to_string().clone(),server_pwd.to_string().clone()
-                                ,room_id.clone(),pwd.clone());
-                    match result {
-                        Ok(code) => {
-                            let _ = out_tx.send(format!("/INVITE:{}", code));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send("生成邀请码失败".to_string());
-                            eprintln!("生成邀请码失败：{}", err);
-                            },
-                        }
-                    }
-                // ←  向左
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    cursor = cursor.saturating_sub(3);
+            Ok(Event::Input(key)) => {
+                let mut ctx = KeyCtx {
+                    input:       &mut input,
+                    cursor:      &mut cursor,
+                    list_state:  &mut list_state,
+                    messages:    &mut messages,
+                    member_list: &mut member_list,
+                    undo_mgr:    &mut undo_mgr,
+                    out_tx:      &out_tx,
+                    server_addr: &mut server_addr,
+                    room_id:     &room_id,
+                    pwd:         &pwd,
+                    username:    &username,
+                };
+                if let ControlFlow::Quit = handle_key(key, &mut ctx) {
+                    break 'ui;                      // ← Esc 时优雅退出
                 }
-                KeyCode::Left => {
-                    if cursor > 0 {
-                        cursor -= 1;
-                    }
-                }
-                
-                // →  向右
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let total = input.graphemes(true).count();
-                    if cursor < total {
-                        cursor = total;
-                    }
-                }
-                KeyCode::Right => {
-                    let total = input.graphemes(true).count();
-                    if cursor < total {
-                        cursor += 1;
-                    }
-                }
-            
-                // Backspace：删掉光标左侧 1 个字符
-                KeyCode::Backspace => {
-                    if cursor > 0 {
-                        undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
-                        let start = nth_grapheme_byte_idx(&input, cursor - 1);
-                        let end   = nth_grapheme_byte_idx(&input, cursor);
-                        input.replace_range(start..end, "");
-                        cursor -= 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
-                    let msg = input.trim();
-                    if !msg.is_empty() {
-                    
-                        // 把输入通过 out_tx 发给网络任务
-                        let _ = out_tx.send(msg.to_string());
-                        input.clear();
-                        cursor = 0;
-                    }
-                }
-                //清空输入框
-                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL)
-                =>{
-                    undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
-                    input.clear();
-                    cursor = 0;
-                    }
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let step = 5;
-                    // 按 ↑，选中上一条
-                    if let Some(i) = list_state.selected() {
-                        list_state.select(Some(i.saturating_sub(step)));
-                    }
-                }
-                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    undo_mgr.undo(&mut input, &mut cursor);
-                }
-                KeyCode::Up => {
-                    let step = 1;
-                    // 按 ↑，选中上一条
-                    if let Some(i) = list_state.selected() {
-                        list_state.select(Some(i.saturating_sub(step)));
-                    }
-                }
-
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    list_state.select(Some(messages.len()-1));
-                }
-
-                KeyCode::Down => {
-                    let step = 1;
-                    // 按 ↓，选中下一条
-                    if let Some(i) = list_state.selected() {
-                        let next = (i + step).min(messages.len().saturating_sub(1));
-                        list_state.select(Some(next));
-                    }
-                }
-                KeyCode::Tab => {
-                    if let Some(selected) = list_state.selected() {
-                        // 假设 images 是 Vec<Option<PathBuf>>
-                        if let ChatMessage::Image { path, .. } = &messages[selected] {
-                            if let Err(e) = open_image(path) {
-                                eprintln!("无法打开图片: {e}");
-                            }
-                        }
-                    }
-                }
-                KeyCode::Esc => {
-                    let _ = out_tx.send("//~``~//".to_string());
-                    drop(out_tx);
-                    break 'ui;
-                    
-                }
-                _ => {}
-                
-            },
+            }
             _ => {}
         }
 
