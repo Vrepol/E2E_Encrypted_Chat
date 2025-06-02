@@ -21,7 +21,8 @@ use tui::{
     Terminal,
 };
 use colored::*;
-use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation,inviation_clear};
+use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation,
+    inviation_clear,HELP_TEXT};
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
 use unicode_segmentation::UnicodeSegmentation;
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
     let img_tempdir = tempfile::Builder::new()
-        .prefix("rust_chat_images")
+        .prefix("")
         .tempdir()?;
     let mut undo_mgr = UndoMgr::new();
     /* ---------- 7. 主循环 ---------- */
@@ -277,6 +278,10 @@ async fn main() -> Result<()> {
                         }
                     }
                 },
+
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = out_tx.send(format!("{}", HELP_TEXT));
+                },
                 KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) 
                     =>{
                         undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
@@ -340,6 +345,7 @@ async fn main() -> Result<()> {
                     undo_mgr.maybe_push(&input, cursor, OpKind::Insert);
                     let msg = input.trim();
                     if !msg.is_empty() {
+                    
                         // 把输入通过 out_tx 发给网络任务
                         let _ = out_tx.send(msg.to_string());
                         input.clear();
@@ -394,7 +400,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 KeyCode::Esc => {
-                    let _ = out_tx.send("/leave".to_string());
+                    let _ = out_tx.send("//~``~//".to_string());
                     drop(out_tx);
                     break 'ui;
                     

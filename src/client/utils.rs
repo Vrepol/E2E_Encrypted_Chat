@@ -1,5 +1,16 @@
 use super::crypto::open;
 use super::receiver::ChatMessage;
+pub const HELP_TEXT: &str = r#"快捷键与命令说明：
+ 
+• Ctrl+X       → 贴入剪贴板文本/图片
+• Ctrl+C       → 复制当前选中消息 
+• Ctrl+Z       → 撤销输入框  
+• Ctrl+A       → 清空输入框
+• Ctrl+I       → 生成邀请码   
+• ←/→          → 移动光标（Ctrl+← 跳5字符，Ctrl+→ 跳至末尾）  
+• ↑/↓          → 列表选上下（Ctrl+↑ 跳 5 条，Ctrl+↓ 跳到底部）  
+• Tab          → 打开选中行的图片  
+• Esc          → 退出房间  "#;
 pub fn parse_text_img(line: &str) -> (String, String, String) {
     // 1. 先找出第一对 [name]
     let (name, after_name) = if let Some(start) = line.find('[') {
@@ -165,7 +176,7 @@ struct Invite {
     room_id:  String,
     room_key: String,
 }
-const PERIOD_SECS: i64 = 500;
+pub const PERIOD_SECS: i64 = 500;
 fn derive_invite_key() -> [u8; 32] {
     let period_id = Utc::now().timestamp() / PERIOD_SECS;
     let bytes = period_id.to_be_bytes(); // 8 bytes

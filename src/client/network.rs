@@ -43,7 +43,7 @@ pub async fn chat_loop(
             // 2) 写
             msg = out_rx.recv() => {
                 match msg {
-                    Some(text) if text == "/leave" => {
+                    Some(text) if text == "//~``~//" => {
                         // 然后再 shutdown 写端，发 FIN
                         writer.shutdown().await?;
                         break;  // 结束 chat_loop
