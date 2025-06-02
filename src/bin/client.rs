@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
                     username:    &username,
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
-                    break 'ui;                      // ← Esc 时优雅退出
+                    break 'ui;
                 }
             }
             _ => {}
@@ -176,15 +176,16 @@ async fn main() -> Result<()> {
         // ——— 收网络消息 ———
         drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path(),&mut member_list,);
     }
-
+    use crate::event::DisableMouseCapture;
     /* ---------- 8. 清理退出 ---------- */
     drop(running);
-    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        //DisableMouseCapture
+        
     )?;
+    disable_raw_mode()?;
     terminal.show_cursor()?;
     println!("{} [{}]","❌ 退出房间",room_id);
     println!("{}","========Press Crtl + C to quit========\n".red().bold());
