@@ -19,7 +19,7 @@ pub enum ChatMessage {
     Image {
         path:    PathBuf,
         sender:  String,
-        ts:      String,   // 这里存储 Local::now().format("%H:%M:%S").to_string()
+        ts:      String,
     },
 }
 
@@ -73,7 +73,7 @@ pub fn drain_messages(
                     if let Ok(mut file) = File::create(&file_path) {
                         let _ = file.write_all(&bytes);
                         messages.push(ChatMessage::Image {
-                            path:   file_path,      // 已是 PathBuf
+                            path:   file_path,
                             sender: sender.clone(),
                             ts:     hms.clone(),
                         });

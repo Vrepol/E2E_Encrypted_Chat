@@ -26,7 +26,7 @@ pub fn parse_text_img(line: &str) -> (String, String) {
         ("???".into(), line)
     };
 
-    // 3. 剥掉 body 前的空格，尝试解密
+    // 2. 剥掉 body 前的空格，尝试解密
     let body_slice = after_name.trim_start();
     let body_plain = open(body_slice).unwrap_or_else(|| body_slice.to_owned());
 

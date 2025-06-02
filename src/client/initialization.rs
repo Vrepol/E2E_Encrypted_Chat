@@ -16,6 +16,15 @@ pub fn init_color() {
 
     colored::control::set_override(ok);
 }
+fn get_password_or_default()->String {
+    let mut inp = String::new();
+    let _ = io::stdin().read_line(&mut inp);
+    if inp.trim().is_empty() {
+        "Vrepol".to_string()
+    } else {
+        inp.trim().to_string()
+    }
+}
 pub fn initial_name() -> io::Result<String> {
     // ---------- 询问昵称 ----------
     let username = loop {
@@ -64,12 +73,7 @@ pub fn initial_serveraddr() -> io::Result<String> {
             if (1..=servers.len()).contains(&idx) {
                 print!("Server Password: ");
                 io::stdout().flush()?;
-                let mut inp = String::new();
-                io::stdin().read_line(&mut inp)?;
-                let mut key = inp.trim();
-                if key.is_empty() {
-                    key = "Vrepol"
-                }
+                let key = get_password_or_default();
                 break format!("{}&{}",servers[idx - 1].1.to_string(),key.to_string());
             }
         }
@@ -80,12 +84,7 @@ pub fn initial_serveraddr() -> io::Result<String> {
         {
             print!("Server Password: ");
             io::stdout().flush()?;
-            let mut inp = String::new();
-            io::stdin().read_line(&mut inp)?;
-            let mut key = inp.trim();
-            if key.is_empty() {
-                key = "Vrepol"
-            }
+            let key = get_password_or_default();
             break format!("{}&{}",s.to_string(),key.to_string());
         }
         // 3️⃣ 邀请码

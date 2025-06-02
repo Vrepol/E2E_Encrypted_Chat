@@ -38,7 +38,7 @@ pub fn draw_chat<B: Backend>(
             Constraint::Length(5),   // 输入框
         ])
         .split(size);
-    /* —— 以下内容几乎照搬你的闭包 —— */
+
     let chat_inner_width = (chunks[0].width - 2) as usize;
     const PREFIX_WIDTH: usize = 5;
 
@@ -104,7 +104,7 @@ pub fn draw_chat<B: Backend>(
 
     // —— 光标定位 —— //
     let inner_width = (chunks[2].width - 2) as usize;
-    let byte_idx = nth_grapheme_byte_idx(input, cursor);     // 你的工具函数
+    let byte_idx = nth_grapheme_byte_idx(input, cursor);
     let prefix   = &input[..byte_idx];
     let wrapped  = wrap(prefix, inner_width);
     let cursor_y = wrapped.len() as u16 - 1;
