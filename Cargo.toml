@@ -15,9 +15,9 @@ base64 = "0.22.1"
 chacha20 = "0.9"          # 纯 Rust，无 SIMD 依赖
 cipher   = "0.4.4"          # trait，只几 KB
 sha2     = "0.10"         # 可选：若想用口令派生 32 字节密钥
-unicode-width = "0.1.14"
-textwrap      = "0.16"
-winresource = "0.1"
+unicode-width = "0.2.0"
+textwrap      = { version = "0.16.2", default-features = false, features = ["unicode-width"] }
+winresource = "0.1.22"
 cpal = "0.15"
 unicode-segmentation = "1.11"
 chrono = "0.4"
@@ -32,7 +32,7 @@ fake = "4.3.0"
 arboard = "3.5.0"
 image = "0.25.6"
 open = "5"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1.17.0", features = ["v4"] }
 tempfile = "3"
 regex = "1.11.1"
 clap = { version = "4", features = ["derive"] }

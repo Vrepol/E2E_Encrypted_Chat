@@ -21,11 +21,9 @@ use tui::{
     Terminal,
 };
 use colored::*;
-use unicode_width::UnicodeWidthStr;
 use rust_chat::client::utils::{parse_name_body,encode_rgba_as_png,create_invitation,inviation_clear};
 use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
 use rust_chat::client::receiver::{drain_messages,ChatMessage};
-use textwrap::wrap;
 use unicode_segmentation::UnicodeSegmentation;
 use rust_chat::client::initialization::{initial_serveraddr,initial_name};
 use rust_chat::client::handshake;
@@ -141,7 +139,6 @@ async fn main() -> Result<()> {
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
-    const MAX_WIDTH: usize = 40;
     let img_tempdir = tempfile::Builder::new()
         .prefix("rust_chat_images")
         .tempdir()?;
@@ -157,40 +154,38 @@ async fn main() -> Result<()> {
                 .constraints([
                     Constraint::Min(1),
                     Constraint::Length(3),  // 新增的状态栏
-                    Constraint::Length(3),  // 输入框
+                    Constraint::Length(5),  // 输入框
                 ].as_ref())
                 .split(size);
             // 聊天记录
-            let items: Vec<ListItem> = messages
-                .iter()
-                .map(|raw| {
-                    let (name,time, display_body) = parse_name_body(raw);
-                    let color = if name == username { Color::Blue } else { Color::Red };
-                    let indent = if name == username { "" } else { "" };
-                    let symbol = if name == username { "$" } else { "$" };
+            let chat_inner_width = (chunks[0].width - 2) as usize;   // 去掉左右边框
+            const PREFIX_WIDTH: usize = 5;   // “└--$ ” / “|  $ ” 均占 5 列
 
-                    // 1) 首行：┌──[name]
-                    let mut spans = vec![
-                        Spans::from( Span::styled(
-                            format!("┌-[{}]-{}#{}",name,indent, time),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        ))
-                    ];
+            let items: Vec<ListItem> = messages.iter().map(|raw| {
+                let (name, time, display_body) = parse_name_body(raw);
+                let color  = if name == username { Color::Blue } else { Color::Red };
+                let symbol = "";
 
-                    // 2) body 多行
-                    let wrapped_lines = wrap(&display_body, MAX_WIDTH);
-                    for (i, line) in wrapped_lines.iter().enumerate() {
-                        // 首 body 行 用 └─，后续用空格对齐
-                        let prefix = if i==wrapped_lines.len()-1 { "└--" } else { "|  " };
-                        spans.push( Spans::from( Span::styled(
-                            format!("{}{} {}", prefix, symbol, line),
-                            Style::default().fg(color).add_modifier(Modifier::BOLD),
-                        )));
-                    }
+                // ① 头行
+                let mut spans = vec![Spans::from(
+                    Span::styled(format!("┌-[{}]-#{}", name, time),
+                                Style::default().fg(color).add_modifier(Modifier::BOLD))
+                )];
 
-                    ListItem::new(spans)
-                })
-                .collect();
+                // ② body 行（动态折行）
+                let wrap_width = chat_inner_width.saturating_sub(PREFIX_WIDTH);
+                let lines = wrap(&display_body, wrap_width);          // 先获得全部折行结果
+                let last = lines.len().saturating_sub(1);             // 最后一行的下标
+                for (i, line) in wrap(&display_body, wrap_width).iter().enumerate() {
+                    let prefix = if i == last { "└--$" } else { "|   " };
+                    spans.push(Spans::from(
+                        Span::styled(format!("{}{} {}", prefix, symbol, line),
+                                    Style::default().fg(color))
+                    ));
+                }
+
+                ListItem::new(spans)
+            }).collect();
             let title = format!("<Room: {}>", room_id.clone());
             let chat = List::new(items)
                 .block(
@@ -215,19 +210,32 @@ async fn main() -> Result<()> {
                 );
             f.render_widget(status, status_chunk);
                     
-            // 输入框
-            let input_box = Paragraph::new(input.as_ref()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("{} >", username))
-                    .style(Style::default().fg(Color::Rgb(0, 135, 0))),
-            );
+            use tui::widgets::Wrap;   // 头部引入
+
+            let input_box = Paragraph::new(input.as_ref())
+                .wrap(Wrap { trim: false })          // ★ 开启自动换行
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("{} >", username))
+                        .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                );
             f.render_widget(input_box, chunks[2]);
             //let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
+            use textwrap::wrap;
+            use unicode_width::UnicodeWidthStr;
+
+            let inner_width = (chunks[2].width - 2) as usize;   // 去掉边框
             let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-            let prefix = &input[..byte_idx];                       // 光标左侧内容
-            let display_width = UnicodeWidthStr::width(prefix) as u16;
-            f.set_cursor(chunks[2].x + display_width + 1, chunks[2].y + 1);  
+            let prefix   = &input[..byte_idx];                  // 光标左侧的字符串
+
+            // 把 prefix 按输入框宽度做同样的自动换行
+            let wrapped   = wrap(prefix, inner_width);
+            let cursor_y  = wrapped.len() as u16 - 1;           // 第几行（0-based）
+            let cursor_x = wrapped.last().unwrap().as_ref().width() as u16;
+
+            f.set_cursor(chunks[2].x + 1 + cursor_x,           // +1 让光标落在边框里面
+                        chunks[2].y + 1 + cursor_y);          // +1 跳过上边框 
         })?;
 
         // ——— 处理键盘事件 ———
