@@ -46,7 +46,7 @@ pub fn drain_messages(
         }
 
         // 拆分发送者、原始时间戳（这里不再用）和 body
-        let (sender, _orig_ts, body) = parse_text_img(&line);
+        let (sender, body) = parse_text_img(&line);
 
         // ★ 只有别人发的才提醒
         if sender != my_name {
