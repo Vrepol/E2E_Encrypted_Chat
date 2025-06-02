@@ -14,10 +14,7 @@ use std::{
 use tokio::sync::mpsc as tokio_mpsc;
 use tui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::ListState,
     Terminal,
 };
 use colored::*;
@@ -50,7 +47,11 @@ enum Event<I> {
     Input(I),
     Tick,
 }
-
+#[derive(Clone)]
+enum UiMode {
+    Chat,                             // 默认聊天界面
+    _ImagePreview(std::path::PathBuf), // 正在预览的图片路径
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -135,6 +136,7 @@ async fn main() -> Result<()> {
     });
 
     /* ---------- 6. 应用状态 ---------- */
+    let ui_mode = UiMode::Chat;
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut member_list: Vec<String>   = Vec::new();
     let mut input = String::new();
@@ -144,101 +146,24 @@ async fn main() -> Result<()> {
         .prefix("")
         .tempdir()?;
     let mut undo_mgr = UndoMgr::new();
+    use rust_chat::client::ui::{draw_chat};
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
-        // ——— 绘制 ———
         terminal.draw(|f| {
-            let size = f.size();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(3),  // 新增的状态栏
-                    Constraint::Length(5),  // 输入框
-                ].as_ref())
-                .split(size);
-            // 聊天记录
-            let chat_inner_width = (chunks[0].width - 2) as usize;   // 去掉左右边框
-            const PREFIX_WIDTH: usize = 5;   // “└--$ ” / “|  $ ” 均占 5 列
-
-            let items: Vec<ListItem> = messages.iter().map(|raw| {
-                let (name, time, display_body) = parse_name_body(raw);
-                let color  = if name == username { Color::Blue } else { Color::Red };
-                let symbol = "";
-
-                // ① 头行
-                let mut spans = vec![Spans::from(
-                    Span::styled(format!("┌-[{}]-#{}", name, time),
-                                Style::default().fg(color).add_modifier(Modifier::BOLD))
-                )];
-
-                // ② body 行（动态折行）
-                let wrap_width = chat_inner_width.saturating_sub(PREFIX_WIDTH);
-                let lines = wrap(&display_body, wrap_width);          // 先获得全部折行结果
-                let last = lines.len().saturating_sub(1);             // 最后一行的下标
-                for (i, line) in wrap(&display_body, wrap_width).iter().enumerate() {
-                    let prefix = if i == last { "└--$" } else { "|   " };
-                    spans.push(Spans::from(
-                        Span::styled(format!("{}{} {}", prefix, symbol, line),
-                                    Style::default().fg(color))
-                    ));
-                }
-
-                ListItem::new(spans)
-            }).collect();
-            let title = format!("<Room: {}>", room_id.clone());
-            let chat = List::new(items)
-                .block(
-                    Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .style(Style::default().fg(Color::Rgb(0, 135, 0))))
-                .highlight_symbol(">");
-            f.render_stateful_widget(chat, chunks[0], &mut list_state);
-            
-
-            let status_chunk = chunks[1];
-            let status_text = if member_list.is_empty() {
-                        "<空>".to_string()
-                    } else {
-                        member_list.join(", ")
-                    };
-                let status = Paragraph::new(status_text)
-                .block(
-                    Block::default().borders(Borders::ALL).title("Members")
-                    .style(Style::default().fg(Color::Rgb(0, 135, 0))),
-                );
-            f.render_widget(status, status_chunk);
-                    
-            use tui::widgets::Wrap;   // 头部引入
-
-            let input_box = Paragraph::new(input.as_ref())
-                .wrap(Wrap { trim: false })          // ★ 开启自动换行
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(format!("{} >", username))
-                        .style(Style::default().fg(Color::Rgb(0, 135, 0))),
-                );
-            f.render_widget(input_box, chunks[2]);
-            //let display_width = UnicodeWidthStr::width(input.as_str()) as u16;
-            use textwrap::wrap;
-            use unicode_width::UnicodeWidthStr;
-
-            let inner_width = (chunks[2].width - 2) as usize;   // 去掉边框
-            let byte_idx = nth_grapheme_byte_idx(&input, cursor);
-            let prefix   = &input[..byte_idx];                  // 光标左侧的字符串
-
-            // 把 prefix 按输入框宽度做同样的自动换行
-            let wrapped   = wrap(prefix, inner_width);
-            let cursor_y  = wrapped.len() as u16 - 1;           // 第几行（0-based）
-            let cursor_x = wrapped.last().unwrap().as_ref().width() as u16;
-
-            f.set_cursor(chunks[2].x + 1 + cursor_x,           // +1 让光标落在边框里面
-                        chunks[2].y + 1 + cursor_y);          // +1 跳过上边框 
+            match ui_mode {
+                UiMode::Chat => draw_chat(
+                    f,
+                    &messages,
+                    &mut list_state,
+                    &member_list,
+                    &input,
+                    cursor,
+                    &username,
+                    &room_id,
+                ),
+                UiMode::_ImagePreview(_) => { /* 这里什么也不画，draw_image 会接管 */ }
+            }
         })?;
-
         // ——— 处理键盘事件 ———
         match ev_rx.recv() {
             Ok(Event::Input(key)) => match key.code {
