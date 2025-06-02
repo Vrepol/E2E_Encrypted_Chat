@@ -1,31 +1,37 @@
 // src/bin/client.rs
-use anyhow::Result;
-use crossterm::{
-    event::{self, EnableMouseCapture, Event as CEvent},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
+/* ---------- 标准库 ---------- */
 use std::{
-    io::{self},
+    io,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
+
+/* ---------- 外部依赖 ---------- */
+use anyhow::Result;
+use colored::*;
+use crossterm::{
+    execute,
+    event::{self, Event as CEvent, EnableMouseCapture, DisableMouseCapture},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use tempfile;
 use tokio::sync::mpsc as tokio_mpsc;
 use tui::{
     backend::CrosstermBackend,
     widgets::ListState,
     Terminal,
 };
-use colored::*;
-use rust_chat::client::utils::inviation_clear;
-use rust_chat::client::network; // ← 记得在 lib.rs/mod.rs 中 `pub mod network;`
-use rust_chat::client::receiver::{drain_messages,ChatMessage};
-use rust_chat::client::initialization::{initial_serveraddr,initial_name};
-use rust_chat::client::handshake;
-use tempfile;
-use rust_chat::client::keyboard::UndoMgr;
-use rust_chat::client::keyboard::{handle_key, KeyCtx, ControlFlow};
+
+/* ---------- 本地 crate ---------- */
+use rust_chat::client::{
+    utils::inviation_clear,
+    network,
+    receiver::{drain_messages, ChatMessage},
+    initialization::{initial_serveraddr, initial_name},
+    handshake,
+    keyboard::{handle_key, UndoMgr, KeyCtx, ControlFlow},
+};
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 // ================== UI 事件枚举 ==================
 #[derive(Debug)]
@@ -176,7 +182,7 @@ async fn main() -> Result<()> {
         // ——— 收网络消息 ———
         drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path(),&mut member_list,);
     }
-    use crate::event::DisableMouseCapture;
+    
     /* ---------- 8. 清理退出 ---------- */
     drop(running);
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
