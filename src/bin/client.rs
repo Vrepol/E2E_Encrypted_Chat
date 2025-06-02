@@ -28,7 +28,7 @@ use rust_chat::client::{
     utils::inviation_clear,
     network,
     receiver::{drain_messages, ChatMessage},
-    initialization::{initial_serveraddr, initial_name},
+    initialization::{initial_serveraddr, initial_name,init_color},
     handshake,
     keyboard::{handle_key, UndoMgr, KeyCtx, ControlFlow},
 };
@@ -47,6 +47,7 @@ enum UiMode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_color();
     let username = initial_name()?;
     let mut server_addr =initial_serveraddr()?;
     /* ---------- 1. 在这里初始化用户名和服务器 ---------- */

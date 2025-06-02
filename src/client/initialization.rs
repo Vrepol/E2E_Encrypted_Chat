@@ -3,6 +3,19 @@ use fake::Fake;
 use fake::locales::{FR_FR};
 use fake::faker::name::raw::*;
 use colored::*;
+use std::io::IsTerminal;
+use supports_color::{self,Stream as ColorStream};
+pub fn init_color() {
+    if std::env::var_os("NO_COLOR").is_some() {
+        colored::control::set_override(false);
+        return;
+    }
+
+    let ok = io::stdout().is_terminal()
+        && supports_color::on(ColorStream::Stdout).is_some();
+
+    colored::control::set_override(ok);
+}
 pub fn initial_name() -> io::Result<String> {
     // ---------- 询问昵称 ----------
     let username = loop {
