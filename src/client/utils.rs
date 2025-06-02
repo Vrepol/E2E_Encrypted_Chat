@@ -127,7 +127,7 @@ pub async fn get_plaintext(msg: &str) -> Result<String> {
 use image::{
     codecs::png::PngEncoder,
     ColorType,
-    ImageEncoder,              // ★ 一定要引入这个 trait
+    ImageEncoder,
 };
 
 pub fn encode_rgba_as_png(
@@ -137,12 +137,11 @@ pub fn encode_rgba_as_png(
 ) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
 
-    // `write_image` 由 ImageEncoder trait 提供
     PngEncoder::new(&mut buf).write_image(
         rgba,
         w,
         h,
-        ColorType::Rgba8.into(),   // 注意要 `.into()` → ExtendedColorType
+        ColorType::Rgba8.into(),
     )?;
 
     Ok(buf)
@@ -165,7 +164,7 @@ struct Invite {
 pub const PERIOD_SECS: i64 = 500;
 fn derive_invite_key() -> [u8; 32] {
     let period_id = Utc::now().timestamp() / PERIOD_SECS;
-    let bytes = period_id.to_be_bytes(); // 8 bytes
+    let bytes = period_id.to_be_bytes();
     let mut key = [0u8; 32];
     for (i, b) in key.iter_mut().enumerate() {
         *b = bytes[i % bytes.len()];
@@ -188,7 +187,6 @@ pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd
         room_key: pwd,
     };
 
-    // 4. 序列化为 JSON bytes
     let mut buf = serde_json::to_vec(&inv)?;
     // 用 ChaCha20 加密（in-place）
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
@@ -202,7 +200,7 @@ pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd
 }
 
 pub fn parse_invitation(inv: &str) -> Option<(String, Vec<u8>, String, String)> {
-    let raw = inv.strip_prefix("/INVITE:")?;   // 非邀请码直接 None
+    let raw = inv.strip_prefix("/INVITE:")?;
 
     // ---------- A. 尝试 URL-safe Base64 ----------
     let bytes = match URL_SAFE_NO_PAD.decode(raw) {
@@ -217,11 +215,10 @@ pub fn parse_invitation(inv: &str) -> Option<(String, Vec<u8>, String, String)> 
         }
     };
 
-    // === 下面和以前完全一致 ===
-    if bytes.len() < 12 { return None; }           // 12-byte nonce
+    if bytes.len() < 12 { return None; }
     let (nonce, cipher) = bytes.split_at(12);
 
-    let key = derive_invite_key();                 // ★ 见第 3 节安全提示
+    let key = derive_invite_key();
     let mut buf = cipher.to_vec();
     let mut chacha = ChaCha20::new(&key.into(), nonce.into());
     chacha.apply_keystream(&mut buf);
