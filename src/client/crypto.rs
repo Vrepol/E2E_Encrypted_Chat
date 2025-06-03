@@ -6,6 +6,7 @@ use chacha20::{cipher::{KeyIvInit, StreamCipher}, ChaCha20};
 use rand::RngCore;
 // ----------------- 常量 -----------------
 static mut ROOM_KEY: [u8; 32] = [0u8; 32]; // 自行替换
+static mut SERVER_KEY: [u8; 32] = [0u8; 32]; // 自行替换
 pub fn set_room_key(md5_hex: &str) {
     let mut buf = [0u8; 16];
     hex::decode_to_slice(md5_hex, &mut buf).expect("md5 hex len != 32");
@@ -14,7 +15,14 @@ pub fn set_room_key(md5_hex: &str) {
         ROOM_KEY[16..].copy_from_slice(&buf);
     }
 }
-
+pub fn set_server_key(md5_hex: &str) {
+    let mut buf = [0u8; 16];
+    hex::decode_to_slice(md5_hex, &mut buf).expect("md5 hex len != 32");
+    unsafe {
+        ROOM_KEY[..16].copy_from_slice(&buf);
+        ROOM_KEY[16..].copy_from_slice(&buf);
+    }
+}
 // 2) 把内部所有加解密改成使用 ROOM_KEY
 fn current_key() -> &'static [u8; 32] {
     let ptr: *const [u8; 32] = &raw const ROOM_KEY;

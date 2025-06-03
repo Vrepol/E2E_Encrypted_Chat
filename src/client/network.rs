@@ -31,11 +31,11 @@ pub async fn chat_loop(
                         let _ = net_tx.send(line);
                     }
                     Ok(None) => {
-                        eprintln!("⚠️ 服务器关闭了连接");
+                        eprintln!("⚠️ Server closed the connection.");
                         break;
                     }
                     Err(e) => {
-                        eprintln!("⚠️ 读取出错: {}", e);
+                        eprintln!("⚠️ Failed to receive message: {}", e);
                         break;
                     }
                 }
@@ -53,7 +53,7 @@ pub async fn chat_loop(
                         // 正常聊天消息
                         let cipher_line = seal(&plain);
                         if writer.write_all(cipher_line.as_bytes()).await.is_err() {
-                            eprintln!("⚠️ 写入失败");
+                            eprintln!("⚠️ Failed to send");
                             break;
                         }
                         let _ = writer.write_all(b"\n").await;

@@ -79,13 +79,13 @@ pub fn drain_messages(
                         });
                     } else {
                         // 写文件失败，退回为文本显示
-                        let fallback = format!("[{}] <图片保存失败>", hms);
+                        let fallback = format!("[{}] <Failed to save image>", hms);
                         messages.push(ChatMessage::Text(fallback));
                     }
                 }
                 Err(_) => {
                     // 解码失败，退回为文本
-                    let fallback = format!("[{}] <无效的图片数据>", hms);
+                    let fallback = format!("[{}] <Invalid image data>", hms);
                     messages.push(ChatMessage::Text(fallback));
                 }
             }

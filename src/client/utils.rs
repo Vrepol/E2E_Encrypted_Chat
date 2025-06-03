@@ -7,10 +7,22 @@ pub const HELP_TEXT: &str = r#"快捷键与命令说明：
 • Ctrl+Z       → 撤销输入框  
 • Ctrl+A       → 清空输入框
 • Ctrl+I       → 生成邀请码   
-• ←/→          → 移动光标（Ctrl+← 跳5字符，Ctrl+→ 跳至末尾）  
+• ←/→          → 移动光标（Ctrl+← 跳3字符，Ctrl+→ 跳至末尾）  
 • ↑/↓          → 列表选上下（Ctrl+↑ 跳 5 条，Ctrl+↓ 跳到底部）  
 • Tab          → 打开选中行的图片  
 • Esc          → 退出房间  "#;
+pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
+
+• Ctrl+X       → Paste clipboard text/image
+• Ctrl+C       → Copy the currently selected message
+• Ctrl+Z       → Undo in input box
+• Ctrl+A       → Clear input box
+• Ctrl+I       → Generate invite code
+• ←/→          → Move cursor (Ctrl+← jump 3 characters, Ctrl+→ jump to end)
+• ↑/↓          → Navigate list up/down (Ctrl+↑ jump 5 items, Ctrl+↓ jump to bottom)
+• Tab          → Open the image in the selected row
+• Esc          → Exit room
+"#;
 pub fn parse_text_img(line: &str) -> (String, String) {
     // 1. 先找出第一对 [name]
     let (name, after_name) = if let Some(start) = line.find('[') {

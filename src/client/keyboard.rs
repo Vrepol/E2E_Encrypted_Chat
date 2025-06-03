@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::receiver::ChatMessage;
 use super::clipboard::{self, ClipData};
-use super::utils::{parse_name_body, encode_rgba_as_png, HELP_TEXT, create_invitation};
+use super::utils::{parse_name_body, encode_rgba_as_png, HELP_TEXT,HELP_TEXT_EN, create_invitation};
 use base64::Engine;
 pub enum ControlFlow { Continue, Quit }
 fn open_image(path: &std::path::Path) -> anyhow::Result<()> {
@@ -47,7 +47,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                         img.height.try_into().unwrap()) {
                         Ok(b) => b,
                         Err(e) => {
-                            let _ = ctx.out_tx.send(format!("⚠️ 图片编码失败: {e}"));
+                            let _ = ctx.out_tx.send(format!("⚠️ Failed to encode image: {e}"));
                             return ControlFlow::Continue;
                         }
                     };
@@ -55,7 +55,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                     let _ = ctx.out_tx.send(format!("/IMGDATA{}", b64));
                 }
                 Err(e) => {
-                    let _ = ctx.out_tx.send(format!("⚠️ 读取剪贴板失败: {e}"));
+                    let _ = ctx.out_tx.send(format!("⚠️ Failed to read clipboard: {e}"));
                 }
             }
         }
@@ -65,7 +65,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             if let Some(sel) = ctx.list_state.selected() {
                 let (_, _, body) = parse_name_body(&ctx.messages[sel]);
                 if let Err(e) = clipboard::set_text(&body) {
-                    eprintln!("⚠️ 复制失败: {e}");
+                    eprintln!("⚠️ Failed to paste: {e}");
                 }
             }
         }
@@ -73,6 +73,9 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
         // =============== 帮助文本 ===============
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let _ = ctx.out_tx.send(HELP_TEXT.to_string());
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let _ = ctx.out_tx.send(HELP_TEXT_EN.to_string());
         }
 
         // =============== 生成邀请码 ===============
@@ -82,7 +85,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             let server_pwd = iter.next().unwrap_or("");
             match create_invitation(server.to_string(), server_pwd.to_string(), ctx.room_id.clone(), ctx.pwd.clone()) {
                 Ok(code) => { let _ = ctx.out_tx.send(format!("/INVITE:{}", code)); }
-                Err(e)   => { let _ = ctx.out_tx.send("生成邀请码失败".to_string()); eprintln!("生成邀请码失败: {e}"); }
+                Err(e)   => { let _ = ctx.out_tx.send("Failed to generate invite code".to_string()); eprintln!("Failed to generate invite code: {e}"); }
             }
         }
 
@@ -160,7 +163,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
         KeyCode::Tab => {
             if let Some(sel) = ctx.list_state.selected() {
                 if let ChatMessage::Image { path, .. } = &ctx.messages[sel] {
-                    if let Err(e) = open_image(path) { eprintln!("无法打开图片: {e}"); }
+                    if let Err(e) = open_image(path) { eprintln!("Failed to open the image: {e}"); }
                 }
             }
         }

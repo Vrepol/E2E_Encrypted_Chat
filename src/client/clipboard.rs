@@ -23,7 +23,7 @@ pub fn get() -> Result<ClipData> {
         return Ok(ClipData::Image(owned));
     }
 
-    Err(anyhow!("剪贴板中既不是文本也不是图片"))
+    Err(anyhow!("Neither text nor image in clipboard"))
 }
 pub fn set_text(s: &str) -> Result<()> {
         let mut cb = Clipboard::new()?;

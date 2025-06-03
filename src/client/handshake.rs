@@ -27,7 +27,7 @@ pub async fn connect_and_login(
                     Some(t) => t,
                     None => {
                         // 直接返回带中文提示的 anyhow 错误
-                        return Err(anyhow!("邀请码无效或已过期"));
+                        return Err(anyhow!("Invalid or expired invitation"));
                     }
                 };
                 //return Err(anyhow!("s:{},sk:{:?},r:{},rk:{}",server_addr,enc_pwd, room_id, pwd));
@@ -52,7 +52,7 @@ pub async fn connect_and_login(
                 let resp = lines.next_line().await?
                     .ok_or_else(|| anyhow!("server closed during auth"))?;
                 if resp.trim() != "OK" {
-                    return Err(anyhow!("服务器拒绝：{}", resp));
+                    return Err(anyhow!("Server declined: {}", resp));
                 }
 
 
@@ -98,7 +98,7 @@ pub async fn connect_and_login(
     let resp = lines.next_line().await?
         .ok_or_else(|| anyhow!("server closed during auth"))?;
     if resp.trim() != "OK" {
-        return Err(anyhow!("服务器拒绝：{}", resp));
+        return Err(anyhow!("Server declined: {}", resp));
     }
 
     // 1. 服务器首条消息：房间列表
@@ -111,21 +111,21 @@ pub async fn connect_and_login(
     }
     let rooms: Vec<String> = first.split_whitespace().skip(1).map(|s| s.to_owned()).collect();
     if rooms.is_empty() {
-        println!("\n{}","— 服务器当前没有房间 —".green().bold());
+        println!("\n{}","— No Rooms Available —".green().bold());
     } else {
-        println!("\n{} \n {}","— 可加入的房间 —".green().bold(), rooms.join("; "));
+        println!("\n{} \n {}","— Available Rooms —".green().bold(), rooms.join("; "));
     }
 
     // 2. 本地交互：输入房间号 & 密码
     let (room_id, pwd, action) = loop {
-        print!("{}","输入 \"/q\" 退出连接, 留空则为大厅,".yellow().bold());
-        print!("{}","输入房间号：".blue());
+        print!("{}","type \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold());
+        print!("{}","Room ID: ".blue());
         io::stdout().flush()?;
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
 
         if id.trim()=="/q"{
-            return Err(anyhow!("断开服务器"));
+            return Err(anyhow!("Disconnected"));
         } else if id.trim() =="'" {
             let room_id: String = rand::rng()
                 .sample_iter(&Alphanumeric)
@@ -149,8 +149,8 @@ pub async fn connect_and_login(
 
         let id = if id.trim().is_empty() {"Public"} else {id.trim()} ;
         if id != "Public" {
-            print!("{}","输入密码时不会显示,".yellow().bold());
-            print!("{}","输入密码：".red());
+            print!("{}","It wouldn't display while typing,".yellow().bold());
+            print!("{}","Password:".red());
             io::stdout().flush()?;
             let pwd = read_password()?;
             let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
