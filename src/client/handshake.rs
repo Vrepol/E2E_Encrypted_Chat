@@ -26,7 +26,6 @@ pub async fn connect_and_login(
                 let (server_addr,enc_pwd, room_id, pwd) = match parse_invitation(server_addr_or_invite) {
                     Some(t) => t,
                     None => {
-                        // 直接返回带中文提示的 anyhow 错误
                         return Err(anyhow!("Invalid or expired invitation"));
                     }
                 };
@@ -74,9 +73,9 @@ pub async fn connect_and_login(
         
                 // 4) 等待服务器 OK
                 let resp = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("server closed during handshake-2"))?;
+                    .ok_or_else(|| anyhow!("Server closed during handshake-2"))?;
                 if resp.trim() != "OK" {
-                    return Err(anyhow!("server refused: {}", resp));
+                    return Err(anyhow!("Server refused: {}", resp));
                 }
                 return Ok((lines, writer, room_id,pwd));
             }
@@ -96,7 +95,7 @@ pub async fn connect_and_login(
     writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
     // 等待 OK
     let resp = lines.next_line().await?
-        .ok_or_else(|| anyhow!("server closed during auth"))?;
+        .ok_or_else(|| anyhow!("Server closed during auth"))?;
     if resp.trim() != "OK" {
         return Err(anyhow!("Server declined: {}", resp));
     }
@@ -118,7 +117,7 @@ pub async fn connect_and_login(
 
     // 2. 本地交互：输入房间号 & 密码
     let (room_id, pwd, action) = loop {
-        print!("{}","type \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold());
+        print!("{}","Enter \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold());
         print!("{}","Room ID: ".blue());
         io::stdout().flush()?;
         let mut id = String::new();

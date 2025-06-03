@@ -21,8 +21,7 @@ pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 • ←/→          → Move cursor (Ctrl+← jump 3 characters, Ctrl+→ jump to end)
 • ↑/↓          → Navigate list up/down (Ctrl+↑ jump 5 items, Ctrl+↓ jump to bottom)
 • Tab          → Open the image in the selected row
-• Esc          → Exit room
-"#;
+• Esc          → Exit room"#;
 pub fn parse_text_img(line: &str) -> (String, String) {
     // 1. 先找出第一对 [name]
     let (name, after_name) = if let Some(start) = line.find('[') {

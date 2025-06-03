@@ -80,12 +80,38 @@ pub fn period_key(ts: i64) -> [u8; 32] {
 /// 单层 ChaCha20-CTR（key = 32 B，nonce 全 0 即可）
 pub fn chacha_once(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
     use chacha20::cipher::{KeyIvInit, StreamCipher};
-    let mut buf = data.to_vec();
-    let zero_nonce = [0u8; 12];
-    chacha20::ChaCha20::new(key.into(), &zero_nonce.into()).apply_keystream(&mut buf);
-    buf
-}
+    use hmac::Mac;
+    // 1) 生成 16 B salt 并派生子密钥：subkey = HMAC-SHA256(pwd_hash, salt)
+    let mut salt = [0u8; 16];
+    rand::rng().fill_bytes(&mut salt);
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    mac.update(&salt);
+    let subkey: [u8; 32] = mac.finalize().into_bytes().into();
 
+    // 2) ChaCha20(nonce = 0) 加密
+    let mut buf = data.to_vec();
+    let zero_iv = [0u8; 12];
+    chacha20::ChaCha20::new(&subkey.into(), &zero_iv.into()).apply_keystream(&mut buf);
+
+    // 3) 输出：salt || cipher
+    let mut out = salt.to_vec();
+    out.extend(buf);
+    out
+}
+pub fn chacha_salt_open(full: &[u8], pwd_hash: &[u8; 32]) -> Option<Vec<u8>> {
+    if full.len() < 16 { return None; }
+    let (salt, cipher) = full.split_at(16);
+    use hmac::Mac;
+    // HMAC-SHA256(pwd_hash, salt) 生成同一把 subkey
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(pwd_hash).ok()?;
+    mac.update(salt);
+    let subkey: [u8; 32] = mac.finalize().into_bytes().into();
+
+    let mut plain = cipher.to_vec();
+    let zero_iv = [0u8; 12];
+    chacha20::ChaCha20::new(&subkey.into(), &zero_iv.into()).apply_keystream(&mut plain);
+    Some(plain)
+}
 /// 生成 AUTH 的二层密文（→ Base64）
 pub fn enc_auth(pwd: &str) -> String {
     let now = Utc::now().timestamp();
@@ -100,12 +126,17 @@ pub fn dec_auth(auth_b64: &str, pwd_hash: &[u8; 32]) -> bool {
     let now = Utc::now().timestamp();
     for delta in [-PERIOD, 0, PERIOD] {
         let outer_key = period_key(now + delta);
-        let stage1 = chacha_once(&cipher, &outer_key);            // remove layer-2
-        let plain  = chacha_once(&stage1, pwd_hash);              // remove layer-1
-        if plain == b"OKYOUARECORRECT" { return true; }                       // 明文用固定串“OK”
-    }
+        if let Some(layer1) = chacha_salt_open(&cipher, &outer_key) {
+            // 再用 pwd_hash 去掉 layer-1
+            if let Some(plain) = chacha_salt_open(&layer1, pwd_hash) {
+                if plain.as_slice() == b"OKYOUARECORRECT" {
+                    return true;
+                    }
+                }
+            }
+        }
     false
-}
+    }
 
 /// 邀请码里只需放 layer-1（pwd→cipher1→Base64）
 pub fn enc_invite_pwd(pwd: &str) -> String {
