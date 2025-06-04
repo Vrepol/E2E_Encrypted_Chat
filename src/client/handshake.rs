@@ -13,6 +13,7 @@ use colored::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use rand::{distr::Alphanumeric, Rng};
+use super::crypto::{server_open,enc_auth};
 /// 返回已经握手成功、可以直接进入聊天循环的
 /// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
 pub async fn connect_and_login(
@@ -32,7 +33,6 @@ pub async fn connect_and_login(
                 set_server_key(enc_pwd);
                 use super::crypto::chacha_once;
                 let auth = chacha_once(b"OKYOUARECORRECT", &enc_pwd);
-                //return Err(anyhow!("s:{},sk:{:?},r:{},rk:{}",server_addr,enc_pwd, room_id, pwd));
                 // 2) 先连 TCP
                 let stream = TcpStream::connect(&server_addr).await?;
                 let (reader, mut writer) = stream.into_split();
@@ -49,9 +49,8 @@ pub async fn connect_and_login(
                     };
                     base64::engine::general_purpose::STANDARD.encode(outer)
                 };
-                //writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
-                writer.write_all(server_seal(format!("AUTH {auth}")).as_bytes()).await?;
-                writer.write_all(b"\n").await?;
+                let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
+                writer.write_all(&cipher).await?;
                 // 等待 OK
                 let resp = lines.next_line().await?
                     .ok_or_else(|| anyhow!("Server closed during auth or {:?}",lines))?;
@@ -63,7 +62,7 @@ pub async fn connect_and_login(
                 // 与原流程相同：读取 "ROOMS ..." 横幅
                 let first = lines.next_line().await?
                     .ok_or_else(|| anyhow!("server closed during handshake"))?;
-                let first = server_open(&first).unwrap().to_string();
+                let first = server_open(&first).unwrap_or(first);
                 if !first.starts_with("ROOMS") {
                     return Err(anyhow!("unexpected banner: {}", first));
                 }
@@ -74,20 +73,19 @@ pub async fn connect_and_login(
                 let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
                 mac.update(b"Hello");
                 let credential = hex::encode(mac.finalize().into_bytes());
-                let cmd = server_seal(format!("JOIN {room_id} {credential} {nickname}"));
-                writer.write_all(cmd.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
+                let cmd = handshake_writeall_macro(format!("JOIN {room_id} {credential} {nickname}"));
+                writer.write_all(&cmd).await?;
                 // 4) 等待服务器 OK
                 let resp = lines.next_line().await?
                     .ok_or_else(|| anyhow!("Server closed during handshake-2"))?;
-                let resp = server_open(&resp).unwrap().to_string();
+                let resp = server_open(&resp).unwrap_or(resp);
                 if resp.trim() != "OK" {
                     return Err(anyhow!("Server refused: {}", resp));
                 }
                 return Ok((lines, writer, room_id,pwd));
             }
     // 0. TCP 连接
-    use super::crypto::{server_seal,server_open,enc_auth};
+
 
     let mut iter = server_addr_or_invite.splitn(2, '&');
     let server = iter.next().unwrap_or("");
@@ -114,7 +112,7 @@ pub async fn connect_and_login(
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("server closed during handshake"))?;
-    let first = server_open(&first).unwrap().to_string();
+    let first = server_open(&first).unwrap_or(first);
     if !first.starts_with("ROOMS") {
         return Err(anyhow!("unexpected banner: {}", first));
     }
@@ -147,7 +145,7 @@ pub async fn connect_and_login(
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                 abcdefghijklmnopqrstuvwxyz\
                 0123456789-_@#";
-            let pwd: String = (0..16)
+            let pwd: String = (0..32)
                 .map(|_| {
                     let idx = rand::rng().random_range(0..CHARSET.len());
                     CHARSET[idx] as char
@@ -191,7 +189,7 @@ pub async fn connect_and_login(
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("server closed during handshake‑2"))?;
-    let resp = server_open(&resp).unwrap().to_string();
+    let resp = server_open(&resp).unwrap_or(resp);
     if resp.trim() != "OK" {
         return Err(anyhow!("server refused: {}", resp));
     }
