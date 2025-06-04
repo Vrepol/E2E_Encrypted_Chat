@@ -47,8 +47,7 @@ pub fn initial_name() -> io::Result<String> {
 pub fn initial_serveraddr() -> io::Result<String> {
 
     let servers = vec![
-        ("Public server", "8.153.67.166:6655"),
-        ("Tailscale server", "100.123.171.94:6655"),
+        ("Please congif at /src/client/initialization", "127.0.0.1:6655"),
     ];
 
     // 交互循环直到拿到合法输入
