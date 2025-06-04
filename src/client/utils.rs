@@ -1,7 +1,7 @@
-use super::crypto::open;
+use super::crypto::{open,server_seal};
 use super::receiver::ChatMessage;
 pub const HELP_TEXT: &str = r#"快捷键与命令说明：
- 
+
 • Ctrl+X       → 贴入剪贴板文本/图片
 • Ctrl+C       → 复制当前选中消息 
 • Ctrl+Z       → 撤销输入框  
@@ -22,6 +22,11 @@ pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 • ↑/↓          → Navigate list up/down (Ctrl+↑ jump 5 items, Ctrl+↓ jump to bottom)
 • Tab          → Open the image in the selected row
 • Esc          → Exit room"#;
+pub fn handshake_writeall_macro(line:String) -> Vec<u8> {
+    let mut buf = server_seal(line.to_string()).into_bytes();
+    buf.push(b'\n');
+    buf
+}
 pub fn parse_text_img(line: &str) -> (String, String) {
     // 1. 先找出第一对 [name]
     let (name, after_name) = if let Some(start) = line.find('[') {
@@ -168,7 +173,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD};
 #[derive(Serialize, Deserialize)]
 struct Invite {
     server:   String,
-    enc_pwd:  Vec<u8>,
+    enc_pwd:  [u8; 32],
     room_id:  String,
     room_key: String,
 }
@@ -188,8 +193,9 @@ pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd
     // 随机 12 字节 nonce
     let mut nonce = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce);
-    use super::crypto::{chacha_once,pwd_hash};
-    let auth = chacha_once(b"OKYOUARECORRECT", &pwd_hash(&server_pwd));
+    use super::crypto::{pwd_hash};
+    //let auth = chacha_once(b"OKYOUARECORRECT", &pwd_hash(&server_pwd));
+    let auth = pwd_hash(&server_pwd);
     // 序列化明文
     let inv = Invite {
         server:   server_addr,
@@ -210,7 +216,7 @@ pub fn create_invitation(server_addr:String,server_pwd:String,room_id:String,pwd
     Ok(URL_SAFE_NO_PAD.encode(out))
 }
 
-pub fn parse_invitation(inv: &str) -> Option<(String, Vec<u8>, String, String)> {
+pub fn parse_invitation(inv: &str) -> Option<(String, [u8; 32], String, String)> {
     let raw = inv.strip_prefix("/INVITE:")?;
 
     // ---------- A. 尝试 URL-safe Base64 ----------

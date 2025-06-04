@@ -7,7 +7,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
 };
-use super::utils::parse_invitation;
+use super::utils::{parse_invitation,handshake_writeall_macro};
 use super::crypto;
 use colored::*;
 use hmac::{Hmac, Mac};
@@ -29,6 +29,9 @@ pub async fn connect_and_login(
                         return Err(anyhow!("Invalid or expired invitation"));
                     }
                 };
+                set_server_key(enc_pwd);
+                use super::crypto::chacha_once;
+                let auth = chacha_once(b"OKYOUARECORRECT", &enc_pwd);
                 //return Err(anyhow!("s:{},sk:{:?},r:{},rk:{}",server_addr,enc_pwd, room_id, pwd));
                 // 2) 先连 TCP
                 let stream = TcpStream::connect(&server_addr).await?;
@@ -42,15 +45,17 @@ pub async fn connect_and_login(
                     // 再包第二层
                     let outer = {
                         let now = Utc::now().timestamp();
-                        super::crypto::chacha_once(&enc_pwd, &period_key(now))
+                        super::crypto::chacha_once(&auth, &period_key(now))
                     };
                     base64::engine::general_purpose::STANDARD.encode(outer)
                 };
-                writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
+                //writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
+                writer.write_all(server_seal(format!("AUTH {auth}")).as_bytes()).await?;
+                writer.write_all(b"\n").await?;
                 // 等待 OK
                 let resp = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("server closed during auth"))?;
-                if resp.trim() != "OK" {
+                    .ok_or_else(|| anyhow!("Server closed during auth or {:?}",lines))?;
+                if server_open(&resp).ok_or_else(|| anyhow!("{}",resp))?.trim() != "OK" {
                     return Err(anyhow!("Server declined: {}", resp));
                 }
 
@@ -58,6 +63,7 @@ pub async fn connect_and_login(
                 // 与原流程相同：读取 "ROOMS ..." 横幅
                 let first = lines.next_line().await?
                     .ok_or_else(|| anyhow!("server closed during handshake"))?;
+                let first = server_open(&first).unwrap().to_string();
                 if !first.starts_with("ROOMS") {
                     return Err(anyhow!("unexpected banner: {}", first));
                 }
@@ -68,19 +74,20 @@ pub async fn connect_and_login(
                 let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
                 mac.update(b"Hello");
                 let credential = hex::encode(mac.finalize().into_bytes());
-                let cmd = format!("JOIN {room_id} {credential} {nickname}\n");
+                let cmd = server_seal(format!("JOIN {room_id} {credential} {nickname}"));
                 writer.write_all(cmd.as_bytes()).await?;
-        
+                writer.write_all(b"\n").await?;
                 // 4) 等待服务器 OK
                 let resp = lines.next_line().await?
                     .ok_or_else(|| anyhow!("Server closed during handshake-2"))?;
+                let resp = server_open(&resp).unwrap().to_string();
                 if resp.trim() != "OK" {
                     return Err(anyhow!("Server refused: {}", resp));
                 }
                 return Ok((lines, writer, room_id,pwd));
             }
     // 0. TCP 连接
-    use super::crypto::enc_auth;
+    use super::crypto::{server_seal,server_open,enc_auth};
 
     let mut iter = server_addr_or_invite.splitn(2, '&');
     let server = iter.next().unwrap_or("");
@@ -89,14 +96,16 @@ pub async fn connect_and_login(
     let stream = TcpStream::connect(server).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    let auth = enc_auth(password);        // server_pwd = 用户输入的服务器口令
+    let auth = enc_auth(password);
+    use super::crypto::{set_server_key,pwd_hash};
+    set_server_key(pwd_hash(password));
 
-
-    writer.write_all(format!("AUTH {auth}\n").as_bytes()).await?;
+    let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
+    writer.write_all(&cipher).await?;
     // 等待 OK
     let resp = lines.next_line().await?
-        .ok_or_else(|| anyhow!("Server closed during auth"))?;
-    if resp.trim() != "OK" {
+        .ok_or_else(|| anyhow!("Server closed during auth or {:?}",lines))?;
+    if server_open(&resp).ok_or_else(|| anyhow!("{}",resp))?.trim() != "OK" {
         return Err(anyhow!("Server declined: {}", resp));
     }
 
@@ -105,6 +114,7 @@ pub async fn connect_and_login(
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("server closed during handshake"))?;
+    let first = server_open(&first).unwrap().to_string();
     if !first.starts_with("ROOMS") {
         return Err(anyhow!("unexpected banner: {}", first));
     }
@@ -174,14 +184,14 @@ pub async fn connect_and_login(
     let credential = hex::encode(tag);
 
     // 4. 发送指令：<ACTION> <ROOM> <CRED> <NICK>
-    let cmd = format!("{action} {room_id} {credential} {nickname}\n");
-    writer.write_all(cmd.as_bytes()).await?;
-
+    let cmd = handshake_writeall_macro(format!("{action} {room_id} {credential} {nickname}"));
+    writer.write_all(&cmd).await?;
     // 5. 等待握手结果
     let resp = lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("server closed during handshake‑2"))?;
+    let resp = server_open(&resp).unwrap().to_string();
     if resp.trim() != "OK" {
         return Err(anyhow!("server refused: {}", resp));
     }

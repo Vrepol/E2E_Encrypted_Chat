@@ -15,12 +15,9 @@ pub fn set_room_key(md5_hex: &str) {
         ROOM_KEY[16..].copy_from_slice(&buf);
     }
 }
-pub fn set_server_key(md5_hex: &str) {
-    let mut buf = [0u8; 16];
-    hex::decode_to_slice(md5_hex, &mut buf).expect("md5 hex len != 32");
+pub fn set_server_key(md5_hex: [u8; 32]) {
     unsafe {
-        ROOM_KEY[..16].copy_from_slice(&buf);
-        ROOM_KEY[16..].copy_from_slice(&buf);
+        SERVER_KEY.copy_from_slice(&md5_hex);
     }
 }
 // 2) 把内部所有加解密改成使用 ROOM_KEY
@@ -28,7 +25,62 @@ fn current_key() -> &'static [u8; 32] {
     let ptr: *const [u8; 32] = &raw const ROOM_KEY;
     unsafe { &*ptr }
 }
+fn current_server_key() -> &'static [u8; 32] {
+    let ptr: *const [u8; 32] = &raw const SERVER_KEY;
+    unsafe { &*ptr }
+}
 // ----------------- 公共 API -----------------
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};      // chacha20poly1305 = "0.10"
+use chacha20poly1305::aead::{Aead, KeyInit};               // traits
+use hkdf::Hkdf;                                            // hkdf = "0.12"
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;   // ChaCha20-Poly1305 = 96-bit
+const KEY_LEN: usize  = 32;    // 256-bit
+
+pub fn server_seal(plain: String) -> String {
+    // 1. 随机 salt + nonce
+    let mut salt  = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut nonce);
+
+    // 2. HKDF(SHA-256) 派生一次性密钥
+    let hk = Hkdf::<Sha256>::new(Some(&salt), current_server_key().as_ref());
+    let mut key = [0u8; KEY_LEN];
+    hk.expand(b"enc", &mut key).unwrap();
+
+    // 3. AEAD 加密（自动附带 16 B Poly1305 MAC）
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let mut ciphertext = cipher.encrypt(Nonce::from_slice(&nonce),
+                                         plain.as_bytes())
+                               .expect("encrypt");
+
+    // 4. 输出 salt|nonce|ciphertext_and_tag → Base64
+    let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.append(&mut ciphertext);
+    b64::STANDARD.encode(out)
+}
+
+pub fn server_open(line: &str) -> Option<String> {
+    let decoded = b64::STANDARD.decode(line).ok()?;
+    if decoded.len() < SALT_LEN + NONCE_LEN + 16 { return None; } // “16”是 Poly1305 tag
+
+    // 1. 解析 salt / nonce / 密文+tag
+    let (salt, rest)   = decoded.split_at(SALT_LEN);
+    let (nonce, ct)    = rest.split_at(NONCE_LEN);
+
+    // 2. 派生同样的会话密钥
+    let hk = Hkdf::<Sha256>::new(Some(salt), current_server_key().as_ref());
+    let mut key = [0u8; KEY_LEN];
+    hk.expand(b"enc", &mut key).ok()?;
+
+    // 3. 验证 tag 并解密
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let plain  = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    String::from_utf8(plain).ok()
+}
 pub fn seal(plain: &str) -> String {
     // 生成随机 12 字节 nonce（IV）
     let mut iv = [0u8; 12];
@@ -84,7 +136,7 @@ pub fn chacha_once(data: &[u8], key: &[u8; 32]) -> Vec<u8> {
     // 1) 生成 16 B salt 并派生子密钥：subkey = HMAC-SHA256(pwd_hash, salt)
     let mut salt = [0u8; 16];
     rand::rng().fill_bytes(&mut salt);
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key).unwrap();
     mac.update(&salt);
     let subkey: [u8; 32] = mac.finalize().into_bytes().into();
 
@@ -103,7 +155,7 @@ pub fn chacha_salt_open(full: &[u8], pwd_hash: &[u8; 32]) -> Option<Vec<u8>> {
     let (salt, cipher) = full.split_at(16);
     use hmac::Mac;
     // HMAC-SHA256(pwd_hash, salt) 生成同一把 subkey
-    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(pwd_hash).ok()?;
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(pwd_hash).ok()?;
     mac.update(salt);
     let subkey: [u8; 32] = mac.finalize().into_bytes().into();
 

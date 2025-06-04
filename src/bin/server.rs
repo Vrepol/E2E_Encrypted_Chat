@@ -10,14 +10,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::broadcast,
 };
-fn broadcast_member_list(info: &RoomInfo) {
-        let names: Vec<_> = info.members.iter().cloned().collect();
-        let _ = info.tx.send(format!("/member_list {}\n", names.join(",")));
-}
+
 use clap::Parser;
 use once_cell::sync::OnceCell;
 use rust_chat::client::crypto::{pwd_hash, dec_auth};
-
+use rust_chat::client::utils::{handshake_writeall_macro};
 #[derive(Parser)]
 struct Args {
     /// 监听端口
@@ -47,7 +44,8 @@ struct RoomGuard {
 impl Drop for RoomGuard {
     fn drop(&mut self) {
         // 发送离开广播
-        let _ = self.tx.send(format!("⚡ [{}] left.\n", self.nickname));
+        let server_enc=server_seal(format!("⚡ [{}] left.", self.nickname));
+        let _ = self.tx.send(format!("{}\n", server_enc));
         // 回收空房间
         let mut map = self.rooms.lock().unwrap();
         if let Some(info) = map.get_mut(&self.room_id) {
@@ -60,12 +58,18 @@ impl Drop for RoomGuard {
         }
     }
 }
+fn broadcast_member_list(info: &RoomInfo) {
+    let names: Vec<_> = info.members.iter().cloned().collect();
+    let cipher = server_seal(format!("/member_list {}", names.join(",")));
+    let _ = info.tx.send(format!("{}\n", cipher));
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     SERVER_PWD_HASH.set(pwd_hash(&args.password)).unwrap();
-
+    use rust_chat::client::crypto::set_server_key;
+    set_server_key(pwd_hash(&args.password));
     let bind_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&bind_addr).await?;
     println!("🛰️  Chat-Server listening on {}", bind_addr);
@@ -91,15 +95,17 @@ async fn main() -> Result<()> {
         );
     }
 }
-
+use rust_chat::client::crypto::{server_open,server_seal};
 async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
     /* ---------- ②-a 等待客户端 AUTH ---------- */
-    let auth_line = match lines.next_line().await? {
-        Some(l) => l,
-        None => return Ok(()),
+    let enc_line = match lines.next_line().await? {
+        Some(l) => l.trim_end().to_owned(),
+        None    => return Ok(()),
     };
+    
+    let auth_line = server_open(&enc_line).unwrap();
     if !auth_line.starts_with("AUTH ") {
         writer.write_all(b"ERR NeedAUTH\n").await?;
         return Ok(());
@@ -109,7 +115,8 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
         writer.write_all(b"ERR BadAuth\n").await?;
         return Ok(());
     }
-    writer.write_all(b"OK\n").await?;
+    let cipher = handshake_writeall_macro("OK".to_string());
+    writer.write_all(&cipher).await?;
     /* ---------- ① 发送房间列表 ---------- */
     let room_line = {
         let map = rooms.lock().unwrap();
@@ -121,14 +128,17 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
         line.push('\n');
         line
     };
-    writer.write_all(room_line.as_bytes()).await?;
+    writer.write_all(server_seal(room_line).as_bytes()).await?;
+    writer.write_all(b"\n").await?;
 
     /* ---------- ② 读取客户端指令 ---------- */
     let cmd = match lines.next_line().await? {
-        Some(c) => c,
+        Some(c) => c.trim_end().to_owned(),
         None => return Ok(()),
     };
+    let cmd = server_open(&cmd).unwrap_or(cmd);
     let mut parts = cmd.split_whitespace();
+    
     let action   = parts.next().unwrap_or_default();
     let room_id  = parts.next().unwrap_or_default().to_string();
     let cred     = parts.next().unwrap_or_default().to_string();
@@ -136,6 +146,7 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
 
     if room_id.is_empty() || cred.is_empty() || nickname.is_empty() {
         writer.write_all(b"ERR InvalidCmd\n").await?;
+        writer.write_all(b"\n").await?;
         return Ok(());
     }
 
@@ -178,7 +189,8 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     /* ---------- ④ 发送握手结果 & 创建清理 guard ---------- */
     let room_tx = match handshake {
         Handshake::Ok(tx) => {
-            writer.write_all(b"OK\n").await?;
+            let cipher = handshake_writeall_macro("OK".to_string());
+            writer.write_all(&cipher).await?;
             tx
         }
         Handshake::Err(why) => {
@@ -196,7 +208,8 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
     };
 
     // 发送加入通知
-    let _ = room_tx.send(format!("⚡ [{}] joined.\n", nickname));
+    let server_enc=server_seal(format!("⚡ [{}] joined.", nickname));
+    let _ = room_tx.send(format!("{}\n", server_enc));
     let mut room_rx = room_tx.subscribe();
     {
         let map = rooms.lock().unwrap();
@@ -214,7 +227,9 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
                             let _ = writer.write_all(b"/ping_ack\n").await;
                             continue;
                         }
-                        let _ = room_tx.send(format!("[{}] {}\n", nickname, line));
+                        let server_plain=server_open(&line).unwrap_or(line);
+                        let server_enc=server_seal(format!("[{}] {}",nickname,server_plain));
+                        let _ = room_tx.send(format!("{}\n", server_enc));
                     }
                     None => break,
                 }

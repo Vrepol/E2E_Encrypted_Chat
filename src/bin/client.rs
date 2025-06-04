@@ -198,5 +198,4 @@ async fn main() -> Result<()> {
     println!("{}","========Press Crtl + C to quit========\n".red().bold());
     continue;
     }
-    Ok(())
 }
