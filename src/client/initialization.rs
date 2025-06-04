@@ -91,7 +91,7 @@ pub fn initial_serveraddr() -> io::Result<String> {
         if s.starts_with("/INVITE:") {
             break s.to_string();
         }
-        println!("Enter an option, IP or invite code!");
+        println!("Enter an choice, IP or invite code!");
     };
 
     Ok(chosen)

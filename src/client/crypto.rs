@@ -17,7 +17,7 @@ pub fn set_room_key(md5_hex: &str) {
 }
 pub fn set_server_key(md5_hex: [u8; 32]) {
     unsafe {
-        SERVER_KEY.copy_from_slice(&md5_hex);
+        SERVER_KEY[..].copy_from_slice(&md5_hex);
     }
 }
 // 2) 把内部所有加解密改成使用 ROOM_KEY
