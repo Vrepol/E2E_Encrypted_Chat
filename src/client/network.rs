@@ -27,6 +27,7 @@ use super::utils::{
     create_invitation, file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
     packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line,
     parse_invite_error_line, parse_invite_token_line, parse_local_invite_request_line,
+    parse_local_ui_event,
     OutgoingPayload, ATTACHMENT_CHUNK_SIZE, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
 };
 
@@ -291,6 +292,11 @@ async fn handle_outgoing_input(
     invite_registry: Arc<InviteRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
 ) -> Result<()> {
+    if parse_local_ui_event(text).is_some() {
+        net_tx.send(text.to_string()).ok();
+        return Ok(());
+    }
+
     if let Some(req) = parse_local_invite_request_line(text) {
         return handle_invite_request(writer, net_tx, ack_registry, invite_registry, req).await;
     }
