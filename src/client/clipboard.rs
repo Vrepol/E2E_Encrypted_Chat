@@ -1,16 +1,19 @@
 // client/clipboard.rs
-use std::borrow::Cow;             // 需要显式引入
+use std::{borrow::Cow, path::PathBuf};             // 需要显式引入
 use arboard::{Clipboard, ImageData};
 use anyhow::{Result, anyhow};
 pub enum ClipData {
     Text(String),
     Image(ImageData<'static>),
+    Files(Vec<PathBuf>),
 }
 pub fn get() -> Result<ClipData> {
     let mut cb = Clipboard::new()?;
 
-    if let Ok(txt) = cb.get_text() {
-        return Ok(ClipData::Text(txt));
+    if let Ok(paths) = cb.get().file_list() {
+        if !paths.is_empty() {
+            return Ok(ClipData::Files(paths));
+        }
     }
 
     if let Ok(img) = cb.get_image() {
@@ -23,7 +26,11 @@ pub fn get() -> Result<ClipData> {
         return Ok(ClipData::Image(owned));
     }
 
-    Err(anyhow!("Neither text nor image in clipboard"))
+    if let Ok(txt) = cb.get_text() {
+        return Ok(ClipData::Text(txt));
+    }
+
+    Err(anyhow!("Clipboard does not contain supported text, image, or file data"))
 }
 pub fn set_text(s: &str) -> Result<()> {
         let mut cb = Clipboard::new()?;

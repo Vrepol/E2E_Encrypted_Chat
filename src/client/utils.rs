@@ -26,7 +26,7 @@ use super::receiver::{AttachmentKind, ChatMessage, TransferStage};
 
 pub const HELP_TEXT: &str = r#"快捷键与命令说明：
 
-• Ctrl+X       → 贴入剪贴板文本/图片
+• Ctrl+X       → 智能贴入剪贴板文本/图片/文件
 • Ctrl+C       → 复制当前选中消息
 • Ctrl+Z       → 撤销输入框
 • Ctrl+A       → 清空输入框
@@ -39,7 +39,7 @@ pub const HELP_TEXT: &str = r#"快捷键与命令说明：
 
 pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 
-• Ctrl+X       → Paste clipboard text/image
+• Ctrl+X       → Smart paste clipboard text/image/files
 • Ctrl+C       → Copy the currently selected message
 • Ctrl+Z       → Undo in input box
 • Ctrl+A       → Clear input box
@@ -686,6 +686,30 @@ pub fn normalize_clipboard_rgba(bytes: &[u8], w: u32, h: u32) -> anyhow::Result<
     }
 
     Ok(rgba)
+}
+
+pub fn parse_clipboard_file_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let normalized = strip_optional_quotes(line);
+        let path = PathBuf::from(normalized);
+        if !path.is_absolute() || !path.is_file() {
+            return None;
+        }
+        paths.push(path);
+    }
+
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
 }
 
 #[derive(Serialize, Deserialize)]

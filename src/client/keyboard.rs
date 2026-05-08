@@ -1,6 +1,6 @@
 // client/keyboard.rs
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::{fs, path::Path};
+use std::{fs, path::{Path, PathBuf}};
 use tokio::sync::mpsc::UnboundedSender;
 use tui::widgets::ListState;
 use unicode_segmentation::UnicodeSegmentation;
@@ -12,12 +12,18 @@ use super::clipboard::{self, ClipData};
 use super::utils::{
     build_local_invite_request_line, build_local_notice_line, encode_rgba_as_png,
     normalize_clipboard_rgba,
-    parse_name_body, HELP_TEXT, HELP_TEXT_EN,
+    parse_clipboard_file_paths, parse_name_body, HELP_TEXT, HELP_TEXT_EN,
 };
 pub enum ControlFlow { Continue, Quit }
 fn open_attachment(path: &Path) -> anyhow::Result<()> {
     open::that(path)?;
     Ok(())
+}
+
+fn queue_attachment_paths(out_tx: &UnboundedSender<String>, paths: &[PathBuf]) {
+    for path in paths {
+        let _ = out_tx.send(path.to_string_lossy().to_string());
+    }
 }
 /// 让 client 把所有可变状态打包进来，便于在这里直接修改。
 
@@ -45,10 +51,14 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             match clipboard::get() {
                 Ok(ClipData::Text(txt)) => {
-                    ctx.undo_mgr.maybe_push(ctx.input, *ctx.cursor, OpKind::Insert);
-                    let byte_idx = nth_grapheme_byte_idx(ctx.input, *ctx.cursor);
-                    ctx.input.insert_str(byte_idx, &txt);
-                    *ctx.cursor += txt.graphemes(true).count();
+                    if let Some(paths) = parse_clipboard_file_paths(&txt) {
+                        queue_attachment_paths(ctx.out_tx, &paths);
+                    } else {
+                        ctx.undo_mgr.maybe_push(ctx.input, *ctx.cursor, OpKind::Insert);
+                        let byte_idx = nth_grapheme_byte_idx(ctx.input, *ctx.cursor);
+                        ctx.input.insert_str(byte_idx, &txt);
+                        *ctx.cursor += txt.graphemes(true).count();
+                    }
                 }
                 Ok(ClipData::Image(img)) => {
                     let width: u32 = img.width.try_into().unwrap();
@@ -79,6 +89,9 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                             let _ = ctx.out_tx.send(build_local_notice_line(&format!("写入临时图片失败: {e}")));
                         }
                     }
+                }
+                Ok(ClipData::Files(paths)) => {
+                    queue_attachment_paths(ctx.out_tx, &paths);
                 }
                 Err(e) => {
                     let _ = ctx.out_tx.send(build_local_notice_line(&format!("读取剪贴板失败: {e}")));

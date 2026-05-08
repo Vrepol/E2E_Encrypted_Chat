@@ -10,7 +10,7 @@ mod tests {
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
         build_ack_line, build_attachment_frames_from_bytes, build_local_invite_request_line,
-        normalize_clipboard_rgba,
+        normalize_clipboard_rgba, parse_clipboard_file_paths,
         build_transport_packet_line, create_invitation, parse_ack_line, parse_attachment_frame,
         parse_invitation, parse_local_invite_request_line, parse_transport_packet_line,
         AttachmentFrame,
@@ -121,5 +121,31 @@ mod tests {
                 40, 50, 60, 255,
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_clipboard_file_paths_rejects_mixed_lines() {
+        let temp_path = std::env::temp_dir().join("rust_chat_clipboard_test.txt");
+        std::fs::write(&temp_path, b"ok").expect("temp file should be created");
+
+        let mixed = format!("{}\nnot-a-real-path", temp_path.display());
+        assert!(parse_clipboard_file_paths(&mixed).is_none());
+
+        let _ = std::fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_parse_clipboard_file_paths_accepts_all_valid_absolute_paths() {
+        let path_a = std::env::temp_dir().join("rust_chat_clipboard_test_a.txt");
+        let path_b = std::env::temp_dir().join("rust_chat_clipboard_test_b.txt");
+        std::fs::write(&path_a, b"a").expect("temp file A should be created");
+        std::fs::write(&path_b, b"b").expect("temp file B should be created");
+
+        let joined = format!("\"{}\"\n{}", path_a.display(), path_b.display());
+        let parsed = parse_clipboard_file_paths(&joined).expect("all valid paths should parse");
+        assert_eq!(parsed, vec![path_a.clone(), path_b.clone()]);
+
+        let _ = std::fs::remove_file(path_a);
+        let _ = std::fs::remove_file(path_b);
     }
 }
