@@ -14,7 +14,7 @@ use tokio::{
         mpsc::{UnboundedReceiver, UnboundedSender},
         Mutex, Notify,
     },
-    time::{interval, timeout, Duration, MissedTickBehavior},
+    time::{interval, timeout, Duration, Instant, MissedTickBehavior},
 };
 use tokio::net::tcp::OwnedWriteHalf;
 
@@ -28,7 +28,8 @@ use super::utils::{
     packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line,
     parse_invite_error_line, parse_invite_token_line, parse_local_invite_request_line,
     parse_local_ui_event,
-    OutgoingPayload, ATTACHMENT_CHUNK_SIZE, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
+    OutgoingPayload, ATTACHMENT_CHUNK_SIZE, ATTACHMENT_WINDOW_SIZE, PACKET_ACK_TIMEOUT_MS,
+    PACKET_RETRY_LIMIT,
 };
 
 #[derive(Default)]
@@ -170,8 +171,18 @@ struct AttachmentJob {
     total_chunks: usize,
     sha256_hex: String,
     next_chunk_index: usize,
+    acked_chunks: usize,
     file: File,
     meta_sent: bool,
+    in_flight: Vec<InFlightChunk>,
+}
+
+struct InFlightChunk {
+    packet_id: String,
+    chunk_line: String,
+    chunk_index: usize,
+    attempts: usize,
+    last_sent_at: Instant,
 }
 
 pub async fn chat_loop(
@@ -452,53 +463,106 @@ async fn pump_attachment_upload(
         return;
     }
 
-    if job.next_chunk_index >= job.total_chunks {
-        net_tx.send(build_local_transfer_done_line(&job.transfer_id)).ok();
+    if let Err(err) = process_attachment_window(writer, net_tx, ack_registry.clone(), job).await {
+        cleanup_attachment_window(ack_registry.clone(), job).await;
+        net_tx
+            .send(build_local_transfer_failed_line(
+                &job.transfer_id,
+                &err.to_string(),
+            ))
+            .ok();
         *active_upload = None;
         return;
     }
 
-    let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
-    let read = match job.file.read(&mut buf).await {
-        Ok(read) => read,
-        Err(err) => {
-            net_tx
-                .send(build_local_transfer_failed_line(&job.transfer_id, &err.to_string()))
-                .ok();
-            *active_upload = None;
-            return;
-        }
-    };
-
-    if read == 0 {
+    if job.acked_chunks >= job.total_chunks
+        && job.next_chunk_index >= job.total_chunks
+        && job.in_flight.is_empty()
+    {
         net_tx.send(build_local_transfer_done_line(&job.transfer_id)).ok();
         *active_upload = None;
-        return;
     }
+}
 
-    let chunk_line = build_attachment_chunk_line(&job.transfer_id, job.next_chunk_index, &buf[..read]);
-    let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, job.next_chunk_index);
-    match send_room_payload_with_ack(writer, &packet_id, &chunk_line, ack_registry.clone()).await {
-        Ok(_) => {
-            job.next_chunk_index += 1;
+async fn process_attachment_window(
+    writer: &mut OwnedWriteHalf,
+    net_tx: &UnboundedSender<String>,
+    ack_registry: Arc<AckRegistry>,
+    job: &mut AttachmentJob,
+) -> Result<()> {
+    let max_attempts = PACKET_RETRY_LIMIT + 1;
+    let mut idx = 0;
+
+    while idx < job.in_flight.len() {
+        let packet_id = job.in_flight[idx].packet_id.clone();
+        if ack_registry.is_acked(&packet_id).await {
+            ack_registry.finish(&packet_id).await;
+            job.acked_chunks += 1;
+            job.in_flight.remove(idx);
             net_tx
                 .send(build_local_transfer_progress_line(
                     &job.transfer_id,
-                    job.next_chunk_index,
+                    job.acked_chunks,
                     job.total_chunks,
                 ))
                 .ok();
-            if job.next_chunk_index >= job.total_chunks {
-                net_tx.send(build_local_transfer_done_line(&job.transfer_id)).ok();
-                *active_upload = None;
+            continue;
+        }
+
+        if job.in_flight[idx].last_sent_at.elapsed() >= Duration::from_millis(PACKET_ACK_TIMEOUT_MS)
+        {
+            if job.in_flight[idx].attempts >= max_attempts {
+                let failed_chunk = job.in_flight[idx].chunk_index;
+                return Err(anyhow!(
+                    "ACK timeout for chunk {} of {}",
+                    failed_chunk + 1,
+                    job.total_chunks
+                ));
             }
+
+            send_room_payload_now(
+                writer,
+                &job.in_flight[idx].packet_id,
+                &job.in_flight[idx].chunk_line,
+            )
+            .await?;
+            job.in_flight[idx].attempts += 1;
+            job.in_flight[idx].last_sent_at = Instant::now();
         }
-        Err(err) => {
-            net_tx
-                .send(build_local_transfer_failed_line(&job.transfer_id, &err.to_string()))
-                .ok();
-            *active_upload = None;
+
+        idx += 1;
+    }
+
+    while job.in_flight.len() < ATTACHMENT_WINDOW_SIZE && job.next_chunk_index < job.total_chunks {
+        let chunk_index = job.next_chunk_index;
+        let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
+        let read = job.file.read(&mut buf).await?;
+        if read == 0 {
+            return Err(anyhow!(
+                "Unexpected EOF while reading attachment {}",
+                job.file_name
+            ));
         }
+
+        let chunk_line = build_attachment_chunk_line(&job.transfer_id, chunk_index, &buf[..read]);
+        let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, chunk_index);
+        send_room_payload_now(writer, &packet_id, &chunk_line).await?;
+        job.in_flight.push(InFlightChunk {
+            packet_id,
+            chunk_line,
+            chunk_index,
+            attempts: 1,
+            last_sent_at: Instant::now(),
+        });
+        job.next_chunk_index += 1;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_attachment_window(ack_registry: Arc<AckRegistry>, job: &AttachmentJob) {
+    for chunk in &job.in_flight {
+        ack_registry.finish(&chunk.packet_id).await;
     }
 }
 
@@ -526,8 +590,10 @@ async fn initialize_attachment_job(path: &Path) -> Result<AttachmentJob> {
         total_chunks,
         sha256_hex,
         next_chunk_index: 0,
+        acked_chunks: 0,
         file,
         meta_sent: false,
+        in_flight: Vec::new(),
     })
 }
 
@@ -539,6 +605,15 @@ async fn send_room_payload_with_ack(
 ) -> Result<()> {
     let room_cipher = seal(plain);
     send_transport_payload_with_ack(writer, packet_id, &room_cipher, ack_registry).await
+}
+
+async fn send_room_payload_now(
+    writer: &mut OwnedWriteHalf,
+    packet_id: &str,
+    plain: &str,
+) -> Result<()> {
+    let room_cipher = seal(plain);
+    send_transport_payload_now(writer, packet_id, &room_cipher).await
 }
 
 async fn send_server_payload_with_ack(
@@ -562,8 +637,7 @@ async fn send_transport_payload_with_ack(
 
     for _attempt in 0..=PACKET_RETRY_LIMIT {
         let notify = ack_registry.subscribe(packet_id).await;
-        writer.write_all(cipher_line.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        write_cipher_line(writer, &cipher_line).await?;
 
         if ack_registry.is_acked(packet_id).await {
             ack_registry.finish(packet_id).await;
@@ -580,6 +654,22 @@ async fn send_transport_payload_with_ack(
 
     ack_registry.finish(packet_id).await;
     Err(anyhow!("ACK timeout for packet {packet_id}"))
+}
+
+async fn send_transport_payload_now(
+    writer: &mut OwnedWriteHalf,
+    packet_id: &str,
+    payload: &str,
+) -> Result<()> {
+    let transport_line = build_transport_packet_line(packet_id, payload);
+    let cipher_line = server_seal(transport_line);
+    write_cipher_line(writer, &cipher_line).await
+}
+
+async fn write_cipher_line(writer: &mut OwnedWriteHalf, cipher_line: &str) -> Result<()> {
+    writer.write_all(cipher_line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
 }
 
 async fn wait_for_ack(packet_id: &str, notify: Arc<Notify>, ack_registry: Arc<AckRegistry>) {
