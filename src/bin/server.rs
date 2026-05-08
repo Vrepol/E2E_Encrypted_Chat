@@ -14,7 +14,7 @@ use tokio::{
 use clap::Parser;
 use once_cell::sync::OnceCell;
 use rust_chat::client::crypto::{pwd_hash, dec_auth};
-use rust_chat::client::utils::{handshake_writeall_macro};
+use rust_chat::client::utils::{build_ack_line, handshake_writeall_macro, parse_transport_packet_line};
 #[derive(Parser)]
 struct Args {
     /// 监听端口
@@ -228,7 +228,14 @@ async fn handle_client(socket: TcpStream, rooms: Rooms) -> Result<()> {
                             continue;
                         }
                         let server_plain=server_open(&line).unwrap_or(line);
-                        let server_enc=server_seal(format!("[{}] {}",nickname,server_plain));
+                        let broadcast_payload = if let Some((packet_id, room_cipher)) = parse_transport_packet_line(&server_plain) {
+                            let ack = handshake_writeall_macro(build_ack_line(&packet_id));
+                            let _ = writer.write_all(&ack).await;
+                            room_cipher
+                        } else {
+                            server_plain
+                        };
+                        let server_enc=server_seal(format!("[{}] {}",nickname,broadcast_payload));
                         let _ = room_tx.send(format!("{}\n", server_enc));
                     }
                     None => break,

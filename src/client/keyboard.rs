@@ -1,15 +1,19 @@
 // client/keyboard.rs
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::{fs, path::Path};
 use tokio::sync::mpsc::UnboundedSender;
 use tui::widgets::ListState;
 use unicode_segmentation::UnicodeSegmentation;
+use uuid::Uuid;
 
 use super::receiver::ChatMessage;
 use super::clipboard::{self, ClipData};
-use super::utils::{parse_name_body, encode_rgba_as_png, HELP_TEXT,HELP_TEXT_EN, create_invitation};
-use base64::Engine;
+use super::utils::{
+    build_local_notice_line, create_invitation, encode_rgba_as_png, parse_name_body, HELP_TEXT,
+    HELP_TEXT_EN,
+};
 pub enum ControlFlow { Continue, Quit }
-fn open_image(path: &std::path::Path) -> anyhow::Result<()> {
+fn open_attachment(path: &Path) -> anyhow::Result<()> {
     open::that(path)?;
     Ok(())
 }
@@ -27,6 +31,7 @@ pub struct KeyCtx<'a> {
     pub room_id:     &'a String,
     pub pwd:         &'a String,
     pub username:    &'a String,
+    pub attachment_dir: &'a Path,
 }
 
 /// 处理一次 KeyEvent：改动都通过 ctx 传回；Esc 返回 Quit
@@ -47,15 +52,25 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                         img.height.try_into().unwrap()) {
                         Ok(b) => b,
                         Err(e) => {
-                            let _ = ctx.out_tx.send(format!("⚠️ Failed to encode image: {e}"));
+                            eprintln!("⚠️ Failed to encode image: {e}");
                             return ControlFlow::Continue;
                         }
                     };
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_buf);
-                    let _ = ctx.out_tx.send(format!("/IMGDATA{}", b64));
+                    let file_path = ctx.attachment_dir.join(format!(
+                        "clipboard_{}.png",
+                        Uuid::new_v4().simple()
+                    ));
+                    match fs::write(&file_path, png_buf) {
+                        Ok(_) => {
+                            let _ = ctx.out_tx.send(file_path.to_string_lossy().to_string());
+                        }
+                        Err(e) => {
+                            let _ = ctx.out_tx.send(build_local_notice_line(&format!("写入临时图片失败: {e}")));
+                        }
+                    }
                 }
                 Err(e) => {
-                    let _ = ctx.out_tx.send(format!("⚠️ Failed to read clipboard: {e}"));
+                    let _ = ctx.out_tx.send(build_local_notice_line(&format!("读取剪贴板失败: {e}")));
                 }
             }
         }
@@ -162,8 +177,10 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
         }
         KeyCode::Tab => {
             if let Some(sel) = ctx.list_state.selected() {
-                if let ChatMessage::Image { path, .. } = &ctx.messages[sel] {
-                    if let Err(e) = open_image(path) { eprintln!("Failed to open the image: {e}"); }
+                if let ChatMessage::Attachment { path, .. } = &ctx.messages[sel] {
+                    if let Err(e) = open_attachment(path) {
+                        let _ = ctx.out_tx.send(build_local_notice_line(&format!("打开附件失败: {e}")));
+                    }
                 }
             }
         }

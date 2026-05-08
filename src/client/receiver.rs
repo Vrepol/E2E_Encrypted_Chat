@@ -1,113 +1,406 @@
-// src/client/receiver.rs
-use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
+use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tui::widgets::ListState;
 use uuid::Uuid;
-use base64::{engine::general_purpose, Engine as _};
-use crate::client::utils::parse_text_img;
-use super::notifier;
-use std::path::Path;
 
-/// 区分文本消息和图片消息
+use crate::client::utils::{
+    parse_attachment_frame, parse_local_ui_event, parse_text_img, render_transfer_line,
+    sanitize_attachment_name, AttachmentChunk, AttachmentFrame, AttachmentMeta, LocalUiEvent,
+};
+
+use super::notifier;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    File,
+}
+
+impl AttachmentKind {
+    pub fn as_protocol_tag(self) -> &'static str {
+        match self {
+            AttachmentKind::Image => "img",
+            AttachmentKind::File => "file",
+        }
+    }
+
+    pub fn from_protocol_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "img" => Some(AttachmentKind::Image),
+            "file" => Some(AttachmentKind::File),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
     Text(String),
-    Image {
-        path:    PathBuf,
-        sender:  String,
-        ts:      String,
+    Attachment {
+        path: PathBuf,
+        sender: String,
+        ts: String,
+        name: String,
+        size: u64,
+        kind: AttachmentKind,
     },
 }
 
-/// 将消息从网络通道里“抽干”到本地消息列表中
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferStage {
+    Sending,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferStatus {
+    pub transfer_id: String,
+    pub file_name: String,
+    pub total_chunks: usize,
+    pub acked_chunks: usize,
+    pub total_size: u64,
+    pub stage: TransferStage,
+    pub detail: Option<String>,
+}
+
+#[derive(Default)]
+pub struct TransferUiState {
+    order: Vec<String>,
+    outgoing: HashMap<String, TransferStatus>,
+}
+
+impl TransferUiState {
+    pub fn apply(&mut self, event: LocalUiEvent) -> Option<String> {
+        match event {
+            LocalUiEvent::TransferBegin {
+                transfer_id,
+                file_name,
+                total_chunks,
+                total_size,
+            } => {
+                if !self.order.contains(&transfer_id) {
+                    self.order.push(transfer_id.clone());
+                }
+                self.outgoing.insert(
+                    transfer_id.clone(),
+                    TransferStatus {
+                        transfer_id,
+                        file_name,
+                        total_chunks,
+                        acked_chunks: 0,
+                        total_size,
+                        stage: TransferStage::Sending,
+                        detail: None,
+                    },
+                );
+                None
+            }
+            LocalUiEvent::TransferProgress {
+                transfer_id,
+                acked_chunks,
+                total_chunks,
+            } => {
+                if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+                    status.acked_chunks = acked_chunks;
+                    status.total_chunks = total_chunks;
+                    status.stage = TransferStage::Sending;
+                    status.detail = None;
+                }
+                None
+            }
+            LocalUiEvent::TransferDone { transfer_id } => {
+                if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+                    status.acked_chunks = status.total_chunks;
+                    status.stage = TransferStage::Done;
+                    status.detail = Some("server acked".to_string());
+                }
+                None
+            }
+            LocalUiEvent::TransferFailed { transfer_id, reason } => {
+                let file_name = if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+                    status.stage = TransferStage::Failed;
+                    status.detail = Some(reason.clone());
+                    status.file_name.clone()
+                } else {
+                    transfer_id.clone()
+                };
+                Some(format!("传输失败: {file_name} - {reason}"))
+            }
+            LocalUiEvent::Notice(message) => Some(message),
+        }
+    }
+
+    pub fn lines(&self, limit: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        for transfer_id in self.order.iter().rev().take(limit) {
+            if let Some(status) = self.outgoing.get(transfer_id) {
+                lines.push(render_transfer_line(
+                    &status.file_name,
+                    status.total_size,
+                    status.stage,
+                    status.acked_chunks,
+                    status.total_chunks,
+                    status.detail.as_deref(),
+                ));
+            }
+        }
+
+        lines
+    }
+}
+
+#[derive(Default)]
+pub struct ReceiverState {
+    incoming: HashMap<String, IncomingAttachment>,
+}
+
+struct IncomingAttachment {
+    sender: String,
+    file_name: String,
+    total_size: u64,
+    total_chunks: usize,
+    sha256_hex: String,
+    kind: AttachmentKind,
+    chunks: Vec<Option<Vec<u8>>>,
+    received_chunks: usize,
+}
+
 pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<ChatMessage>,
     list_state: &mut ListState,
     my_name: &str,
-    img_dir: &Path,
-    members:    &mut Vec<String>, 
+    attachment_dir: &Path,
+    members: &mut Vec<String>,
+    receiver_state: &mut ReceiverState,
+    transfer_ui_state: &mut TransferUiState,
 ) {
     while let Ok(line) = net_rx.try_recv() {
         if line.starts_with("/member_list ") {
-                members.clear();
-                members.extend(
-                    line["/member_list ".len()..]
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                );
-                continue;
+            members.clear();
+            members.extend(
+                line["/member_list ".len()..]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            );
+            continue;
         }
 
-        // 拆分发送者、原始时间戳（这里不再用）和 body
-        let (sender, body) = parse_text_img(&line);
+        if let Some(event) = parse_local_ui_event(&line) {
+            if let Some(notice) = transfer_ui_state.apply(event) {
+                let hms = Local::now().format("%H:%M:%S").to_string();
+                push_message(
+                    messages,
+                    list_state,
+                    ChatMessage::Text(format!("[System] [{hms}] {notice}")),
+                );
+            }
+            continue;
+        }
 
-        // ★ 只有别人发的才提醒
+        let (sender, body) = parse_text_img(&line);
+        let hms = Local::now().format("%H:%M:%S").to_string();
+
+        let result = match parse_attachment_frame(&body) {
+            Some(AttachmentFrame::Meta(meta)) => {
+                register_attachment(receiver_state, sender.clone(), meta, attachment_dir, &hms)
+            }
+            Some(AttachmentFrame::Chunk(chunk)) => {
+                append_attachment_chunk(receiver_state, chunk, attachment_dir, &hms)
+            }
+            None if body.starts_with("/IMGDATA") => {
+                Ok(decode_legacy_image(&sender, &body, attachment_dir, &hms))
+            }
+            None => Ok(Some(ChatMessage::Text(format_text_message(&line, &hms)))),
+        };
+
+        let Some(message) = (match result {
+            Ok(message) => message,
+            Err(err) => Some(ChatMessage::Text(format!("[System] [{hms}] {err}"))),
+        }) else {
+            continue;
+        };
+
         if sender != my_name {
             notifier::notify();
         }
+        push_message(messages, list_state, message);
+    }
+}
 
-        // 判断是否滚动到底部
-        let at_bottom = list_state
-            .selected()
-            .map(|i| i + 1 == messages.len())
-            .unwrap_or(true);
+fn register_attachment(
+    receiver_state: &mut ReceiverState,
+    sender: String,
+    meta: AttachmentMeta,
+    attachment_dir: &Path,
+    hms: &str,
+) -> Result<Option<ChatMessage>, String> {
+    let incoming = IncomingAttachment {
+        sender,
+        file_name: meta.file_name,
+        total_size: meta.total_size,
+        total_chunks: meta.total_chunks,
+        sha256_hex: meta.sha256_hex,
+        kind: meta.kind,
+        chunks: vec![None; meta.total_chunks],
+        received_chunks: 0,
+    };
 
-        // 本地时间戳
-        let now = Local::now();
-        let hms = now.format("%H:%M:%S").to_string();
+    if meta.total_chunks == 0 {
+        return finalize_attachment(meta.transfer_id, incoming, attachment_dir, hms).map(Some);
+    }
 
-        if body.starts_with("/IMGDATA") {
-            // 图片分支：去掉前缀，解 base64，写文件
-            let b64_data = &body["/IMGDATA".len()..];
-            match general_purpose::STANDARD.decode(b64_data) {
-                Ok(bytes) => {
-                    // 临时目录 ./rust_chat_images
-                    let file_path = img_dir.join(format!("img_{}.png", Uuid::new_v4()));
-                    if let Ok(mut file) = File::create(&file_path) {
-                        let _ = file.write_all(&bytes);
-                        messages.push(ChatMessage::Image {
-                            path:   file_path,
-                            sender: sender.clone(),
-                            ts:     hms.clone(),
-                        });
-                    } else {
-                        // 写文件失败，退回为文本显示
-                        let fallback = format!("[{}] <Failed to save image>", hms);
-                        messages.push(ChatMessage::Text(fallback));
-                    }
-                }
-                Err(_) => {
-                    // 解码失败，退回为文本
-                    let fallback = format!("[{}] <Invalid image data>", hms);
-                    messages.push(ChatMessage::Text(fallback));
-                }
-            }
-        } else {
-            // 文本分支：按旧逻辑加时间戳
-            let formatted = if let Some(pos) = line.find(']') {
-                // 保留原来中括号后的内容
-                let (left, right) = line.split_at(pos + 1);
-                format!("{} [{}]{}", left, hms, right)
-            } else {
-                format!("[{}] {}", hms, line)
-            };
-            messages.push(ChatMessage::Text(formatted));
+    receiver_state.incoming.insert(meta.transfer_id, incoming);
+    Ok(None)
+}
+
+fn append_attachment_chunk(
+    receiver_state: &mut ReceiverState,
+    chunk: AttachmentChunk,
+    attachment_dir: &Path,
+    hms: &str,
+) -> Result<Option<ChatMessage>, String> {
+    let mut ready = false;
+
+    {
+        let Some(incoming) = receiver_state.incoming.get_mut(&chunk.transfer_id) else {
+            return Ok(None);
+        };
+
+        if chunk.index >= incoming.total_chunks {
+            return Err(format!("Attachment chunk out of range: {}", chunk.index));
         }
 
-        // 维持选中最后一条
-        if at_bottom {
-            list_state.select(Some(messages.len().saturating_sub(1)));
+        if incoming.chunks[chunk.index].is_none() {
+            incoming.chunks[chunk.index] = Some(chunk.data);
+            incoming.received_chunks += 1;
         }
-        // 超过 500 条就删除前 100 条
-        if messages.len() > 500 {
-            messages.drain(..100);
+
+        if incoming.received_chunks == incoming.total_chunks {
+            ready = true;
         }
+    }
+
+    if !ready {
+        return Ok(None);
+    }
+
+    let incoming = receiver_state
+        .incoming
+        .remove(&chunk.transfer_id)
+        .ok_or_else(|| "Attachment state missing during finalize".to_string())?;
+
+    finalize_attachment(chunk.transfer_id, incoming, attachment_dir, hms).map(Some)
+}
+
+fn finalize_attachment(
+    transfer_id: String,
+    incoming: IncomingAttachment,
+    attachment_dir: &Path,
+    hms: &str,
+) -> Result<ChatMessage, String> {
+    let mut hasher = Sha256::new();
+    let mut written_size = 0u64;
+    let safe_name = sanitize_attachment_name(&incoming.file_name);
+    let file_path = attachment_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe_name));
+
+    fs::create_dir_all(attachment_dir).map_err(|e| e.to_string())?;
+    let mut file = File::create(&file_path).map_err(|e| e.to_string())?;
+
+    for chunk in incoming.chunks {
+        let chunk = chunk.ok_or_else(|| {
+            format!("Attachment {transfer_id} is incomplete, missing one or more chunks")
+        })?;
+        written_size = written_size.saturating_add(chunk.len() as u64);
+        hasher.update(&chunk);
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+    }
+
+    if written_size != incoming.total_size {
+        let _ = fs::remove_file(&file_path);
+        return Err(format!(
+            "Attachment size mismatch: expected {}, got {}",
+            incoming.total_size, written_size
+        ));
+    }
+
+    let digest = hex::encode(hasher.finalize());
+    if digest != incoming.sha256_hex {
+        let _ = fs::remove_file(&file_path);
+        return Err(format!("Attachment checksum mismatch for {}", incoming.file_name));
+    }
+
+    Ok(ChatMessage::Attachment {
+        path: file_path,
+        sender: incoming.sender,
+        ts: hms.to_string(),
+        name: safe_name,
+        size: written_size,
+        kind: incoming.kind,
+    })
+}
+
+fn decode_legacy_image(
+    sender: &str,
+    body: &str,
+    attachment_dir: &Path,
+    hms: &str,
+) -> Option<ChatMessage> {
+    let b64_data = &body["/IMGDATA".len()..];
+    let bytes = general_purpose::STANDARD.decode(b64_data).ok()?;
+    let file_path = attachment_dir.join(format!("img_{}.png", Uuid::new_v4()));
+    let mut file = File::create(&file_path).ok()?;
+    file.write_all(&bytes).ok()?;
+
+    Some(ChatMessage::Attachment {
+        path: file_path,
+        sender: sender.to_string(),
+        ts: hms.to_string(),
+        name: "clipboard.png".to_string(),
+        size: bytes.len() as u64,
+        kind: AttachmentKind::Image,
+    })
+}
+
+fn format_text_message(line: &str, hms: &str) -> String {
+    if let Some(pos) = line.find(']') {
+        let (left, right) = line.split_at(pos + 1);
+        format!("{} [{}]{}", left, hms, right)
+    } else {
+        format!("[{}] {}", hms, line)
+    }
+}
+
+fn push_message(
+    messages: &mut Vec<ChatMessage>,
+    list_state: &mut ListState,
+    message: ChatMessage,
+) {
+    let at_bottom = list_state
+        .selected()
+        .map(|i| i + 1 == messages.len())
+        .unwrap_or(true);
+
+    messages.push(message);
+
+    if at_bottom {
+        list_state.select(Some(messages.len().saturating_sub(1)));
+    }
+
+    if messages.len() > 500 {
+        messages.drain(..100);
     }
 }

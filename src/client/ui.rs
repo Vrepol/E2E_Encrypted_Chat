@@ -23,6 +23,7 @@ pub fn draw_chat<B: Backend>(
     messages: &[ChatMessage],
     list_state: &mut ListState,
     member_list: &[String],
+    transfer_lines: &[String],
     input: &str,
     cursor: usize,
     username: &str,
@@ -35,6 +36,7 @@ pub fn draw_chat<B: Backend>(
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),   // 成员栏
+            Constraint::Length(4),   // 传输状态
             Constraint::Length(5),   // 输入框
         ])
         .split(size);
@@ -90,6 +92,19 @@ pub fn draw_chat<B: Backend>(
         chunks[1],
     );
 
+    // —— Transfers —— //
+    let transfers_text = if transfer_lines.is_empty() {
+        "No active transfers".to_string()
+    } else {
+        transfer_lines.join("\n")
+    };
+    f.render_widget(
+        Paragraph::new(transfers_text)
+            .block(Block::default().borders(Borders::ALL).title("Transfers")
+            .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
+        chunks[2],
+    );
+
     // —— Input —— //
     use tui::widgets::Wrap;
     f.render_widget(
@@ -99,15 +114,15 @@ pub fn draw_chat<B: Backend>(
                 .borders(Borders::ALL)
                 .title(format!("{} >", username))
                 .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
-        chunks[2],
+        chunks[3],
     );
 
     // —— 光标定位 —— //
-    let inner_width = (chunks[2].width - 2) as usize;
+    let inner_width = (chunks[3].width - 2) as usize;
     let byte_idx = nth_grapheme_byte_idx(input, cursor);
     let prefix   = &input[..byte_idx];
     let wrapped  = wrap(prefix, inner_width);
     let cursor_y = wrapped.len() as u16 - 1;
     let cursor_x = wrapped.last().unwrap().as_ref().width() as u16;
-    f.set_cursor(chunks[2].x + 1 + cursor_x, chunks[2].y + 1 + cursor_y);
+    f.set_cursor(chunks[3].x + 1 + cursor_x, chunks[3].y + 1 + cursor_y);
 }

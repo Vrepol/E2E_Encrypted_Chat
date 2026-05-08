@@ -27,7 +27,7 @@ use tui::{
 use rust_chat::client::{
     utils::inviation_clear,
     network,
-    receiver::{drain_messages, ChatMessage},
+    receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState},
     initialization::{initial_serveraddr, initial_name,init_color},
     handshake,
     keyboard::{handle_key, UndoMgr, KeyCtx, ControlFlow},
@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
     let ui_mode = UiMode::Chat;
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut member_list: Vec<String>   = Vec::new();
+    let mut receiver_state = ReceiverState::default();
+    let mut transfer_ui_state = TransferUiState::default();
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
@@ -143,12 +145,14 @@ async fn main() -> Result<()> {
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
         terminal.draw(|f| {
+            let transfer_lines = transfer_ui_state.lines(2);
             match ui_mode {
                 UiMode::Chat => draw_chat(
                     f,
                     &messages,
                     &mut list_state,
                     &member_list,
+                    &transfer_lines,
                     &input,
                     cursor,
                     &username,
@@ -172,6 +176,7 @@ async fn main() -> Result<()> {
                     room_id:     &room_id,
                     pwd:         &pwd,
                     username:    &username,
+                    attachment_dir: img_tempdir.path(),
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
                     break 'ui;
@@ -181,7 +186,16 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
-        drain_messages(&mut net_rx, &mut messages, &mut list_state, &username,img_tempdir.path(),&mut member_list,);
+        drain_messages(
+            &mut net_rx,
+            &mut messages,
+            &mut list_state,
+            &username,
+            img_tempdir.path(),
+            &mut member_list,
+            &mut receiver_state,
+            &mut transfer_ui_state,
+        );
     }
     
     /* ---------- 8. 清理退出 ---------- */
