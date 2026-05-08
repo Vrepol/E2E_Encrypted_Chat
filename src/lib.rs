@@ -1,6 +1,7 @@
 // lib.rs
 
 pub mod client;
+pub mod app_config;
 
 #[cfg(test)]
 mod tests {
@@ -9,6 +10,7 @@ mod tests {
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
         build_ack_line, build_attachment_frames_from_bytes, build_local_invite_request_line,
+        normalize_clipboard_rgba,
         build_transport_packet_line, create_invitation, parse_ack_line, parse_attachment_frame,
         parse_invitation, parse_local_invite_request_line, parse_transport_packet_line,
         AttachmentFrame,
@@ -102,5 +104,22 @@ mod tests {
         assert_eq!(parsed.room_id, "Public");
         assert_eq!(parsed.room_key, "");
         assert_eq!(parsed.owner_capability, "owner-cap-1");
+    }
+
+    #[test]
+    fn test_normalize_clipboard_rgba_fills_missing_alpha() {
+        let raw = vec![
+            10, 20, 30, 0,
+            40, 50, 60, 0,
+        ];
+
+        let normalized = normalize_clipboard_rgba(&raw, 2, 1).expect("clipboard rgba should normalize");
+        assert_eq!(
+            normalized,
+            vec![
+                10, 20, 30, 255,
+                40, 50, 60, 255,
+            ]
+        );
     }
 }

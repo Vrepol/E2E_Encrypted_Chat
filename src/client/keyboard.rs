@@ -7,9 +7,11 @@ use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 use super::receiver::ChatMessage;
+use super::ui::{selected_message_index, RenderedChatRow};
 use super::clipboard::{self, ClipData};
 use super::utils::{
     build_local_invite_request_line, build_local_notice_line, encode_rgba_as_png,
+    normalize_clipboard_rgba,
     parse_name_body, HELP_TEXT, HELP_TEXT_EN,
 };
 pub enum ControlFlow { Continue, Quit }
@@ -23,6 +25,7 @@ pub struct KeyCtx<'a> {
     pub input:       &'a mut String,
     pub cursor:      &'a mut usize,
     pub list_state:  &'a mut ListState,
+    pub chat_rows:   &'a [RenderedChatRow],
     pub messages:    &'a mut Vec<ChatMessage>,
     pub member_list: &'a mut Vec<String>, // 目前未用到，但保留以备扩展
     pub undo_mgr:    &'a mut UndoMgr,
@@ -48,9 +51,16 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                     *ctx.cursor += txt.graphemes(true).count();
                 }
                 Ok(ClipData::Image(img)) => {
-                    let png_buf = match encode_rgba_as_png(&img.bytes,
-                        img.width.try_into().unwrap(),
-                        img.height.try_into().unwrap()) {
+                    let width: u32 = img.width.try_into().unwrap();
+                    let height: u32 = img.height.try_into().unwrap();
+                    let rgba = match normalize_clipboard_rgba(&img.bytes, width, height) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            let _ = ctx.out_tx.send(build_local_notice_line(&format!("剪贴板图片格式异常: {e}")));
+                            return ControlFlow::Continue;
+                        }
+                    };
+                    let png_buf = match encode_rgba_as_png(&rgba, width, height) {
                         Ok(b) => b,
                         Err(e) => {
                             eprintln!("⚠️ Failed to encode image: {e}");
@@ -78,7 +88,7 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
 
         // =============== 复制选中行 ===============
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Some(sel) = ctx.list_state.selected() {
+            if let Some(sel) = selected_message_index(ctx.chat_rows, ctx.list_state.selected()) {
                 let (_, _, body) = parse_name_body(&ctx.messages[sel]);
                 if let Err(e) = clipboard::set_text(&body) {
                     eprintln!("⚠️ Failed to paste: {e}");
@@ -180,16 +190,17 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             }
         }
         KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ctx.list_state.select(Some(ctx.messages.len().saturating_sub(1)));
+            ctx.list_state
+                .select(Some(ctx.chat_rows.len().saturating_sub(1)));
         }
         KeyCode::Down => {
             if let Some(i) = ctx.list_state.selected() {
-                let next = (i + 1).min(ctx.messages.len().saturating_sub(1));
+                let next = (i + 1).min(ctx.chat_rows.len().saturating_sub(1));
                 ctx.list_state.select(Some(next));
             }
         }
         KeyCode::Tab => {
-            if let Some(sel) = ctx.list_state.selected() {
+            if let Some(sel) = selected_message_index(ctx.chat_rows, ctx.list_state.selected()) {
                 if let ChatMessage::Attachment { path, .. } = &ctx.messages[sel] {
                     if let Err(e) = open_attachment(path) {
                         let _ = ctx.out_tx.send(build_local_notice_line(&format!("打开附件失败: {e}")));

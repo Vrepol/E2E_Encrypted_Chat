@@ -3,6 +3,7 @@ use clap::Parser;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
 use rand::{distr::Alphanumeric, Rng};
+use rust_chat::app_config::{DEFAULT_SERVER_PASSWORD, DEFAULT_SERVER_PORT};
 use rust_chat::client::{
     crypto::{dec_auth, pwd_hash, server_open, server_seal},
     utils::{
@@ -24,9 +25,9 @@ use tokio::{
 
 #[derive(Parser)]
 struct Args {
-    #[arg(short, long, default_value_t = 6655)]
+    #[arg(short, long, default_value_t = DEFAULT_SERVER_PORT)]
     port: u16,
-    #[arg(short = 'k', default_value = "Vrepol")]
+    #[arg(short = 'k', default_value_t = String::from(DEFAULT_SERVER_PASSWORD))]
     password: String,
 }
 

@@ -141,15 +141,26 @@ async fn main() -> Result<()> {
         .prefix("")
         .tempdir()?;
     let mut undo_mgr = UndoMgr::new();
-    use rust_chat::client::ui::{draw_chat};
+    use rust_chat::client::ui::{build_chat_rows, chat_inner_width, draw_chat, RenderedChatRow};
+    let mut chat_rows: Vec<RenderedChatRow>;
     /* ---------- 7. 主循环 ---------- */
     'ui: loop {
+        let size = terminal.size()?;
+        chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
+        if let Some(selected) = list_state.selected() {
+            if selected >= chat_rows.len() && !chat_rows.is_empty() {
+                list_state.select(Some(chat_rows.len() - 1));
+            }
+        } else if !chat_rows.is_empty() {
+            list_state.select(Some(chat_rows.len() - 1));
+        }
+
         terminal.draw(|f| {
             let transfer_lines = transfer_ui_state.lines(2);
             match ui_mode {
                 UiMode::Chat => draw_chat(
                     f,
-                    &messages,
+                    &chat_rows,
                     &mut list_state,
                     &member_list,
                     &transfer_lines,
@@ -168,6 +179,7 @@ async fn main() -> Result<()> {
                     input:       &mut input,
                     cursor:      &mut cursor,
                     list_state:  &mut list_state,
+                    chat_rows:   &chat_rows,
                     messages:    &mut messages,
                     member_list: &mut member_list,
                     undo_mgr:    &mut undo_mgr,
@@ -187,16 +199,28 @@ async fn main() -> Result<()> {
         }
 
         // ——— 收网络消息 ———
+        let was_at_bottom = list_state
+            .selected()
+            .map(|i| i + 1 >= chat_rows.len())
+            .unwrap_or(true);
         drain_messages(
             &mut net_rx,
             &mut messages,
-            &mut list_state,
             &username,
             img_tempdir.path(),
             &mut member_list,
             &mut receiver_state,
             &mut transfer_ui_state,
         );
+        let size = terminal.size()?;
+        chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
+        if was_at_bottom && !chat_rows.is_empty() {
+            list_state.select(Some(chat_rows.len() - 1));
+        } else if let Some(selected) = list_state.selected() {
+            if selected >= chat_rows.len() && !chat_rows.is_empty() {
+                list_state.select(Some(chat_rows.len() - 1));
+            }
+        }
     }
     
     /* ---------- 8. 清理退出 ---------- */

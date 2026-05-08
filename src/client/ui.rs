@@ -2,7 +2,7 @@
 use tui::{
     backend::Backend,
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -12,15 +12,76 @@ use textwrap::wrap;
 use super::utils::parse_name_body;
 use super::receiver::ChatMessage;
 use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Debug, Clone)]
+pub struct RenderedChatRow {
+    pub message_index: usize,
+    pub text: String,
+    pub color: Color,
+}
+
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
      .nth(n)
      .map(|(idx, _)| idx)
      .unwrap_or_else(|| s.len())
 }
+
+pub fn chat_inner_width(size: Rect) -> usize {
+    size.width.saturating_sub(4) as usize
+}
+
+pub fn build_chat_rows(
+    messages: &[ChatMessage],
+    chat_inner_width: usize,
+    username: &str,
+) -> Vec<RenderedChatRow> {
+    const PREFIX_WIDTH: usize = 5;
+    let wrap_width = chat_inner_width.saturating_sub(PREFIX_WIDTH).max(1);
+    let mut rows = Vec::new();
+
+    for (message_index, raw) in messages.iter().enumerate() {
+        let (name, time, display_body) = parse_name_body(raw);
+        let color = if name == "System" {
+            Color::DarkGray
+        } else if name == username {
+            Color::Blue
+        } else {
+            Color::Red
+        };
+
+        rows.push(RenderedChatRow {
+            message_index,
+            text: format!("┌-[{}]-#{}", name, time),
+            color,
+        });
+
+        let lines = wrap(&display_body, wrap_width);
+        let last = lines.len().saturating_sub(1);
+        for (i, line) in lines.iter().enumerate() {
+            let prefix = if i == last { "└--$" } else { "|   " };
+            rows.push(RenderedChatRow {
+                message_index,
+                text: format!("{} {}", prefix, line),
+                color,
+            });
+        }
+    }
+
+    rows
+}
+
+pub fn selected_message_index(
+    rows: &[RenderedChatRow],
+    selected_row: Option<usize>,
+) -> Option<usize> {
+    let row = selected_row?;
+    rows.get(row).map(|item| item.message_index)
+}
+
 pub fn draw_chat<B: Backend>(
     f: &mut Frame<B>,
-    messages: &[ChatMessage],
+    chat_rows: &[RenderedChatRow],
     list_state: &mut ListState,
     member_list: &[String],
     transfer_lines: &[String],
@@ -41,32 +102,19 @@ pub fn draw_chat<B: Backend>(
         ])
         .split(size);
 
-    let chat_inner_width = (chunks[0].width - 2) as usize;
-    const PREFIX_WIDTH: usize = 5;
-
-    let items: Vec<ListItem> = messages.iter().map(|raw| {
-        let (name, time, display_body) = parse_name_body(raw);
-        let color  = if name == username { Color::Blue } else { Color::Red };
-
-        // ① 头行
-        let mut spans = vec![Spans::from(
-            Span::styled(format!("┌-[{}]-#{}", name, time),
-                         Style::default().fg(color).add_modifier(Modifier::BOLD))
-        )];
-
-        // ② body 行（动态折行）
-        let wrap_width = chat_inner_width.saturating_sub(PREFIX_WIDTH);
-        let lines = wrap(&display_body, wrap_width);
-        let last = lines.len().saturating_sub(1);
-        for (i, line) in lines.iter().enumerate() {
-            let prefix = if i == last { "└--$" } else { "|   " };
-            spans.push(Spans::from(
-                Span::styled(format!("{} {}", prefix, line),
-                             Style::default().fg(color))
-            ));
-        }
-        ListItem::new(spans)
-    }).collect();
+    let items: Vec<ListItem> = chat_rows
+        .iter()
+        .map(|row| {
+            let style = if row.text.starts_with("┌-") {
+                Style::default()
+                    .fg(row.color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(row.color)
+            };
+            ListItem::new(Spans::from(Span::styled(row.text.clone(), style)))
+        })
+        .collect();
 
     f.render_stateful_widget(
         List::new(items)
@@ -118,7 +166,7 @@ pub fn draw_chat<B: Backend>(
     );
 
     // —— 光标定位 —— //
-    let inner_width = (chunks[3].width - 2) as usize;
+    let inner_width = (chunks[3].width - 2).max(1) as usize;
     let byte_idx = nth_grapheme_byte_idx(input, cursor);
     let prefix   = &input[..byte_idx];
     let wrapped  = wrap(prefix, inner_width);

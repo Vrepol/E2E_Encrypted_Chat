@@ -9,7 +9,6 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tui::widgets::ListState;
 use uuid::Uuid;
 
 use crate::client::utils::{
@@ -179,7 +178,6 @@ struct IncomingAttachment {
 pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<ChatMessage>,
-    list_state: &mut ListState,
     my_name: &str,
     attachment_dir: &Path,
     members: &mut Vec<String>,
@@ -202,11 +200,7 @@ pub fn drain_messages(
         if let Some(event) = parse_local_ui_event(&line) {
             if let Some(notice) = transfer_ui_state.apply(event) {
                 let hms = Local::now().format("%H:%M:%S").to_string();
-                push_message(
-                    messages,
-                    list_state,
-                    ChatMessage::Text(format!("[System] [{hms}] {notice}")),
-                );
+                push_message(messages, ChatMessage::Text(format!("[System] [{hms}] {notice}")));
             }
             continue;
         }
@@ -237,7 +231,7 @@ pub fn drain_messages(
         if sender != my_name {
             notifier::notify();
         }
-        push_message(messages, list_state, message);
+        push_message(messages, message);
     }
 }
 
@@ -384,21 +378,8 @@ fn format_text_message(line: &str, hms: &str) -> String {
     }
 }
 
-fn push_message(
-    messages: &mut Vec<ChatMessage>,
-    list_state: &mut ListState,
-    message: ChatMessage,
-) {
-    let at_bottom = list_state
-        .selected()
-        .map(|i| i + 1 == messages.len())
-        .unwrap_or(true);
-
+fn push_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
     messages.push(message);
-
-    if at_bottom {
-        list_state.select(Some(messages.len().saturating_sub(1)));
-    }
 
     if messages.len() > 500 {
         messages.drain(..100);

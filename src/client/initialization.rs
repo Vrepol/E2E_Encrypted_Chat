@@ -5,6 +5,11 @@ use fake::faker::name::raw::*;
 use colored::*;
 use std::io::IsTerminal;
 use supports_color::{self,Stream as ColorStream};
+
+use crate::app_config::{
+    default_client_server, CLIENT_SERVER_PRESETS, DEFAULT_SERVER_PASSWORD,
+};
+
 pub fn init_color() {
     if std::env::var_os("NO_COLOR").is_some() {
         colored::control::set_override(false);
@@ -20,7 +25,7 @@ fn get_password_or_default()->String {
     let mut inp = String::new();
     let _ = io::stdin().read_line(&mut inp);
     if inp.trim().is_empty() {
-        "Vrepol".to_string()
+        DEFAULT_SERVER_PASSWORD.to_string()
     } else {
         inp.trim().to_string()
     }
@@ -45,17 +50,11 @@ pub fn initial_name() -> io::Result<String> {
     Ok(username)
 }
 pub fn initial_serveraddr() -> io::Result<String> {
-
-    let servers = vec![
-        ("Public server", "8.153.67.166:6655"),
-        ("Tailscale server", "100.123.171.94:6655"),
-    ];
-
     // 交互循环直到拿到合法输入
     let chosen = loop {
         println!("\nAvaliable Servers:");
-        for (i, (name, _)) in servers.iter().enumerate() {
-            println!("  {}. {}", i + 1, name);
+        for (i, server) in CLIENT_SERVER_PRESETS.iter().enumerate() {
+            println!("  {}. {}", i + 1, server.name);
         }
         print!("Choice / IP:Port / /INVITE:…  ➜ ");
         io::stdout().flush()?;
@@ -64,28 +63,28 @@ pub fn initial_serveraddr() -> io::Result<String> {
         io::stdin().read_line(&mut inp)?;
         let s = inp.trim();
         if s.is_empty() {
-            println!("Default Choice : {}", servers[0].0);
-            let key = String::from("Vrepol");
-            break format!("{}&{}",servers[0].1.to_string(),key);
+            let server = default_client_server();
+            println!("Default Choice : {}", server.name);
+            break format!("{}&{}", server.addr, DEFAULT_SERVER_PASSWORD);
         }
         // 1️⃣ 数字
         if let Ok(idx) = s.parse::<usize>() {
-            if (1..=servers.len()).contains(&idx) {
+            if let Some(server) = CLIENT_SERVER_PRESETS.get(idx - 1) {
                 print!("Server Password: ");
                 io::stdout().flush()?;
                 let key = get_password_or_default();
-                break format!("{}&{}",servers[idx - 1].1.to_string(),key.to_string());
+                break format!("{}&{}", server.addr, key);
             }
         }
-        // 2️⃣ IP:Port  (简单正则校验 0-255.0-255.0-255.0-255:数字)
-        if regex::Regex::new(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
+        // 2️⃣ host:port / IP:port
+        if regex::Regex::new(r"^[A-Za-z0-9.\-]+:\d+$")
             .unwrap()
             .is_match(s)
         {
             print!("Server Password: ");
             io::stdout().flush()?;
             let key = get_password_or_default();
-            break format!("{}&{}",s.to_string(),key.to_string());
+            break format!("{}&{}", s, key);
         }
         // 3️⃣ 邀请码
         if s.starts_with("/INVITE:") {

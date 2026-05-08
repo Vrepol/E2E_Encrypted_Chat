@@ -8,7 +8,7 @@
 
 `rust_chat` 由 **客户端** 和 **服务器** 两部分组成，均使用 Rust **Tokio 异步运行时** 实现。项目聚焦在「轻量级 + 强安全 + 高可玩性」：内置房间系统、邀请码、TUI 聊天界面、附件分片传输、图片预览与可插拔的加密层。
 
-只需要稍微改一下`initialization.rs`可以为好友们提供懒人启动方式。
+默认服务器、默认端口、默认服务器密码现在集中在 `src/app_config.rs`，后续开源时只改这一处即可。
 
 <div align="center">
   <img src="https://github.com/Vrepol/Rust_Crypto_Chat/blob/main/demo.gif" width="600" alt="Demo GIF"/>
@@ -77,6 +77,13 @@ $ cargo build --release
 | ------------ | --------------- | -------- |
 | `--port`     | 监听端口            | `6655`   |
 | `-k` | 服务器主密码（同时作为根密钥） | `Vrepol` |
+
+如果你想改项目默认值，而不是每次手动传参：
+- 服务端默认端口
+- 服务端默认密码
+- 客户端预设服务器列表
+
+直接修改 `src/app_config.rs` 即可。
 
 
 ### 4. 运行客户端

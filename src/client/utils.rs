@@ -663,6 +663,31 @@ pub fn encode_rgba_as_png(rgba: &[u8], w: u32, h: u32) -> anyhow::Result<Vec<u8>
     Ok(buf)
 }
 
+pub fn normalize_clipboard_rgba(bytes: &[u8], w: u32, h: u32) -> anyhow::Result<Vec<u8>> {
+    let expected_len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| anyhow!("Clipboard image dimensions are too large"))?;
+
+    if bytes.len() != expected_len {
+        return Err(anyhow!(
+            "Clipboard image buffer size mismatch: expected {expected_len}, got {}",
+            bytes.len()
+        ));
+    }
+
+    let mut rgba = bytes.to_vec();
+    let all_alpha_zero = rgba.chunks_exact(4).all(|px| px[3] == 0);
+
+    if all_alpha_zero {
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+
+    Ok(rgba)
+}
+
 #[derive(Serialize, Deserialize)]
 struct InvitePayload {
     server: String,
