@@ -4,11 +4,14 @@ pub mod client;
 
 #[cfg(test)]
 mod tests {
+    use crate::client::crypto::{open, seal, set_room_key};
     use crate::client::notifier;
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
-        build_ack_line, build_attachment_frames_from_bytes, build_transport_packet_line,
-        parse_ack_line, parse_attachment_frame, parse_transport_packet_line, AttachmentFrame,
+        build_ack_line, build_attachment_frames_from_bytes, build_local_invite_request_line,
+        build_transport_packet_line, create_invitation, parse_ack_line, parse_attachment_frame,
+        parse_invitation, parse_local_invite_request_line, parse_transport_packet_line,
+        AttachmentFrame,
     };
 
     #[test]
@@ -51,5 +54,53 @@ mod tests {
     fn test_ack_line_round_trip() {
         let line = build_ack_line("packet-2");
         assert_eq!(parse_ack_line(&line), Some("packet-2"));
+    }
+
+    #[test]
+    fn test_room_cipher_round_trip() {
+        set_room_key("00112233445566778899aabbccddeeff");
+        let cipher = seal("hello room");
+        assert!(cipher.starts_with("ENC:"));
+        assert_eq!(open(&cipher).as_deref(), Some("hello room"));
+    }
+
+    #[test]
+    fn test_invite_round_trip() {
+        let server_hash = [7u8; 32];
+        let invite = create_invitation(
+            "127.0.0.1:6655".to_string(),
+            server_hash,
+            "room-a".to_string(),
+            "room-password".to_string(),
+            "invite-token-123".to_string(),
+            1_700_000_000,
+        )
+        .expect("invite should build");
+
+        let (server, parsed_hash, room_id, room_key, token, expires_at) =
+            parse_invitation(&invite).expect("invite should parse");
+        assert_eq!(server, "127.0.0.1:6655");
+        assert_eq!(parsed_hash, server_hash);
+        assert_eq!(room_id, "room-a");
+        assert_eq!(room_key, "room-password");
+        assert_eq!(token, "invite-token-123");
+        assert_eq!(expires_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn test_local_invite_request_round_trip_with_empty_room_key() {
+        let line = build_local_invite_request_line(
+            "127.0.0.1:6655",
+            [9u8; 32],
+            "Public",
+            "",
+            "owner-cap-1",
+        );
+        let parsed = parse_local_invite_request_line(&line).expect("request should parse");
+        assert_eq!(parsed.server_addr, "127.0.0.1:6655");
+        assert_eq!(parsed.server_pwd_hash, [9u8; 32]);
+        assert_eq!(parsed.room_id, "Public");
+        assert_eq!(parsed.room_key, "");
+        assert_eq!(parsed.owner_capability, "owner-cap-1");
     }
 }

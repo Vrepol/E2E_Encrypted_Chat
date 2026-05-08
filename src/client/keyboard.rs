@@ -9,8 +9,8 @@ use uuid::Uuid;
 use super::receiver::ChatMessage;
 use super::clipboard::{self, ClipData};
 use super::utils::{
-    build_local_notice_line, create_invitation, encode_rgba_as_png, parse_name_body, HELP_TEXT,
-    HELP_TEXT_EN,
+    build_local_invite_request_line, build_local_notice_line, encode_rgba_as_png,
+    parse_name_body, HELP_TEXT, HELP_TEXT_EN,
 };
 pub enum ControlFlow { Continue, Quit }
 fn open_attachment(path: &Path) -> anyhow::Result<()> {
@@ -32,6 +32,7 @@ pub struct KeyCtx<'a> {
     pub pwd:         &'a String,
     pub username:    &'a String,
     pub attachment_dir: &'a Path,
+    pub owner_capability: &'a Option<String>,
 }
 
 /// 处理一次 KeyEvent：改动都通过 ctx 传回；Esc 返回 Quit
@@ -95,13 +96,25 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
 
         // =============== 生成邀请码 ===============
         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let Some(owner_capability) = ctx.owner_capability.as_deref() else {
+                let _ = ctx.out_tx.send(build_local_notice_line("只有当前房主连接可以申请一次性邀请码"));
+                return ControlFlow::Continue;
+            };
             let mut iter = ctx.server_addr.splitn(2, '&');
             let server     = iter.next().unwrap_or("");
             let server_pwd = iter.next().unwrap_or("");
-            match create_invitation(server.to_string(), server_pwd.to_string(), ctx.room_id.clone(), ctx.pwd.clone()) {
-                Ok(code) => { let _ = ctx.out_tx.send(format!("/INVITE:{}", code)); }
-                Err(e)   => { let _ = ctx.out_tx.send("Failed to generate invite code".to_string()); eprintln!("Failed to generate invite code: {e}"); }
+            if server.is_empty() || server_pwd.is_empty() {
+                let _ = ctx.out_tx.send(build_local_notice_line("当前连接没有可用的服务器口令上下文，无法申请邀请码"));
+                return ControlFlow::Continue;
             }
+            let request = build_local_invite_request_line(
+                server,
+                super::crypto::pwd_hash(server_pwd),
+                ctx.room_id,
+                ctx.pwd,
+                owner_capability,
+            );
+            let _ = ctx.out_tx.send(request);
         }
 
         // =============== 普通字符插入 ===============

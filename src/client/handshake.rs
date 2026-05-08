@@ -9,11 +9,12 @@ use tokio::{
 };
 use super::utils::{parse_invitation,handshake_writeall_macro};
 use super::crypto;
+use chrono::Utc;
 use colored::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use rand::{distr::Alphanumeric, Rng};
-use super::crypto::{server_open,enc_auth};
+use super::crypto::{enc_auth, enc_auth_from_hash, pwd_hash, server_open, set_server_key};
 /// 返回已经握手成功、可以直接进入聊天循环的
 /// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
 pub async fn connect_and_login(
@@ -21,34 +22,24 @@ pub async fn connect_and_login(
     nickname: &str,
 ) -> Result<(Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
             tokio::net::tcp::OwnedWriteHalf,
-            String,String)> {
+            String,String,Option<String>)> {
             if server_addr_or_invite.starts_with("/INVITE:") {
                 // 1) 解码
-                let (server_addr,enc_pwd, room_id, pwd) = match parse_invitation(server_addr_or_invite) {
+                let (server_addr,enc_pwd, room_id, pwd, invite_token, expires_at) = match parse_invitation(server_addr_or_invite) {
                     Some(t) => t,
                     None => {
                         return Err(anyhow!("Invalid or expired invitation"));
                     }
                 };
+                if Utc::now().timestamp() > expires_at {
+                    return Err(anyhow!("Invalid or expired invitation"));
+                }
                 set_server_key(enc_pwd);
-                use super::crypto::chacha_once;
-                let auth = chacha_once(b"OKYOUARECORRECT", &enc_pwd);
                 // 2) 先连 TCP
                 let stream = TcpStream::connect(&server_addr).await?;
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
-                let auth = {
-                    // enc_pwd1 是 Base64(layer-1)
-                    use super::crypto::{period_key};
-                    use chrono::Utc;
-                    use base64::Engine;
-                    // 再包第二层
-                    let outer = {
-                        let now = Utc::now().timestamp();
-                        super::crypto::chacha_once(&auth, &period_key(now))
-                    };
-                    base64::engine::general_purpose::STANDARD.encode(outer)
-                };
+                let auth = enc_auth_from_hash(&enc_pwd);
                 let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
                 writer.write_all(&cipher).await?;
                 // 等待 OK
@@ -73,16 +64,16 @@ pub async fn connect_and_login(
                 let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
                 mac.update(b"Hello");
                 let credential = hex::encode(mac.finalize().into_bytes());
-                let cmd = handshake_writeall_macro(format!("JOIN {room_id} {credential} {nickname}"));
+                let cmd = handshake_writeall_macro(format!("JOIN_INVITE {room_id} {invite_token} {credential} {nickname}"));
                 writer.write_all(&cmd).await?;
                 // 4) 等待服务器 OK
                 let resp = lines.next_line().await?
                     .ok_or_else(|| anyhow!("Server closed during handshake-2"))?;
                 let resp = server_open(&resp).unwrap_or(resp);
-                if resp.trim() != "OK" {
+                if !resp.starts_with("OK") {
                     return Err(anyhow!("Server refused: {}", resp));
                 }
-                return Ok((lines, writer, room_id,pwd));
+                return Ok((lines, writer, room_id, pwd, None));
             }
     // 0. TCP 连接
 
@@ -95,7 +86,6 @@ pub async fn connect_and_login(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
     let auth = enc_auth(password);
-    use super::crypto::{set_server_key,pwd_hash};
     set_server_key(pwd_hash(password));
 
     let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
@@ -190,8 +180,20 @@ pub async fn connect_and_login(
         .await?
         .ok_or_else(|| anyhow!("server closed during handshake‑2"))?;
     let resp = server_open(&resp).unwrap_or(resp);
-    if resp.trim() != "OK" {
+    if !resp.starts_with("OK") {
         return Err(anyhow!("server refused: {}", resp));
     }
-    Ok((lines, writer, room_id,pwd))
+    let owner_capability = parse_owner_capability(&resp);
+    Ok((lines, writer, room_id, pwd, owner_capability))
+}
+
+fn parse_owner_capability(resp: &str) -> Option<String> {
+    let mut parts = resp.split_whitespace();
+    if parts.next()? != "OK" {
+        return None;
+    }
+    match parts.next() {
+        Some("OWNER") => parts.next().map(|s| s.to_string()),
+        _ => None,
+    }
 }

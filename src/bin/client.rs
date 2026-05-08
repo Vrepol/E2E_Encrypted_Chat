@@ -61,14 +61,14 @@ async fn main() -> Result<()> {
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
 
     //得到服务器地址后开始握手
-    let (lines, writer, room_id,pwd) = loop {
+    let (lines, writer, room_id, pwd, owner_capability) = loop {
         if server_addr.is_empty() {
             let new_addr = initial_serveraddr()?;
             server_addr = new_addr;
         }
         match handshake::connect_and_login(&server_addr, &username).await {
-            Ok((lines, writer, room_id,pwd)) => {
-                break (lines, writer, room_id,pwd);
+            Ok((lines, writer, room_id, pwd, owner_capability)) => {
+                break (lines, writer, room_id, pwd, owner_capability);
             }
             Err(e) if e.to_string().contains("邀请码无效") => {
                 eprintln!("❌ 邀请码无效或已过期，请重新选择服务器或输入新的邀请码。\n");
@@ -177,6 +177,7 @@ async fn main() -> Result<()> {
                     pwd:         &pwd,
                     username:    &username,
                     attachment_dir: img_tempdir.path(),
+                    owner_capability: &owner_capability,
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
                     break 'ui;

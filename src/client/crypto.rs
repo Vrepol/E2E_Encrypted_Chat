@@ -1,8 +1,8 @@
-//! 简易对称加解密（ChaCha20-CTR + Base64）
+//! 简易对称加解密
 //! 控制行保持明文；聊天行用 `ENC:<base64>` 前缀包裹
 
 use base64::{engine::general_purpose as b64, Engine};
-use chacha20::{cipher::{KeyIvInit, StreamCipher}, ChaCha20};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use rand::RngCore;
 // ----------------- 常量 -----------------
 static mut ROOM_KEY: [u8; 32] = [0u8; 32]; // 自行替换
@@ -36,26 +36,24 @@ use hkdf::Hkdf;                                            // hkdf = "0.12"
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;   // ChaCha20-Poly1305 = 96-bit
 const KEY_LEN: usize  = 32;    // 256-bit
+const ROOM_INFO: &[u8] = b"room-enc";
+const SERVER_INFO: &[u8] = b"server-enc";
 
-pub fn server_seal(plain: String) -> String {
-    // 1. 随机 salt + nonce
+fn aead_seal(key_material: &[u8; 32], info: &[u8], plain: &[u8]) -> String {
     let mut salt  = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
 
-    // 2. HKDF(SHA-256) 派生一次性密钥
-    let hk = Hkdf::<Sha256>::new(Some(&salt), current_server_key().as_ref());
+    let hk = Hkdf::<Sha256>::new(Some(&salt), key_material.as_ref());
     let mut key = [0u8; KEY_LEN];
-    hk.expand(b"enc", &mut key).unwrap();
+    hk.expand(info, &mut key).expect("hkdf expand");
 
-    // 3. AEAD 加密（自动附带 16 B Poly1305 MAC）
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let mut ciphertext = cipher.encrypt(Nonce::from_slice(&nonce),
-                                         plain.as_bytes())
-                               .expect("encrypt");
+    let mut ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain)
+        .expect("encrypt");
 
-    // 4. 输出 salt|nonce|ciphertext_and_tag → Base64
     let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce);
@@ -63,48 +61,40 @@ pub fn server_seal(plain: String) -> String {
     b64::STANDARD.encode(out)
 }
 
-pub fn server_open(line: &str) -> Option<String> {
-    let decoded = b64::STANDARD.decode(line).ok()?;
-    if decoded.len() < SALT_LEN + NONCE_LEN + 16 { return None; } // “16”是 Poly1305 tag
+fn aead_open(key_material: &[u8; 32], info: &[u8], encoded: &str) -> Option<Vec<u8>> {
+    let decoded = b64::STANDARD.decode(encoded).ok()?;
+    if decoded.len() < SALT_LEN + NONCE_LEN + 16 {
+        return None;
+    }
 
-    // 1. 解析 salt / nonce / 密文+tag
-    let (salt, rest)   = decoded.split_at(SALT_LEN);
-    let (nonce, ct)    = rest.split_at(NONCE_LEN);
+    let (salt, rest) = decoded.split_at(SALT_LEN);
+    let (nonce, ct) = rest.split_at(NONCE_LEN);
 
-    // 2. 派生同样的会话密钥
-    let hk = Hkdf::<Sha256>::new(Some(salt), current_server_key().as_ref());
+    let hk = Hkdf::<Sha256>::new(Some(salt), key_material.as_ref());
     let mut key = [0u8; KEY_LEN];
-    hk.expand(b"enc", &mut key).ok()?;
+    hk.expand(info, &mut key).ok()?;
 
-    // 3. 验证 tag 并解密
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    let plain  = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
+pub fn server_seal(plain: String) -> String {
+    aead_seal(current_server_key(), SERVER_INFO, plain.as_bytes())
+}
+
+pub fn server_open(line: &str) -> Option<String> {
+    let plain = aead_open(current_server_key(), SERVER_INFO, line)?;
     String::from_utf8(plain).ok()
 }
-pub fn seal(plain: &str) -> String {
-    // 生成随机 12 字节 nonce（IV）
-    let mut iv = [0u8; 12];
-    rand::rng().fill_bytes(&mut iv);
-    // 加密
-    let mut data = plain.as_bytes().to_vec();
-    ChaCha20::new(current_key().into(), &iv.into()).apply_keystream(&mut data);
 
-    // 拼装：ENC:<base64(iv + cipher)>
-    let mut iv_cipher = iv.to_vec();
-    iv_cipher.extend(data);
-    format!("ENC:{}", b64::STANDARD.encode(iv_cipher))
+pub fn seal(plain: &str) -> String {
+    let encoded = aead_seal(current_key(), ROOM_INFO, plain.as_bytes());
+    format!("ENC:{encoded}")
 }
 
 pub fn open(line: &str) -> Option<String> {
-    // 非密文行直接返回 None
     let Some(encoded) = line.strip_prefix("ENC:") else { return None };
-
-    let decoded = b64::STANDARD.decode(encoded).ok()?;
-    if decoded.len() < 12 { return None; }
-    let (iv, cipher) = decoded.split_at(12);
-
-    let mut plain = cipher.to_vec();
-    ChaCha20::new(current_key().into(), iv.into()).apply_keystream(&mut plain);
+    let plain = aead_open(current_key(), ROOM_INFO, encoded)?;
     String::from_utf8(plain).ok()
 }
 use sha2::{Digest as ShaDigest, Sha256};
@@ -166,8 +156,12 @@ pub fn chacha_salt_open(full: &[u8], pwd_hash: &[u8; 32]) -> Option<Vec<u8>> {
 }
 /// 生成 AUTH 的二层密文（→ Base64）
 pub fn enc_auth(pwd: &str) -> String {
+    enc_auth_from_hash(&pwd_hash(pwd))
+}
+
+pub fn enc_auth_from_hash(server_pwd_hash: &[u8; 32]) -> String {
     let now = Utc::now().timestamp();
-    let inner = chacha_once(b"OKYOUARECORRECT", &pwd_hash(pwd));      // layer-1
+    let inner = chacha_once(b"OKYOUARECORRECT", server_pwd_hash);      // layer-1
     let outer = chacha_once(&inner, &period_key(now));            // layer-2
     b64::STANDARD.encode(outer)
 }

@@ -23,10 +23,11 @@ use super::utils::{
     build_attachment_chunk_line, build_attachment_meta_line, build_local_notice_line,
     build_local_transfer_begin_line, build_local_transfer_done_line,
     build_local_transfer_failed_line, build_local_transfer_progress_line,
-    build_transport_packet_line, classify_outgoing_input, file_name_or_default,
-    infer_attachment_kind, packet_id_for_attachment_chunk, packet_id_for_attachment_meta,
-    packet_id_for_text, parse_ack_line, OutgoingPayload, ATTACHMENT_CHUNK_SIZE,
-    PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
+    build_server_invite_request_line, build_transport_packet_line, classify_outgoing_input,
+    create_invitation, file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
+    packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line,
+    parse_invite_error_line, parse_invite_token_line, parse_local_invite_request_line,
+    OutgoingPayload, ATTACHMENT_CHUNK_SIZE, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
 };
 
 #[derive(Default)]
@@ -70,6 +71,96 @@ impl AckRegistry {
     }
 }
 
+#[derive(Default)]
+struct InviteRegistry {
+    state: Mutex<InviteState>,
+}
+
+#[derive(Default)]
+struct InviteState {
+    pending: HashMap<String, PendingInvite>,
+}
+
+struct PendingInvite {
+    notify: Arc<Notify>,
+    server_addr: String,
+    server_pwd_hash: [u8; 32],
+    room_id: String,
+    room_key: String,
+    response: Option<Result<(String, i64), String>>,
+}
+
+impl InviteRegistry {
+    async fn register(
+        &self,
+        request_id: String,
+        server_addr: String,
+        server_pwd_hash: [u8; 32],
+        room_id: String,
+        room_key: String,
+    ) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        let mut state = self.state.lock().await;
+        state.pending.insert(
+            request_id,
+            PendingInvite {
+                notify: notify.clone(),
+                server_addr,
+                server_pwd_hash,
+                room_id,
+                room_key,
+                response: None,
+            },
+        );
+        notify
+    }
+
+    async fn resolve_success(&self, request_id: &str, token: String, expires_at: i64) {
+        let mut state = self.state.lock().await;
+        if let Some(pending) = state.pending.get_mut(request_id) {
+            pending.response = Some(Ok((token, expires_at)));
+            pending.notify.notify_waiters();
+        }
+    }
+
+    async fn resolve_error(&self, request_id: &str, reason: String) {
+        let mut state = self.state.lock().await;
+        if let Some(pending) = state.pending.get_mut(request_id) {
+            pending.response = Some(Err(reason));
+            pending.notify.notify_waiters();
+        }
+    }
+
+    async fn take_result(
+        &self,
+        request_id: &str,
+    ) -> Option<(String, [u8; 32], String, String, Result<(String, i64), String>)> {
+        let mut state = self.state.lock().await;
+        let pending = state.pending.remove(request_id)?;
+        Some((
+            pending.server_addr,
+            pending.server_pwd_hash,
+            pending.room_id,
+            pending.room_key,
+            pending.response?,
+        ))
+    }
+
+    async fn has_response(&self, request_id: &str) -> bool {
+        let state = self.state.lock().await;
+        state
+            .pending
+            .get(request_id)
+            .and_then(|p| p.response.as_ref())
+            .is_some()
+    }
+
+    async fn drop_request(&self, request_id: &str) {
+        let mut state = self.state.lock().await;
+        state.pending.remove(request_id);
+    }
+}
+
 struct AttachmentJob {
     path: PathBuf,
     transfer_id: String,
@@ -93,7 +184,9 @@ pub async fn chat_loop(
     send_pump.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let ack_registry = Arc::new(AckRegistry::default());
+    let invite_registry = Arc::new(InviteRegistry::default());
     let read_ack_registry = ack_registry.clone();
+    let read_invite_registry = invite_registry.clone();
     let read_net_tx = net_tx.clone();
     let mut pending_uploads = VecDeque::<PathBuf>::new();
     let mut active_upload: Option<AttachmentJob> = None;
@@ -113,6 +206,16 @@ pub async fn chat_loop(
 
                     if let Some(packet_id) = parse_ack_line(&plain) {
                         read_ack_registry.mark_acked(packet_id).await;
+                        continue;
+                    }
+                    if let Some((request_id, token, expires_at)) = parse_invite_token_line(&plain) {
+                        read_invite_registry
+                            .resolve_success(&request_id, token, expires_at)
+                            .await;
+                        continue;
+                    }
+                    if let Some((request_id, reason)) = parse_invite_error_line(&plain) {
+                        read_invite_registry.resolve_error(&request_id, reason).await;
                         continue;
                     }
 
@@ -145,6 +248,7 @@ pub async fn chat_loop(
                             &text,
                             &net_tx,
                             ack_registry.clone(),
+                            invite_registry.clone(),
                             &mut pending_uploads,
                         ).await {
                             net_tx.send(build_local_notice_line(&format!("发送失败: {err}"))).ok();
@@ -184,8 +288,13 @@ async fn handle_outgoing_input(
     text: &str,
     net_tx: &UnboundedSender<String>,
     ack_registry: Arc<AckRegistry>,
+    invite_registry: Arc<InviteRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
 ) -> Result<()> {
+    if let Some(req) = parse_local_invite_request_line(text) {
+        return handle_invite_request(writer, net_tx, ack_registry, invite_registry, req).await;
+    }
+
     match classify_outgoing_input(text)? {
         OutgoingPayload::Text(plain) => {
             let packet_id = packet_id_for_text();
@@ -193,11 +302,80 @@ async fn handle_outgoing_input(
         }
         OutgoingPayload::AttachmentPath(path) => {
             pending_uploads.push_back(path);
-            net_tx
-                .send(build_local_notice_line("附件已加入发送队列"))
-                .ok();
+            net_tx.send(build_local_notice_line("附件已加入发送队列")).ok();
             Ok(())
         }
+    }
+}
+
+async fn handle_invite_request(
+    writer: &mut OwnedWriteHalf,
+    net_tx: &UnboundedSender<String>,
+    ack_registry: Arc<AckRegistry>,
+    invite_registry: Arc<InviteRegistry>,
+    req: super::utils::LocalInviteRequest,
+) -> Result<()> {
+    let notify = invite_registry
+        .register(
+            req.request_id.clone(),
+            req.server_addr.clone(),
+            req.server_pwd_hash,
+            req.room_id.clone(),
+            req.room_key.clone(),
+        )
+        .await;
+
+    let server_line = build_server_invite_request_line(&req.request_id, &req.room_id, &req.owner_capability);
+    let packet_id = packet_id_for_text();
+    if let Err(err) = send_server_payload_with_ack(writer, &packet_id, &server_line, ack_registry).await {
+        invite_registry.drop_request(&req.request_id).await;
+        return Err(err);
+    }
+
+    let wait_result = timeout(
+        Duration::from_secs(5),
+        wait_for_invite_response(&req.request_id, notify, invite_registry.clone()),
+    )
+    .await;
+
+    if wait_result.is_err() {
+        invite_registry.drop_request(&req.request_id).await;
+        return Err(anyhow!("Invite token timeout"));
+    }
+
+    let Some((server_addr, server_pwd_hash, room_id, room_key, response)) =
+        invite_registry.take_result(&req.request_id).await
+    else {
+        return Err(anyhow!("Invite response missing"));
+    };
+
+    match response {
+        Ok((token, expires_at)) => {
+            let invite = create_invitation(
+                server_addr,
+                server_pwd_hash,
+                room_id,
+                room_key,
+                token,
+                expires_at,
+            )?;
+            net_tx.send(build_local_notice_line(&invite)).ok();
+            Ok(())
+        }
+        Err(reason) => Err(anyhow!("Invite request rejected: {reason}")),
+    }
+}
+
+async fn wait_for_invite_response(
+    request_id: &str,
+    notify: Arc<Notify>,
+    invite_registry: Arc<InviteRegistry>,
+) {
+    loop {
+        if invite_registry.has_response(request_id).await {
+            return;
+        }
+        notify.notified().await;
     }
 }
 
@@ -354,7 +532,25 @@ async fn send_room_payload_with_ack(
     ack_registry: Arc<AckRegistry>,
 ) -> Result<()> {
     let room_cipher = seal(plain);
-    let transport_line = build_transport_packet_line(packet_id, &room_cipher);
+    send_transport_payload_with_ack(writer, packet_id, &room_cipher, ack_registry).await
+}
+
+async fn send_server_payload_with_ack(
+    writer: &mut OwnedWriteHalf,
+    packet_id: &str,
+    plain: &str,
+    ack_registry: Arc<AckRegistry>,
+) -> Result<()> {
+    send_transport_payload_with_ack(writer, packet_id, plain, ack_registry).await
+}
+
+async fn send_transport_payload_with_ack(
+    writer: &mut OwnedWriteHalf,
+    packet_id: &str,
+    payload: &str,
+    ack_registry: Arc<AckRegistry>,
+) -> Result<()> {
+    let transport_line = build_transport_packet_line(packet_id, payload);
     let cipher_line = server_seal(transport_line);
     let timeout_duration = Duration::from_millis(PACKET_ACK_TIMEOUT_MS);
 
