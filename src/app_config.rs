@@ -15,10 +15,6 @@ pub const CLIENT_SERVER_PRESETS: &[PresetServer] = &[
         name: "Tailscale server",
         addr: "100.123.171.94:6655",
     },
-    PresetServer {
-        name: "Local server",
-        addr: "127.0.0.1:6655",
-    },
 ];
 
 pub const CLIENT_DEFAULT_SERVER_INDEX: usize = 0;
