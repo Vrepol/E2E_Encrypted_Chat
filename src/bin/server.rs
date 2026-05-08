@@ -7,9 +7,9 @@ use rust_chat::app_config::{DEFAULT_SERVER_PASSWORD, DEFAULT_SERVER_PORT};
 use rust_chat::client::{
     crypto::{dec_auth, pwd_hash, server_open, server_seal},
     utils::{
-        build_ack_line, build_invite_error_line, build_invite_token_line,
-        handshake_writeall_macro, parse_server_invite_request_line, parse_transport_packet_line,
-        INVITE_TTL_SECS,
+        build_ack_line, build_invite_blob_line, build_invite_error_line, build_invite_token_line,
+        handshake_writeall_macro, parse_invite_fetch_line, parse_server_invite_request_line,
+        parse_transport_packet_line, INVITE_TTL_SECS,
     },
 };
 use std::{
@@ -46,6 +46,7 @@ struct InviteTokenInfo {
     credential: String,
     expires_at: i64,
     used: bool,
+    blob_b64: String,
 }
 
 type Rooms = Arc<Mutex<HashMap<String, RoomInfo>>>;
@@ -122,12 +123,30 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
     let (reader, mut writer) = socket.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    let enc_line = match lines.next_line().await? {
+    let first_line = match lines.next_line().await? {
         Some(l) => l.trim_end().to_owned(),
         None => return Ok(()),
     };
 
-    let auth_line = server_open(&enc_line).unwrap();
+    let enc_line = if let Some(token) = parse_invite_fetch_line(&first_line) {
+        let response = fetch_invite_blob(&invites, &token)
+            .unwrap_or_else(|| "ERR InviteInvalid".to_string());
+        writer.write_all(format!("{response}\n").as_bytes()).await?;
+        match lines.next_line().await? {
+            Some(line) => line.trim_end().to_owned(),
+            None => return Ok(()),
+        }
+    } else {
+        first_line
+    };
+
+    let auth_line = match server_open(&enc_line) {
+        Some(line) => line,
+        None => {
+            writer.write_all(b"ERR NeedAUTH\n").await?;
+            return Ok(());
+        }
+    };
     if !auth_line.starts_with("AUTH ") {
         writer.write_all(b"ERR NeedAUTH\n").await?;
         return Ok(());
@@ -435,10 +454,19 @@ fn handle_invite_request(
             credential: info_credential(rooms, room_id),
             expires_at,
             used: false,
+            blob_b64: request.blob_b64,
         },
     );
 
     build_invite_token_line(&request.request_id, &token, expires_at)
+}
+
+fn fetch_invite_blob(invites: &Invites, token: &str) -> Option<String> {
+    let now = chrono::Utc::now().timestamp();
+    let mut invites_map = invites.lock().unwrap();
+    invites_map.retain(|_, info| !info.used && info.expires_at >= now);
+    let info = invites_map.get(token)?;
+    Some(build_invite_blob_line(&info.blob_b64))
 }
 
 fn info_credential(rooms: &Rooms, room_id: &str) -> String {

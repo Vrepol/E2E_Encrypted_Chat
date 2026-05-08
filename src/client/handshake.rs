@@ -7,9 +7,11 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
 };
-use super::utils::{parse_invitation,handshake_writeall_macro};
+use super::utils::{
+    build_invite_fetch_line, handshake_writeall_macro, open_invite_blob, parse_invitation,
+    parse_invite_blob_line,
+};
 use super::crypto;
-use chrono::Utc;
 use colored::*;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -25,20 +27,29 @@ pub async fn connect_and_login(
             String,String,Option<String>)> {
             if server_addr_or_invite.starts_with("/INVITE:") {
                 // 1) 解码
-                let (server_addr,enc_pwd, room_id, pwd, invite_token, expires_at) = match parse_invitation(server_addr_or_invite) {
+                let (server_addr, invite_token, blob_key_b64) = match parse_invitation(server_addr_or_invite) {
                     Some(t) => t,
                     None => {
-                        return Err(anyhow!("Invalid or expired invitation"));
+                        return Err(anyhow!("Invalid invitation"));
                     }
                 };
-                if Utc::now().timestamp() > expires_at {
-                    return Err(anyhow!("Invalid or expired invitation"));
-                }
-                set_server_key(enc_pwd);
                 // 2) 先连 TCP
                 let stream = TcpStream::connect(&server_addr).await?;
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
+                writer
+                    .write_all(format!("{}\n", build_invite_fetch_line(&invite_token)).as_bytes())
+                    .await?;
+                let blob_resp = lines.next_line().await?
+                    .ok_or_else(|| anyhow!("Server closed during invite blob fetch"))?;
+                if blob_resp.starts_with("ERR ") {
+                    return Err(anyhow!("邀请码无效或已过期"));
+                }
+                let blob_b64 = parse_invite_blob_line(&blob_resp)
+                    .ok_or_else(|| anyhow!("Invalid invite blob response"))?;
+                let (enc_pwd, room_id, pwd) = open_invite_blob(&blob_b64, &blob_key_b64)
+                    .ok_or_else(|| anyhow!("Invalid invitation"))?;
+                set_server_key(enc_pwd);
                 let auth = enc_auth_from_hash(&enc_pwd);
                 let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
                 writer.write_all(&cipher).await?;

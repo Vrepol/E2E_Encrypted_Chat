@@ -51,9 +51,9 @@ pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 • Esc          → Exit room"#;
 
 pub const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
-pub const ATTACHMENT_WINDOW_SIZE: usize = 8;
-pub const PACKET_ACK_TIMEOUT_MS: u64 = 1500;
-pub const PACKET_RETRY_LIMIT: usize = 3;
+pub const ATTACHMENT_WINDOW_SIZE: usize = 6;
+pub const PACKET_ACK_TIMEOUT_MS: u64 = 4500;
+pub const PACKET_RETRY_LIMIT: usize = 2;
 pub const INVITE_TTL_SECS: i64 = 600;
 const EMPTY_FIELD_SENTINEL: &str = "~";
 
@@ -458,10 +458,11 @@ pub fn build_server_invite_request_line(
     request_id: &str,
     room_id: &str,
     owner_capability: &str,
+    blob_b64: &str,
 ) -> String {
     let room_b64 = URL_SAFE_NO_PAD.encode(room_id.as_bytes());
     let owner_b64 = URL_SAFE_NO_PAD.encode(owner_capability.as_bytes());
-    format!("/INVITE_REQUEST {request_id} {room_b64} {owner_b64}")
+    format!("/INVITE_REQUEST {request_id} {room_b64} {owner_b64} {blob_b64}")
 }
 
 #[derive(Debug, Clone)]
@@ -469,6 +470,7 @@ pub struct ServerInviteRequest {
     pub request_id: String,
     pub room_id: String,
     pub owner_capability: String,
+    pub blob_b64: String,
 }
 
 pub fn parse_server_invite_request_line(line: &str) -> Option<ServerInviteRequest> {
@@ -480,10 +482,12 @@ pub fn parse_server_invite_request_line(line: &str) -> Option<ServerInviteReques
     let request_id = parts.next()?.to_string();
     let room_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
     let owner_capability = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let blob_b64 = parts.next()?.to_string();
     Some(ServerInviteRequest {
         request_id,
         room_id,
         owner_capability,
+        blob_b64,
     })
 }
 
@@ -518,6 +522,30 @@ pub fn parse_invite_error_line(line: &str) -> Option<(String, String)> {
     let request_id = parts.next()?.to_string();
     let reason = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
     Some((request_id, reason))
+}
+
+pub fn build_invite_fetch_line(token: &str) -> String {
+    let token_b64 = URL_SAFE_NO_PAD.encode(token.as_bytes());
+    format!("/INVITE_FETCH {token_b64}")
+}
+
+pub fn parse_invite_fetch_line(line: &str) -> Option<String> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "/INVITE_FETCH" {
+        return None;
+    }
+    String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()
+}
+
+pub fn build_invite_blob_line(blob_b64: &str) -> String {
+    format!("/INVITE_BLOB {blob_b64}")
+}
+
+pub fn parse_invite_blob_line(line: &str) -> Option<String> {
+    line.strip_prefix("/INVITE_BLOB ")
+        .map(str::trim)
+        .filter(|blob| !blob.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub fn parse_local_ui_event(line: &str) -> Option<LocalUiEvent> {
@@ -715,71 +743,76 @@ pub fn parse_clipboard_file_paths(text: &str) -> Option<Vec<PathBuf>> {
 
 #[derive(Serialize, Deserialize)]
 struct InvitePayload {
-    server: String,
     server_pwd_hash: [u8; 32],
     room_id: String,
     room_key: String,
-    expires_at: i64,
 }
 
-pub fn create_invitation(
-    server_addr: String,
+pub fn create_invite_blob(
     server_pwd_hash: [u8; 32],
     room_id: String,
-    pwd: String,
-    invite_token: String,
-    expires_at: i64,
-) -> Result<String> {
+    room_key: String,
+) -> Result<(String, String)> {
     let mut nonce = [0u8; 12];
+    let mut blob_key = [0u8; 16];
     rand::rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut blob_key);
 
-    let inv = InvitePayload {
-        server: server_addr,
+    let payload = InvitePayload {
         server_pwd_hash,
         room_id,
-        room_key: pwd,
-        expires_at,
+        room_key,
     };
 
-    let key_bytes = Sha256::digest(invite_token.as_bytes());
+    let key_bytes = Sha256::digest(blob_key);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), serde_json::to_vec(&inv)?.as_ref())
-        .map_err(|_| anyhow!("Failed to encrypt invite payload"))?;
+        .encrypt(Nonce::from_slice(&nonce), serde_json::to_vec(&payload)?.as_ref())
+        .map_err(|_| anyhow!("Failed to encrypt invite blob"))?;
 
     let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ciphertext);
-    Ok(format!("/INVITE:{invite_token}.{}", URL_SAFE_NO_PAD.encode(out)))
+    Ok((
+        URL_SAFE_NO_PAD.encode(out),
+        URL_SAFE_NO_PAD.encode(blob_key),
+    ))
 }
 
-pub fn parse_invitation(inv: &str) -> Option<(String, [u8; 32], String, String, String, i64)> {
-    let raw = inv.strip_prefix("/INVITE:")?;
-    let (invite_token, encoded_payload) = raw.split_once('.')?;
+pub fn open_invite_blob(blob_b64: &str, blob_key_b64: &str) -> Option<([u8; 32], String, String)> {
+    let bytes = URL_SAFE_NO_PAD.decode(blob_b64).ok()?;
+    let blob_key = URL_SAFE_NO_PAD.decode(blob_key_b64).ok()?;
 
-    let bytes = URL_SAFE_NO_PAD.decode(encoded_payload).ok()?;
-
-    if bytes.len() < 12 {
+    if bytes.len() < 12 || blob_key.len() != 16 {
         return None;
     }
-    let (nonce, cipher_bytes) = bytes.split_at(12);
 
-    let key_bytes = Sha256::digest(invite_token.as_bytes());
+    let (nonce, cipher_bytes) = bytes.split_at(12);
+    let key_bytes = Sha256::digest(&blob_key);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
     let plain = cipher.decrypt(Nonce::from_slice(nonce), cipher_bytes).ok()?;
 
     serde_json::from_slice::<InvitePayload>(&plain)
-        .map(|v| {
-            (
-                v.server,
-                v.server_pwd_hash,
-                v.room_id,
-                v.room_key,
-                invite_token.to_string(),
-                v.expires_at,
-            )
-        })
+        .map(|payload| (payload.server_pwd_hash, payload.room_id, payload.room_key))
         .ok()
+}
+
+pub fn create_invitation(
+    server_addr: String,
+    invite_token: String,
+    blob_key_b64: String,
+) -> Result<String> {
+    let server_b64 = URL_SAFE_NO_PAD.encode(server_addr.as_bytes());
+    Ok(format!("/INVITE:{server_b64}.{invite_token}.{blob_key_b64}"))
+}
+
+pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {
+    let raw = inv.strip_prefix("/INVITE:")?;
+    let mut parts = raw.splitn(3, '.');
+    let server_addr = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let invite_token = parts.next()?.to_string();
+    let blob_key_b64 = parts.next()?.to_string();
+    Some((server_addr, invite_token, blob_key_b64))
 }
 
 pub fn inviation_clear(inv: &str) -> String {

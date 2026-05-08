@@ -24,7 +24,7 @@ use super::utils::{
     build_local_transfer_begin_line, build_local_transfer_done_line,
     build_local_transfer_failed_line, build_local_transfer_progress_line,
     build_server_invite_request_line, build_transport_packet_line, classify_outgoing_input,
-    create_invitation, file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
+    create_invite_blob, create_invitation, file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
     packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line,
     parse_invite_error_line, parse_invite_token_line, parse_local_invite_request_line,
     parse_local_ui_event,
@@ -86,9 +86,7 @@ struct InviteState {
 struct PendingInvite {
     notify: Arc<Notify>,
     server_addr: String,
-    server_pwd_hash: [u8; 32],
-    room_id: String,
-    room_key: String,
+    blob_key_b64: String,
     response: Option<Result<(String, i64), String>>,
 }
 
@@ -97,9 +95,7 @@ impl InviteRegistry {
         &self,
         request_id: String,
         server_addr: String,
-        server_pwd_hash: [u8; 32],
-        room_id: String,
-        room_key: String,
+        blob_key_b64: String,
     ) -> Arc<Notify> {
         let notify = Arc::new(Notify::new());
         let mut state = self.state.lock().await;
@@ -108,9 +104,7 @@ impl InviteRegistry {
             PendingInvite {
                 notify: notify.clone(),
                 server_addr,
-                server_pwd_hash,
-                room_id,
-                room_key,
+                blob_key_b64,
                 response: None,
             },
         );
@@ -136,14 +130,12 @@ impl InviteRegistry {
     async fn take_result(
         &self,
         request_id: &str,
-    ) -> Option<(String, [u8; 32], String, String, Result<(String, i64), String>)> {
+    ) -> Option<(String, String, Result<(String, i64), String>)> {
         let mut state = self.state.lock().await;
         let pending = state.pending.remove(request_id)?;
         Some((
             pending.server_addr,
-            pending.server_pwd_hash,
-            pending.room_id,
-            pending.room_key,
+            pending.blob_key_b64,
             pending.response?,
         ))
     }
@@ -332,17 +324,25 @@ async fn handle_invite_request(
     invite_registry: Arc<InviteRegistry>,
     req: super::utils::LocalInviteRequest,
 ) -> Result<()> {
+    let (blob_b64, blob_key_b64) = create_invite_blob(
+        req.server_pwd_hash,
+        req.room_id.clone(),
+        req.room_key.clone(),
+    )?;
     let notify = invite_registry
         .register(
             req.request_id.clone(),
             req.server_addr.clone(),
-            req.server_pwd_hash,
-            req.room_id.clone(),
-            req.room_key.clone(),
+            blob_key_b64,
         )
         .await;
 
-    let server_line = build_server_invite_request_line(&req.request_id, &req.room_id, &req.owner_capability);
+    let server_line = build_server_invite_request_line(
+        &req.request_id,
+        &req.room_id,
+        &req.owner_capability,
+        &blob_b64,
+    );
     let packet_id = packet_id_for_text();
     if let Err(err) = send_server_payload_with_ack(writer, &packet_id, &server_line, ack_registry).await {
         invite_registry.drop_request(&req.request_id).await;
@@ -360,22 +360,15 @@ async fn handle_invite_request(
         return Err(anyhow!("Invite token timeout"));
     }
 
-    let Some((server_addr, server_pwd_hash, room_id, room_key, response)) =
+    let Some((server_addr, blob_key_b64, response)) =
         invite_registry.take_result(&req.request_id).await
     else {
         return Err(anyhow!("Invite response missing"));
     };
 
     match response {
-        Ok((token, expires_at)) => {
-            let invite = create_invitation(
-                server_addr,
-                server_pwd_hash,
-                room_id,
-                room_key,
-                token,
-                expires_at,
-            )?;
+        Ok((token, _expires_at)) => {
+            let invite = create_invitation(server_addr, token, blob_key_b64)?;
             net_tx.send(build_local_notice_line(&invite)).ok();
             Ok(())
         }

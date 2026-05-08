@@ -10,7 +10,8 @@ mod tests {
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
         build_ack_line, build_attachment_frames_from_bytes, build_local_invite_request_line,
-        normalize_clipboard_rgba, parse_clipboard_file_paths,
+        create_invite_blob, normalize_clipboard_rgba, open_invite_blob,
+        parse_clipboard_file_paths,
         build_transport_packet_line, create_invitation, parse_ack_line, parse_attachment_frame,
         parse_invitation, parse_local_invite_request_line, parse_transport_packet_line,
         AttachmentFrame,
@@ -69,24 +70,29 @@ mod tests {
     #[test]
     fn test_invite_round_trip() {
         let server_hash = [7u8; 32];
-        let invite = create_invitation(
-            "127.0.0.1:6655".to_string(),
+        let (blob_b64, blob_key_b64) = create_invite_blob(
             server_hash,
             "room-a".to_string(),
             "room-password".to_string(),
+        )
+        .expect("invite blob should build");
+        let invite = create_invitation(
+            "127.0.0.1:6655".to_string(),
             "invite-token-123".to_string(),
-            1_700_000_000,
+            blob_key_b64.clone(),
         )
         .expect("invite should build");
 
-        let (server, parsed_hash, room_id, room_key, token, expires_at) =
+        let (server, token, parsed_blob_key) =
             parse_invitation(&invite).expect("invite should parse");
+        let (parsed_hash, room_id, room_key) =
+            open_invite_blob(&blob_b64, &parsed_blob_key).expect("invite blob should open");
         assert_eq!(server, "127.0.0.1:6655");
         assert_eq!(parsed_hash, server_hash);
         assert_eq!(room_id, "room-a");
         assert_eq!(room_key, "room-password");
         assert_eq!(token, "invite-token-123");
-        assert_eq!(expires_at, 1_700_000_000);
+        assert_eq!(parsed_blob_key, blob_key_b64);
     }
 
     #[test]
