@@ -7,6 +7,7 @@ pub mod sounds;
 pub mod initialization;
 pub mod handshake;
 pub mod clipboard;
+pub mod attachment_store;
 pub mod keyboard;
 pub mod ui;
 pub mod local_server;

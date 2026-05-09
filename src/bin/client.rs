@@ -25,6 +25,7 @@ use tui::{
 
 /* ---------- 本地 crate ---------- */
 use rust_chat::client::{
+    attachment_store::AttachmentStore,
     utils::inviation_clear,
     network,
     receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState},
@@ -137,9 +138,10 @@ async fn main() -> Result<()> {
     let mut input = String::new();
     let mut cursor = 0usize;
     let mut list_state = ListState::default();
-    let img_tempdir = tempfile::Builder::new()
+    let room_tempdir = tempfile::Builder::new()
         .prefix("")
         .tempdir()?;
+    let attachment_store = AttachmentStore::new_in(room_tempdir.path().to_path_buf())?;
     let mut undo_mgr = UndoMgr::new();
     use rust_chat::client::ui::{build_chat_rows, chat_inner_width, draw_chat, RenderedChatRow};
     let mut chat_rows: Vec<RenderedChatRow>;
@@ -188,7 +190,8 @@ async fn main() -> Result<()> {
                     room_id:     &room_id,
                     pwd:         &pwd,
                     username:    &username,
-                    attachment_dir: img_tempdir.path(),
+                    attachment_dir: room_tempdir.path(),
+                    attachment_store: &attachment_store,
                     owner_capability: &owner_capability,
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
@@ -207,7 +210,7 @@ async fn main() -> Result<()> {
             &mut net_rx,
             &mut messages,
             &username,
-            img_tempdir.path(),
+            &attachment_store,
             &mut member_list,
             &mut receiver_state,
             &mut transfer_ui_state,

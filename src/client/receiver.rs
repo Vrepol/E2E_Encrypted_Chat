@@ -1,21 +1,18 @@
 use std::{
     collections::HashMap,
-    fs::{self, File},
-    io::Write,
-    path::{Path, PathBuf},
 };
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
-use uuid::Uuid;
 
 use crate::client::utils::{
     parse_attachment_frame, parse_local_ui_event, parse_text_img, render_transfer_line,
     sanitize_attachment_name, AttachmentChunk, AttachmentFrame, AttachmentMeta, LocalUiEvent,
 };
 
+use super::attachment_store::AttachmentStore;
 use super::notifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +42,7 @@ impl AttachmentKind {
 pub enum ChatMessage {
     Text(String),
     Attachment {
-        path: PathBuf,
+        attachment_id: String,
         sender: String,
         ts: String,
         name: String,
@@ -179,7 +176,7 @@ pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<ChatMessage>,
     my_name: &str,
-    attachment_dir: &Path,
+    attachment_store: &AttachmentStore,
     members: &mut Vec<String>,
     receiver_state: &mut ReceiverState,
     transfer_ui_state: &mut TransferUiState,
@@ -210,13 +207,13 @@ pub fn drain_messages(
 
         let result = match parse_attachment_frame(&body) {
             Some(AttachmentFrame::Meta(meta)) => {
-                register_attachment(receiver_state, sender.clone(), meta, attachment_dir, &hms)
+                register_attachment(receiver_state, sender.clone(), meta, attachment_store, &hms)
             }
             Some(AttachmentFrame::Chunk(chunk)) => {
-                append_attachment_chunk(receiver_state, chunk, attachment_dir, &hms)
+                append_attachment_chunk(receiver_state, chunk, attachment_store, &hms)
             }
             None if body.starts_with("/IMGDATA") => {
-                Ok(decode_legacy_image(&sender, &body, attachment_dir, &hms))
+                Ok(decode_legacy_image(&sender, &body, attachment_store, &hms))
             }
             None => Ok(Some(ChatMessage::Text(format_text_message(&line, &hms)))),
         };
@@ -239,7 +236,7 @@ fn register_attachment(
     receiver_state: &mut ReceiverState,
     sender: String,
     meta: AttachmentMeta,
-    attachment_dir: &Path,
+    attachment_store: &AttachmentStore,
     hms: &str,
 ) -> Result<Option<ChatMessage>, String> {
     let incoming = IncomingAttachment {
@@ -254,7 +251,7 @@ fn register_attachment(
     };
 
     if meta.total_chunks == 0 {
-        return finalize_attachment(meta.transfer_id, incoming, attachment_dir, hms).map(Some);
+        return finalize_attachment(meta.transfer_id, incoming, attachment_store, hms).map(Some);
     }
 
     receiver_state.incoming.insert(meta.transfer_id, incoming);
@@ -264,7 +261,7 @@ fn register_attachment(
 fn append_attachment_chunk(
     receiver_state: &mut ReceiverState,
     chunk: AttachmentChunk,
-    attachment_dir: &Path,
+    attachment_store: &AttachmentStore,
     hms: &str,
 ) -> Result<Option<ChatMessage>, String> {
     let mut ready = false;
@@ -297,22 +294,19 @@ fn append_attachment_chunk(
         .remove(&chunk.transfer_id)
         .ok_or_else(|| "Attachment state missing during finalize".to_string())?;
 
-    finalize_attachment(chunk.transfer_id, incoming, attachment_dir, hms).map(Some)
+    finalize_attachment(chunk.transfer_id, incoming, attachment_store, hms).map(Some)
 }
 
 fn finalize_attachment(
     transfer_id: String,
     incoming: IncomingAttachment,
-    attachment_dir: &Path,
+    attachment_store: &AttachmentStore,
     hms: &str,
 ) -> Result<ChatMessage, String> {
     let mut hasher = Sha256::new();
+    let mut plain_bytes = Vec::with_capacity(incoming.total_size as usize);
     let mut written_size = 0u64;
     let safe_name = sanitize_attachment_name(&incoming.file_name);
-    let file_path = attachment_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe_name));
-
-    fs::create_dir_all(attachment_dir).map_err(|e| e.to_string())?;
-    let mut file = File::create(&file_path).map_err(|e| e.to_string())?;
 
     for chunk in incoming.chunks {
         let chunk = chunk.ok_or_else(|| {
@@ -320,11 +314,10 @@ fn finalize_attachment(
         })?;
         written_size = written_size.saturating_add(chunk.len() as u64);
         hasher.update(&chunk);
-        file.write_all(&chunk).map_err(|e| e.to_string())?;
+        plain_bytes.extend_from_slice(&chunk);
     }
 
     if written_size != incoming.total_size {
-        let _ = fs::remove_file(&file_path);
         return Err(format!(
             "Attachment size mismatch: expected {}, got {}",
             incoming.total_size, written_size
@@ -333,12 +326,15 @@ fn finalize_attachment(
 
     let digest = hex::encode(hasher.finalize());
     if digest != incoming.sha256_hex {
-        let _ = fs::remove_file(&file_path);
         return Err(format!("Attachment checksum mismatch for {}", incoming.file_name));
     }
 
+    let attachment_id = attachment_store
+        .store_attachment(&safe_name, &plain_bytes)
+        .map_err(|e| e.to_string())?;
+
     Ok(ChatMessage::Attachment {
-        path: file_path,
+        attachment_id,
         sender: incoming.sender,
         ts: hms.to_string(),
         name: safe_name,
@@ -350,17 +346,15 @@ fn finalize_attachment(
 fn decode_legacy_image(
     sender: &str,
     body: &str,
-    attachment_dir: &Path,
+    attachment_store: &AttachmentStore,
     hms: &str,
 ) -> Option<ChatMessage> {
     let b64_data = &body["/IMGDATA".len()..];
     let bytes = general_purpose::STANDARD.decode(b64_data).ok()?;
-    let file_path = attachment_dir.join(format!("img_{}.png", Uuid::new_v4()));
-    let mut file = File::create(&file_path).ok()?;
-    file.write_all(&bytes).ok()?;
+    let attachment_id = attachment_store.store_attachment("clipboard.png", &bytes).ok()?;
 
     Some(ChatMessage::Attachment {
-        path: file_path,
+        attachment_id,
         sender: sender.to_string(),
         ts: hms.to_string(),
         name: "clipboard.png".to_string(),

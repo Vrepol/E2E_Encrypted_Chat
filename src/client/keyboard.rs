@@ -6,6 +6,7 @@ use tui::widgets::ListState;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
+use super::attachment_store::AttachmentStore;
 use super::receiver::ChatMessage;
 use super::ui::{selected_message_index, RenderedChatRow};
 use super::clipboard::{self, ClipData};
@@ -15,10 +16,6 @@ use super::utils::{
     parse_clipboard_file_paths, parse_name_body, HELP_TEXT, HELP_TEXT_EN,
 };
 pub enum ControlFlow { Continue, Quit }
-fn open_attachment(path: &Path) -> anyhow::Result<()> {
-    open::that(path)?;
-    Ok(())
-}
 
 fn queue_attachment_paths(out_tx: &UnboundedSender<String>, paths: &[PathBuf]) {
     for path in paths {
@@ -41,6 +38,7 @@ pub struct KeyCtx<'a> {
     pub pwd:         &'a String,
     pub username:    &'a String,
     pub attachment_dir: &'a Path,
+    pub attachment_store: &'a AttachmentStore,
     pub owner_capability: &'a Option<String>,
 }
 
@@ -214,8 +212,8 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
         }
         KeyCode::Tab => {
             if let Some(sel) = selected_message_index(ctx.chat_rows, ctx.list_state.selected()) {
-                if let ChatMessage::Attachment { path, .. } = &ctx.messages[sel] {
-                    if let Err(e) = open_attachment(path) {
+                if let ChatMessage::Attachment { attachment_id, .. } = &ctx.messages[sel] {
+                    if let Err(e) = ctx.attachment_store.open_temp_and_cleanup_after_delay(attachment_id) {
                         let _ = ctx.out_tx.send(build_local_notice_line(&format!("打开附件失败: {e}")));
                     }
                 }
