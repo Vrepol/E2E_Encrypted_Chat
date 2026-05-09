@@ -17,10 +17,40 @@ pub fn init_color() {
         return;
     }
 
+    let windows_vt_ok = enable_windows_vt_processing();
     let ok = io::stdout().is_terminal()
-        && supports_color::on(ColorStream::Stdout).is_some();
+        && supports_color::on(ColorStream::Stdout).is_some()
+        && windows_vt_ok;
 
     colored::control::set_override(ok);
+}
+
+#[cfg(windows)]
+fn enable_windows_vt_processing() -> bool {
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_PROCESSED_OUTPUT,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) else {
+            return false;
+        };
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(handle, &mut mode as *mut CONSOLE_MODE).is_err() {
+            return false;
+        }
+
+        let desired_mode = CONSOLE_MODE(
+            mode.0 | ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
+        );
+        SetConsoleMode(handle, desired_mode).is_ok()
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_windows_vt_processing() -> bool {
+    true
 }
 fn get_password_or_default()->String {
     let mut inp = String::new();
