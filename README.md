@@ -1,4 +1,4 @@
-# Rust Crypto Chat
+# E2E Encrypted Chat
 
 > **终端 × Rust × 端到端加密** — 一款跨平台、零依赖、可在本地或 VPS 一键部署的即时通讯应用。
 
@@ -6,17 +6,20 @@
 
 ## ✨ 项目概述
 
-`rust_chat` 由 **客户端** 和 **服务器** 两部分组成，均使用 Rust **Tokio 异步运行时** 实现。项目聚焦在「轻量级 + 强安全 + 高可玩性」：内置房间系统、邀请码、TUI 聊天界面、附件分片传输、图片预览与可插拔的加密层。
+`E2E_Encrypted_Chat` 由 **客户端** 和 **服务器** 两部分组成，均使用 Rust **Tokio 异步运行时** 实现。项目聚焦在「轻量级 + 强安全 + 高可玩性」：内置房间系统、邀请码、TUI 聊天界面、附件分片传输、图片预览与可插拔的加密层。
 
-默认服务器、默认端口、默认服务器密码现在集中在 `src/app_config.rs`，后续开源时只改这一处即可。
+默认服务器、默认端口、默认服务器密码现在集中在 `src/app_config.rs`。
 
+<div align="center">
+  <img src="./demo.gif" width="600" alt="Demo GIF"/>
+</div>
 
 ---
 
 ## 📂 目录结构
 
 ```text
-rust_chat/
+E2E_Encrypted_Chat/
 ├── Cargo.toml
 ├── README.md
 ├── src/
@@ -42,29 +45,18 @@ rust_chat/
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
-
-| 平台                  | 必备工具                                                                                             | 说明                                       |
-| ------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------- |
-| **Ubuntu / Debian** | `build-essential pkg-config libasound2-dev`                                                      | `alsa-sys` 依赖，如无需提示音可省略 `libasound2-dev` |
-| **Arch**            | `base-devel pkgconf`                                                                             |                                          |
-| **macOS**           | `brew install pkg-config`                                                                        |                                          |
-| **Windows**         | [MSVC Build Tools](https://visualstudio.microsoft.com/zh-hans/visual-cpp-build-tools/) / MinGW64 | 推荐 MSVC 以获得最佳兼容性                         |
-
-> Rust 版本需 **1.77** 及以上。
-
-### 2. 编译
+### 1. 编译
 
 ```bash
 # 克隆代码
-$ git clone https://github.com/yourname/rust_chat.git
-$ cd rust_chat
+$ git clone https://github.com/Vrepol/E2E_Encrypted_Chat.git
+$ cd E2E_Encrypted_Chat
 
 # Release 构建
 $ cargo build --release
 ```
 
-### 3. 运行服务器
+### 2. 运行服务器
 
 ```bash
 ./server --port 6655 -k 'Password'
@@ -83,7 +75,7 @@ $ cargo build --release
 直接修改 `src/app_config.rs` 即可。
 
 
-### 4. 运行客户端
+### 3. 运行客户端
 
 ```bash
 ./client

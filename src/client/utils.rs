@@ -50,8 +50,8 @@ pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 • Tab          → Open the attachment in the selected row
 • Esc          → Exit room"#;
 
-pub const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
-pub const ATTACHMENT_WINDOW_SIZE: usize = 6;
+pub const ATTACHMENT_CHUNK_SIZE: usize = 32 * 1024;
+pub const ATTACHMENT_WINDOW_SIZE: usize = 3;
 pub const PACKET_ACK_TIMEOUT_MS: u64 = 4500;
 pub const PACKET_RETRY_LIMIT: usize = 2;
 pub const INVITE_TTL_SECS: i64 = 600;
