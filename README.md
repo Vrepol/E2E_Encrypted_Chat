@@ -10,9 +10,6 @@
 
 默认服务器、默认端口、默认服务器密码现在集中在 `src/app_config.rs`，后续开源时只改这一处即可。
 
-<div align="center">
-  <img src="https://github.com/Vrepol/Rust_Crypto_Chat/blob/main/demo.gif" width="600" alt="Demo GIF"/>
-</div>
 
 ---
 
