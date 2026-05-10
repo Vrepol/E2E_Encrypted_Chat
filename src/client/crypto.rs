@@ -8,6 +8,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
+use std::collections::{HashSet, VecDeque};
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -15,10 +16,12 @@ const KEY_LEN: usize = 32;
 const ROOM_INFO: &[u8] = b"room-enc";
 const ROOM_STATE_LABEL: &[u8] = b"rust-chat room-state v1";
 const ROOM_JOIN_LABEL: &[u8] = b"rust-chat room-join-credential v1";
-const TRANSPORT_INFO: &[u8] = b"rust-chat transport key v1";
+const TRANSPORT_C2S_INFO: &[u8] = b"rust-chat transport c2s key v1";
+const TRANSPORT_S2C_INFO: &[u8] = b"rust-chat transport s2c key v1";
 const AUTH_PROOF_LABEL: &[u8] = b"rust-chat auth proof v1";
 const INVITE_PROOF_LABEL: &[u8] = b"rust-chat invite proof v1";
 const INVITE_TOKEN_ID_LABEL: &[u8] = b"rust-chat token id v1";
+const TRANSPORT_REPLAY_WINDOW: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomCryptoState {
@@ -79,34 +82,81 @@ impl RoomCryptoState {
 
 #[derive(Debug, Clone)]
 pub struct TransportCrypto {
-    transport_key: [u8; 32],
+    send_key: [u8; 32],
+    recv_key: [u8; 32],
     send_seq: u64,
-    recv_seq: u64,
+    next_recv_seq: u64,
+    recent_recv_seqs: VecDeque<u64>,
+    seen_recv_seqs: HashSet<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportSide {
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportOpenResult {
+    Fresh(String),
+    Duplicate(String),
 }
 
 impl TransportCrypto {
-    pub fn new(transport_key: [u8; 32]) -> Self {
+    pub fn new(shared_secret: [u8; 32], side: TransportSide) -> Self {
+        let (send_info, recv_info) = match side {
+            TransportSide::Client => (TRANSPORT_C2S_INFO, TRANSPORT_S2C_INFO),
+            TransportSide::Server => (TRANSPORT_S2C_INFO, TRANSPORT_C2S_INFO),
+        };
         Self {
-            transport_key,
+            send_key: transport_direction_key(&shared_secret, send_info),
+            recv_key: transport_direction_key(&shared_secret, recv_info),
             send_seq: 0,
-            recv_seq: 0,
+            next_recv_seq: 0,
+            recent_recv_seqs: VecDeque::new(),
+            seen_recv_seqs: HashSet::new(),
         }
     }
 
-    pub fn transport_key(&self) -> &[u8; 32] {
-        &self.transport_key
+    pub fn send_key(&self) -> &[u8; 32] {
+        &self.send_key
+    }
+
+    pub fn recv_key(&self) -> &[u8; 32] {
+        &self.recv_key
     }
 
     pub fn seal(&mut self, plain: &str) -> String {
-        let cipher = aead_seal_sequenced(&self.transport_key, self.send_seq, plain.as_bytes());
+        let cipher = aead_seal_sequenced(&self.send_key, self.send_seq, plain.as_bytes());
         self.send_seq = self.send_seq.wrapping_add(1);
         cipher
     }
 
-    pub fn open(&mut self, cipher_line: &str) -> Option<String> {
-        let plain = aead_open_sequenced(&self.transport_key, self.recv_seq, cipher_line)?;
-        self.recv_seq = self.recv_seq.wrapping_add(1);
-        String::from_utf8(plain).ok()
+    pub fn open(&mut self, cipher_line: &str) -> Option<TransportOpenResult> {
+        let (seq, plain) = aead_open_sequenced(&self.recv_key, cipher_line)?;
+        let plain = String::from_utf8(plain).ok()?;
+
+        if seq == self.next_recv_seq {
+            self.mark_seq_seen(seq);
+            self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
+            return Some(TransportOpenResult::Fresh(plain));
+        }
+
+        if seq < self.next_recv_seq && self.seen_recv_seqs.contains(&seq) {
+            return Some(TransportOpenResult::Duplicate(plain));
+        }
+
+        None
+    }
+
+    fn mark_seq_seen(&mut self, seq: u64) {
+        self.recent_recv_seqs.push_back(seq);
+        self.seen_recv_seqs.insert(seq);
+        while self.recent_recv_seqs.len() > TRANSPORT_REPLAY_WINDOW {
+            if let Some(evicted) = self.recent_recv_seqs.pop_front() {
+                self.seen_recv_seqs.remove(&evicted);
+            }
+        }
     }
 }
 
@@ -149,11 +199,10 @@ fn aead_open_randomized(key_material: &[u8; 32], info: &[u8], encoded: &str) -> 
     cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
 }
 
-fn transport_message_key(transport_key: &[u8; 32]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(None, transport_key);
+fn transport_direction_key(shared_secret: &[u8; 32], info: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut key = [0u8; KEY_LEN];
-    hk.expand(TRANSPORT_INFO, &mut key)
-        .expect("transport message key");
+    hk.expand(info, &mut key).expect("transport direction key");
     key
 }
 
@@ -164,9 +213,8 @@ fn transport_nonce(seq: u64) -> [u8; NONCE_LEN] {
 }
 
 fn aead_seal_sequenced(transport_key: &[u8; 32], seq: u64, plain: &[u8]) -> String {
-    let key = transport_message_key(transport_key);
     let nonce = transport_nonce(seq);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(transport_key));
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), plain)
         .expect("transport encrypt");
@@ -177,7 +225,7 @@ fn aead_seal_sequenced(transport_key: &[u8; 32], seq: u64, plain: &[u8]) -> Stri
     b64::STANDARD.encode(out)
 }
 
-fn aead_open_sequenced(transport_key: &[u8; 32], expected_seq: u64, encoded: &str) -> Option<Vec<u8>> {
+fn aead_open_sequenced(transport_key: &[u8; 32], encoded: &str) -> Option<(u64, Vec<u8>)> {
     let decoded = b64::STANDARD.decode(encoded).ok()?;
     if decoded.len() < 8 + 16 {
         return None;
@@ -185,14 +233,10 @@ fn aead_open_sequenced(transport_key: &[u8; 32], expected_seq: u64, encoded: &st
 
     let (seq_bytes, ct) = decoded.split_at(8);
     let seq = u64::from_be_bytes(seq_bytes.try_into().ok()?);
-    if seq != expected_seq {
-        return None;
-    }
-
-    let key = transport_message_key(transport_key);
     let nonce = transport_nonce(seq);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-    cipher.decrypt(Nonce::from_slice(&nonce), ct).ok()
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(transport_key));
+    let plain = cipher.decrypt(Nonce::from_slice(&nonce), ct).ok()?;
+    Some((seq, plain))
 }
 
 pub fn pwd_hash(pwd: &str) -> [u8; 32] {

@@ -8,6 +8,7 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
+use super::utils::MemberIdentity;
 use super::utils::parse_name_body;
 use super::receiver::ChatMessage;
 use unicode_segmentation::UnicodeSegmentation;
@@ -133,7 +134,7 @@ pub fn draw_chat<B: Backend>(
     f: &mut Frame<B>,
     chat_rows: &[RenderedChatRow],
     list_state: &mut ListState,
-    member_list: &[String],
+    member_list: &[MemberIdentity],
     transfer_lines: &[String],
     input: &str,
     cursor: usize,
@@ -181,7 +182,11 @@ pub fn draw_chat<B: Backend>(
     let members_text = if member_list.is_empty() {
         "<空>".to_string()
     } else {
-        member_list.join(", ")
+        member_list
+            .iter()
+            .map(|member| member.nickname.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     f.render_widget(
         Paragraph::new(members_text)

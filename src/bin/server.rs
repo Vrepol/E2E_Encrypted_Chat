@@ -9,17 +9,20 @@ use rust_chat::client::{
     crypto::{
         compute_invite_proof, compute_password_auth_proof, compute_invite_token_id,
         derive_invite_transport_key, derive_password_transport_key, pwd_hash, TransportCrypto,
+        TransportOpenResult, TransportSide,
     },
     utils::{
         build_ack_line, build_auth_challenge_line, build_invite_challenge_line,
         build_invite_error_line, build_invite_ok_line, build_invite_token_line,
+        build_session_ok_line,
+        build_member_list_line, MemberIdentity,
         handshake_writeall_macro, parse_auth_hello_line, parse_auth_proof_line,
         parse_invite_hello_line, parse_invite_proof_line, parse_invite_ready_line,
         parse_server_invite_request_line, parse_transport_packet_line, INVITE_TTL_SECS,
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     panic::AssertUnwindSafe,
     sync::{Arc, Mutex},
 };
@@ -48,8 +51,8 @@ enum ServerEvent {
 struct RoomInfo {
     tx: broadcast::Sender<ServerEvent>,
     join_credential: String,
-    members: HashSet<String>,
-    owner_nickname: Option<String>,
+    members: HashMap<String, String>,
+    owner_member_id: Option<String>,
     owner_capability: Option<String>,
 }
 
@@ -77,6 +80,7 @@ type Invites = Arc<Mutex<HashMap<String, InviteTokenInfo>>>;
 struct RoomGuard {
     rooms: Rooms,
     room_id: String,
+    member_id: String,
     nickname: String,
     tx: broadcast::Sender<ServerEvent>,
 }
@@ -89,9 +93,9 @@ impl Drop for RoomGuard {
 
         let mut map = self.rooms.lock().unwrap();
         if let Some(info) = map.get_mut(&self.room_id) {
-            info.members.remove(&self.nickname);
-            if info.owner_nickname.as_deref() == Some(&self.nickname) {
-                info.owner_nickname = None;
+            info.members.remove(&self.member_id);
+            if info.owner_member_id.as_deref() == Some(&self.member_id) {
+                info.owner_member_id = None;
                 info.owner_capability = None;
             }
             broadcast_member_list(info);
@@ -103,10 +107,16 @@ impl Drop for RoomGuard {
 }
 
 fn broadcast_member_list(info: &RoomInfo) {
-    let names: Vec<_> = info.members.iter().cloned().collect();
-    let _ = info
-        .tx
-        .send(ServerEvent::Plain(format!("/member_list {}", names.join(","))));
+    let mut members = info
+        .members
+        .iter()
+        .map(|(member_id, nickname)| MemberIdentity {
+            member_id: member_id.clone(),
+            nickname: nickname.clone(),
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|a, b| a.nickname.cmp(&b.nickname).then_with(|| a.member_id.cmp(&b.member_id)));
+    let _ = info.tx.send(ServerEvent::Plain(build_member_list_line(&members)));
 }
 
 #[tokio::main]
@@ -198,7 +208,7 @@ async fn handle_password_client(
 
     let transport_key =
         derive_password_transport_key(SERVER_PWD_HASH.get().unwrap(), &client_nonce, &server_nonce);
-    let mut transport = TransportCrypto::new(transport_key);
+    let mut transport = TransportCrypto::new(transport_key, TransportSide::Server);
     write_transport_plain(writer, &mut transport, "OK").await?;
 
     let room_line = {
@@ -217,8 +227,8 @@ async fn handle_password_client(
         None => return Ok(()),
     };
     let cmd = match transport.open(&cmd_cipher) {
-        Some(value) => value,
-        None => {
+        Some(TransportOpenResult::Fresh(value)) => value,
+        Some(TransportOpenResult::Duplicate(_)) | None => {
             write_transport_plain(writer, &mut transport, "ERR InvalidCmd").await?;
             return Ok(());
         }
@@ -306,7 +316,7 @@ async fn handle_invite_client(
     }
 
     let transport_key = derive_invite_transport_key(&token_secret, &token_id, &client_nonce, &server_nonce);
-    let mut transport = TransportCrypto::new(transport_key);
+    let mut transport = TransportCrypto::new(transport_key, TransportSide::Server);
     write_transport_plain(writer, &mut transport, &build_invite_ok_line(&room_id, &blob_b64)).await?;
 
     let ready_cipher = match lines.next_line().await? {
@@ -317,8 +327,8 @@ async fn handle_invite_client(
         }
     };
     let ready_plain = match transport.open(&ready_cipher) {
-        Some(value) => value,
-        None => {
+        Some(TransportOpenResult::Fresh(value)) => value,
+        Some(TransportOpenResult::Duplicate(_)) | None => {
             reset_invite_to_unused(&invites, &token_id_hex);
             return Ok(());
         }
@@ -330,6 +340,7 @@ async fn handle_invite_client(
             return Ok(());
         }
     };
+    let member_id = random_member_id();
 
     let invite_ok = consume_invite_ready(&invites, &token_id_hex, &client_nonce, &server_nonce);
     if !invite_ok {
@@ -340,7 +351,7 @@ async fn handle_invite_client(
     let tx = match {
         let mut map = rooms.lock().unwrap();
         if let Some(info) = map.get_mut(&room_id) {
-            info.members.insert(nickname.clone());
+            info.members.insert(member_id.clone(), nickname.clone());
             Some(info.tx.clone())
         } else {
             None
@@ -353,9 +364,9 @@ async fn handle_invite_client(
         }
     };
 
-    write_transport_plain(writer, &mut transport, "OK").await?;
     let handshake = RoomHandshake::Join {
         room_id,
+        member_id,
         nickname,
         tx,
         owner_capability: None,
@@ -366,12 +377,14 @@ async fn handle_invite_client(
 enum RoomHandshake {
     Create {
         room_id: String,
+        member_id: String,
         nickname: String,
         tx: broadcast::Sender<ServerEvent>,
         owner_capability: Option<String>,
     },
     Join {
         room_id: String,
+        member_id: String,
         nickname: String,
         tx: broadcast::Sender<ServerEvent>,
         owner_capability: Option<String>,
@@ -390,6 +403,7 @@ fn parse_join_command(rooms: &Rooms, cmd: &str) -> Result<Option<RoomHandshake>,
             if room_id.is_empty() || cred.is_empty() || nickname.is_empty() {
                 Ok(None)
             } else {
+                let member_id = random_member_id();
                 let mut map = rooms.lock().unwrap();
                 if map.contains_key(&room_id) {
                     Err("RoomExists")
@@ -400,21 +414,22 @@ fn parse_join_command(rooms: &Rooms, cmd: &str) -> Result<Option<RoomHandshake>,
                         .map(char::from)
                         .collect();
                     let (tx, _) = broadcast::channel::<ServerEvent>(500);
-                    let mut set = HashSet::new();
-                    set.insert(nickname.clone());
+                    let mut members = HashMap::new();
+                    members.insert(member_id.clone(), nickname.clone());
                     map.insert(
                         room_id.clone(),
                         RoomInfo {
                             tx: tx.clone(),
                             join_credential: cred,
-                            members: set,
-                            owner_nickname: Some(nickname.clone()),
+                            members,
+                            owner_member_id: Some(member_id.clone()),
                             owner_capability: Some(owner_capability.clone()),
                         },
                     );
 
                     Ok(Some(RoomHandshake::Create {
                         room_id,
+                        member_id,
                         nickname,
                         tx,
                         owner_capability: Some(owner_capability),
@@ -429,13 +444,14 @@ fn parse_join_command(rooms: &Rooms, cmd: &str) -> Result<Option<RoomHandshake>,
             if room_id.is_empty() || cred.is_empty() || nickname.is_empty() {
                 Ok(None)
             } else {
+                let member_id = random_member_id();
                 match {
                     let mut map = rooms.lock().unwrap();
                     if let Some(info) = map.get_mut(&room_id) {
                         if info.join_credential != cred {
                             Err("BadCredential")
                         } else {
-                            info.members.insert(nickname.clone());
+                            info.members.insert(member_id.clone(), nickname.clone());
                             Ok(info.tx.clone())
                         }
                     } else {
@@ -444,6 +460,7 @@ fn parse_join_command(rooms: &Rooms, cmd: &str) -> Result<Option<RoomHandshake>,
                 } {
                     Ok(tx) => Ok(Some(RoomHandshake::Join {
                         room_id,
+                        member_id,
                         nickname,
                         tx,
                         owner_capability: None,
@@ -464,34 +481,42 @@ async fn enter_room_loop(
     mut transport: TransportCrypto,
     handshake: RoomHandshake,
 ) -> Result<()> {
-    let (room_id, nickname, room_tx, owner_capability) = match handshake {
+    let (room_id, member_id, nickname, room_tx, owner_capability) = match handshake {
         RoomHandshake::Create {
             room_id,
+            member_id,
             nickname,
             tx,
             owner_capability,
         } => {
-            if let Some(owner_capability) = owner_capability.as_deref() {
-                write_transport_plain(writer, &mut transport, &format!("OK OWNER {owner_capability}")).await?;
-            } else {
-                write_transport_plain(writer, &mut transport, "OK").await?;
-            }
-            (room_id, nickname, tx, owner_capability)
+            write_transport_plain(
+                writer,
+                &mut transport,
+                &build_session_ok_line(&member_id, owner_capability.as_deref()),
+            )
+            .await?;
+            (room_id, member_id, nickname, tx, owner_capability)
         }
         RoomHandshake::Join {
             room_id,
+            member_id,
             nickname,
             tx,
             owner_capability,
         } => {
-            write_transport_plain(writer, &mut transport, "OK").await?;
-            (room_id, nickname, tx, owner_capability)
+            write_transport_plain(
+                writer,
+                &mut transport,
+                &build_session_ok_line(&member_id, owner_capability.as_deref()),
+            )
+            .await?;
+            (room_id, member_id, nickname, tx, owner_capability)
         }
     };
-
     let _guard = RoomGuard {
         rooms: rooms.clone(),
         room_id: room_id.clone(),
+        member_id: member_id.clone(),
         nickname: nickname.clone(),
         tx: room_tx.clone(),
     };
@@ -510,8 +535,12 @@ async fn enter_room_loop(
             result = lines.next_line() => {
                 match result? {
                     Some(line) => {
-                        let Some(server_plain) = transport.open(line.trim_end()) else {
+                        let Some(open_result) = transport.open(line.trim_end()) else {
                             continue;
+                        };
+                        let (server_plain, is_duplicate) = match open_result {
+                            TransportOpenResult::Fresh(plain) => (plain, false),
+                            TransportOpenResult::Duplicate(plain) => (plain, true),
                         };
 
                         if server_plain == "/ping" {
@@ -522,8 +551,14 @@ async fn enter_room_loop(
                         let broadcast_payload = if let Some((packet_id, room_cipher)) = parse_transport_packet_line(&server_plain) {
                             let ack = build_ack_line(&packet_id);
                             let _ = write_transport_plain(writer, &mut transport, &ack).await;
+                            if is_duplicate {
+                                continue;
+                            }
                             room_cipher
                         } else {
+                            if is_duplicate {
+                                continue;
+                            }
                             server_plain
                         };
 
@@ -532,7 +567,7 @@ async fn enter_room_loop(
                                 &rooms,
                                 &invites,
                                 &room_id,
-                                &nickname,
+                                &member_id,
                                 owner_capability.as_deref(),
                                 inv_req,
                             );
@@ -561,7 +596,7 @@ fn handle_invite_request(
     rooms: &Rooms,
     invites: &Invites,
     room_id: &str,
-    nickname: &str,
+    member_id: &str,
     session_owner_capability: Option<&str>,
     request: rust_chat::client::utils::ServerInviteRequest,
 ) -> String {
@@ -574,8 +609,8 @@ fn handle_invite_request(
         return build_invite_error_line(&request.request_id, "NoSuchRoom");
     };
 
-    let owner_capability = match (&info.owner_nickname, &info.owner_capability) {
-        (Some(owner_name), Some(owner_capability)) if owner_name == nickname => owner_capability,
+    let owner_capability = match (&info.owner_member_id, &info.owner_capability) {
+        (Some(owner_member_id), Some(owner_capability)) if owner_member_id == member_id => owner_capability,
         _ => return build_invite_error_line(&request.request_id, "OwnerOffline"),
     };
 
@@ -667,6 +702,14 @@ fn random_nonce32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
     rand::rng().fill_bytes(&mut nonce);
     nonce
+}
+
+fn random_member_id() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect()
 }
 
 fn decode_hex_32(value: &str) -> Result<[u8; 32]> {

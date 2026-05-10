@@ -187,6 +187,18 @@ pub enum LocalUiEvent {
     Notice(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberIdentity {
+    pub member_id: String,
+    pub nickname: String,
+}
+
+impl MemberIdentity {
+    pub fn display_name(&self) -> String {
+        member_display_name(&self.nickname, &self.member_id)
+    }
+}
+
 pub fn classify_outgoing_input(msg: &str) -> Result<OutgoingPayload> {
     if is_attachment_protocol_line(msg) {
         return Ok(OutgoingPayload::Text(msg.to_string()));
@@ -351,6 +363,41 @@ pub fn packet_id_for_attachment_meta(transfer_id: &str) -> String {
 
 pub fn packet_id_for_attachment_chunk(transfer_id: &str, index: usize) -> String {
     format!("att-{transfer_id}-chunk-{index}")
+}
+
+pub fn member_display_name(nickname: &str, member_id: &str) -> String {
+    let short_len = member_id.len().min(6);
+    format!("{nickname}#{}", &member_id[..short_len])
+}
+
+pub fn build_member_list_line(members: &[MemberIdentity]) -> String {
+    let encoded = members
+        .iter()
+        .map(|member| {
+            let id_b64 = URL_SAFE_NO_PAD.encode(member.member_id.as_bytes());
+            let nick_b64 = URL_SAFE_NO_PAD.encode(member.nickname.as_bytes());
+            format!("{id_b64}:{nick_b64}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("/member_list {encoded}")
+}
+
+pub fn parse_member_list_line(line: &str) -> Option<Vec<MemberIdentity>> {
+    let payload = line.strip_prefix("/member_list ")?;
+    if payload.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    payload
+        .split(',')
+        .map(|entry| {
+            let mut parts = entry.splitn(2, ':');
+            let member_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+            let nickname = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+            Some(MemberIdentity { member_id, nickname })
+        })
+        .collect()
 }
 
 pub fn build_local_transfer_begin_line(
@@ -607,6 +654,28 @@ pub fn build_invite_ready_line(nickname: &str) -> String {
 pub fn parse_invite_ready_line(line: &str) -> Option<String> {
     let encoded = line.strip_prefix("/INVITE_READY ")?;
     String::from_utf8(URL_SAFE_NO_PAD.decode(encoded.trim()).ok()?).ok()
+}
+
+pub fn build_session_ok_line(member_id: &str, owner_capability: Option<&str>) -> String {
+    let member_b64 = URL_SAFE_NO_PAD.encode(member_id.as_bytes());
+    match owner_capability {
+        Some(owner_capability) => format!("OK MEMBER {member_b64} OWNER {owner_capability}"),
+        None => format!("OK MEMBER {member_b64}"),
+    }
+}
+
+pub fn parse_session_ok_line(line: &str) -> Option<(String, Option<String>)> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "OK" || parts.next()? != "MEMBER" {
+        return None;
+    }
+    let member_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let owner_capability = match parts.next() {
+        Some("OWNER") => parts.next().map(|s| s.to_string()),
+        None => None,
+        _ => return None,
+    };
+    Some((member_id, owner_capability))
 }
 
 pub fn parse_local_ui_event(line: &str) -> Option<LocalUiEvent> {

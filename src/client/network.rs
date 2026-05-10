@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio::net::tcp::OwnedWriteHalf;
 
-use super::crypto::RoomCryptoState;
+use super::crypto::{RoomCryptoState, TransportOpenResult};
 use super::handshake::SharedTransportCrypto;
 use super::utils::{
     build_attachment_chunk_line, build_attachment_meta_line, build_local_notice_line,
@@ -204,8 +204,12 @@ pub async fn chat_loop(
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    let Some(plain) = transport_open_line(&read_transport, &line) else {
+                    let Some(open_result) = transport_open_line(&read_transport, &line) else {
                         continue;
+                    };
+                    let plain = match open_result {
+                        TransportOpenResult::Fresh(plain) => plain,
+                        TransportOpenResult::Duplicate(_) => continue,
                     };
 
                     if should_drop_transport_control_message(&plain) {
@@ -745,7 +749,10 @@ async fn hash_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn transport_open_line(transport: &SharedTransportCrypto, cipher_line: &str) -> Option<String> {
+fn transport_open_line(
+    transport: &SharedTransportCrypto,
+    cipher_line: &str,
+) -> Option<TransportOpenResult> {
     let mut guard = transport.lock().ok()?;
     guard.open(cipher_line)
 }

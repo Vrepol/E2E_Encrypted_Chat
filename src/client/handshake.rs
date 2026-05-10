@@ -15,13 +15,13 @@ use tokio::{
 use super::crypto::{
     compute_invite_proof, compute_invite_token_id, compute_password_auth_proof,
     derive_invite_transport_key, derive_password_transport_key, pwd_hash, RoomCryptoState,
-    TransportCrypto,
+    TransportCrypto, TransportOpenResult, TransportSide,
 };
 use super::utils::{
     build_auth_hello_line, build_auth_proof_line, build_invite_hello_line,
     build_invite_ready_line, build_invite_proof_line, handshake_writeall_macro,
     open_invite_blob, parse_auth_challenge_line, parse_invitation, parse_invite_challenge_line,
-    parse_invite_ok_line,
+    parse_invite_ok_line, parse_session_ok_line, MemberIdentity,
 };
 
 pub type SharedTransportCrypto = Arc<Mutex<TransportCrypto>>;
@@ -32,6 +32,7 @@ pub struct ConnectedSession {
     pub server_addr: String,
     pub room_crypto: RoomCryptoState,
     pub transport: SharedTransportCrypto,
+    pub local_member: MemberIdentity,
     pub owner_capability: Option<String>,
 }
 
@@ -84,13 +85,12 @@ async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Res
         .write_all(handshake_writeall_macro(build_invite_proof_line(&hex::encode(proof))).as_slice())
         .await?;
 
-    let mut transport = TransportCrypto::new(transport_key);
+    let mut transport = TransportCrypto::new(transport_key, TransportSide::Client);
     let invite_ok_cipher = lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during invite auth"))?;
-    let invite_ok = transport
-        .open(&invite_ok_cipher)
+    let invite_ok = expect_fresh_transport_line(&mut transport, &invite_ok_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted invite response"))?;
     let (_room_id_from_server, blob_b64) =
         parse_invite_ok_line(&invite_ok).ok_or_else(|| anyhow!("Invalid INVITE_OK"))?;
@@ -108,10 +108,11 @@ async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Res
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during invite finalize"))?;
-    let ok_plain = transport
-        .open(&ok_cipher)
+    let ok_plain = expect_fresh_transport_line(&mut transport, &ok_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted invite finalize response"))?;
-    if !ok_plain.starts_with("OK") {
+    let (member_id, owner_capability) = parse_session_ok_line(&ok_plain)
+        .ok_or_else(|| anyhow!("Server refused invite: {ok_plain}"))?;
+    if owner_capability.is_some() {
         return Err(anyhow!("Server refused invite: {ok_plain}"));
     }
 
@@ -121,6 +122,10 @@ async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Res
         server_addr,
         room_crypto,
         transport: Arc::new(Mutex::new(transport)),
+        local_member: MemberIdentity {
+            member_id,
+            nickname: nickname.to_string(),
+        },
         owner_capability: None,
     })
 }
@@ -159,13 +164,12 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
         .write_all(handshake_writeall_macro(build_auth_proof_line(&hex::encode(proof))).as_slice())
         .await?;
 
-    let mut transport = TransportCrypto::new(transport_key);
+    let mut transport = TransportCrypto::new(transport_key, TransportSide::Client);
     let ok_cipher = lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during auth"))?;
-    let ok_plain = transport
-        .open(&ok_cipher)
+    let ok_plain = expect_fresh_transport_line(&mut transport, &ok_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted auth response"))?;
     if ok_plain.trim() != "OK" {
         return Err(anyhow!("Server declined: {ok_plain}"));
@@ -175,8 +179,7 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during room banner"))?;
-    let rooms_plain = transport
-        .open(&rooms_cipher)
+    let rooms_plain = expect_fresh_transport_line(&mut transport, &rooms_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted room banner"))?;
     if !rooms_plain.starts_with("ROOMS") {
         return Err(anyhow!("unexpected banner: {rooms_plain}"));
@@ -205,13 +208,10 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during room join"))?;
-    let response_plain = transport
-        .open(&response_cipher)
+    let response_plain = expect_fresh_transport_line(&mut transport, &response_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted room join response"))?;
-    if !response_plain.starts_with("OK") {
-        return Err(anyhow!("server refused: {response_plain}"));
-    }
-    let owner_capability = parse_owner_capability(&response_plain);
+    let (member_id, owner_capability) = parse_session_ok_line(&response_plain)
+        .ok_or_else(|| anyhow!("server refused: {response_plain}"))?;
 
     Ok(ConnectedSession {
         lines,
@@ -219,6 +219,10 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
         server_addr,
         room_crypto,
         transport: Arc::new(Mutex::new(transport)),
+        local_member: MemberIdentity {
+            member_id,
+            nickname: nickname.to_string(),
+        },
         owner_capability,
     })
 }
@@ -268,17 +272,6 @@ fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static s
     }
 }
 
-fn parse_owner_capability(resp: &str) -> Option<String> {
-    let mut parts = resp.split_whitespace();
-    if parts.next()? != "OK" {
-        return None;
-    }
-    match parts.next() {
-        Some("OWNER") => parts.next().map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
 fn random_nonce32() -> [u8; 32] {
     let mut nonce = [0u8; 32];
     rand::rng().fill_bytes(&mut nonce);
@@ -289,4 +282,11 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     hex::decode_to_slice(value, &mut out).map_err(|_| anyhow!("Invalid 32-byte hex field"))?;
     Ok(out)
+}
+
+fn expect_fresh_transport_line(transport: &mut TransportCrypto, cipher_line: &str) -> Option<String> {
+    match transport.open(cipher_line)? {
+        TransportOpenResult::Fresh(plain) => Some(plain),
+        TransportOpenResult::Duplicate(_) => None,
+    }
 }

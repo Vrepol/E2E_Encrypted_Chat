@@ -8,8 +8,9 @@ use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::client::utils::{
-    parse_attachment_frame, parse_local_ui_event, parse_text_img, render_transfer_line,
-    sanitize_attachment_name, AttachmentChunk, AttachmentFrame, AttachmentMeta, LocalUiEvent,
+    parse_attachment_frame, parse_local_ui_event, parse_member_list_line, parse_text_img,
+    render_transfer_line, sanitize_attachment_name, AttachmentChunk, AttachmentFrame,
+    AttachmentMeta, LocalUiEvent, MemberIdentity,
 };
 
 use super::attachment_store::AttachmentStore;
@@ -179,7 +180,7 @@ pub fn drain_messages(
     my_name: &str,
     room_crypto: &RoomCryptoState,
     attachment_store: &AttachmentStore,
-    members: &mut Vec<String>,
+    members: &mut Vec<MemberIdentity>,
     receiver_state: &mut ReceiverState,
     transfer_ui_state: &mut TransferUiState,
 ) {
@@ -188,15 +189,9 @@ pub fn drain_messages(
             continue;
         }
 
-        if line.starts_with("/member_list ") {
+        if let Some(parsed_members) = parse_member_list_line(&line) {
             members.clear();
-            members.extend(
-                line["/member_list ".len()..]
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-            );
+            members.extend(parsed_members);
             continue;
         }
 

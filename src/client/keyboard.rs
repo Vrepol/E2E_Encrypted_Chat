@@ -12,7 +12,7 @@ use super::ui::{selected_message_index, RenderedChatRow};
 use super::clipboard::{self, ClipData};
 use super::utils::{
     build_local_invite_request_line, build_local_notice_line, encode_rgba_as_png,
-    normalize_clipboard_rgba,
+    normalize_clipboard_rgba, MemberIdentity,
     parse_clipboard_file_paths, parse_name_body, HELP_TEXT, HELP_TEXT_EN,
 };
 pub enum ControlFlow { Continue, Quit }
@@ -30,7 +30,7 @@ pub struct KeyCtx<'a> {
     pub list_state:  &'a mut ListState,
     pub chat_rows:   &'a [RenderedChatRow],
     pub messages:    &'a mut Vec<ChatMessage>,
-    pub member_list: &'a mut Vec<String>, // 目前未用到，但保留以备扩展
+    pub member_list: &'a mut Vec<MemberIdentity>, // 目前未用到，但保留以备扩展
     pub undo_mgr:    &'a mut UndoMgr,
     pub out_tx:      &'a UnboundedSender<String>,
     pub server_addr: &'a mut String,

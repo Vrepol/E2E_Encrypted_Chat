@@ -32,6 +32,7 @@ use rust_chat::client::{
     initialization::{initial_serveraddr, initial_name,init_color},
     handshake,
     keyboard::{handle_key, UndoMgr, KeyCtx, ControlFlow},
+    utils::MemberIdentity,
 };
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 // ================== UI 事件枚举 ==================
@@ -141,7 +142,7 @@ async fn main() -> Result<()> {
     /* ---------- 6. 应用状态 ---------- */
     let ui_mode = UiMode::Chat;
     let mut messages: Vec<ChatMessage> = Vec::new();
-    let mut member_list: Vec<String>   = Vec::new();
+    let mut member_list: Vec<MemberIdentity>   = Vec::new();
     let mut receiver_state = ReceiverState::default();
     let mut transfer_ui_state = TransferUiState::default();
     let mut input = String::new();
