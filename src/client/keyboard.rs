@@ -121,16 +121,12 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                 let _ = ctx.out_tx.send(build_local_notice_line("只有当前房主连接可以申请一次性邀请码"));
                 return ControlFlow::Continue;
             };
-            let mut iter = ctx.server_addr.splitn(2, '&');
-            let server     = iter.next().unwrap_or("");
-            let server_pwd = iter.next().unwrap_or("");
-            if server.is_empty() || server_pwd.is_empty() {
-                let _ = ctx.out_tx.send(build_local_notice_line("当前连接没有可用的服务器口令上下文，无法申请邀请码"));
+            if ctx.server_addr.trim().is_empty() {
+                let _ = ctx.out_tx.send(build_local_notice_line("当前连接没有可用的服务器地址，无法申请邀请码"));
                 return ControlFlow::Continue;
             }
             let request = build_local_invite_request_line(
-                server,
-                super::crypto::pwd_hash(server_pwd),
+                ctx.server_addr,
                 ctx.room_id,
                 ctx.pwd,
                 owner_capability,

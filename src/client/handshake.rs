@@ -1,201 +1,271 @@
-// client/handshake.rs
 use anyhow::{anyhow, Result};
-use md5::{Digest, Md5};
+use base64::Engine;
+use colored::*;
+use rand::{distr::Alphanumeric, Rng, RngCore};
 use rpassword::read_password;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
 };
-use super::utils::{
-    build_invite_fetch_line, handshake_writeall_macro, open_invite_blob, parse_invitation,
-    parse_invite_blob_line,
+
+use super::crypto::{
+    compute_invite_proof, compute_invite_token_id, compute_password_auth_proof,
+    derive_invite_transport_key, derive_password_transport_key, pwd_hash, RoomCryptoState,
+    TransportCrypto,
 };
-use super::crypto;
-use colored::*;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use rand::{distr::Alphanumeric, Rng};
-use super::crypto::{enc_auth, enc_auth_from_hash, pwd_hash, server_open, set_server_key};
-/// 返回已经握手成功、可以直接进入聊天循环的
-/// `(Lines<OwnedReadHalf>, OwnedWriteHalf, String /*room_id*/)`
-pub async fn connect_and_login(
-    server_addr_or_invite: &str,
-    nickname: &str,
-) -> Result<(Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-            tokio::net::tcp::OwnedWriteHalf,
-            String,String,Option<String>)> {
-            if server_addr_or_invite.starts_with("/INVITE:") {
-                // 1) 解码
-                let (server_addr, invite_token, blob_key_b64) = match parse_invitation(server_addr_or_invite) {
-                    Some(t) => t,
-                    None => {
-                        return Err(anyhow!("Invalid invitation"));
-                    }
-                };
-                // 2) 先连 TCP
-                let stream = TcpStream::connect(&server_addr).await?;
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-                writer
-                    .write_all(format!("{}\n", build_invite_fetch_line(&invite_token)).as_bytes())
-                    .await?;
-                let blob_resp = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("Server closed during invite blob fetch"))?;
-                if blob_resp.starts_with("ERR ") {
-                    return Err(anyhow!("邀请码无效或已过期"));
-                }
-                let blob_b64 = parse_invite_blob_line(&blob_resp)
-                    .ok_or_else(|| anyhow!("Invalid invite blob response"))?;
-                let (enc_pwd, room_id, pwd) = open_invite_blob(&blob_b64, &blob_key_b64)
-                    .ok_or_else(|| anyhow!("Invalid invitation"))?;
-                set_server_key(enc_pwd);
-                let auth = enc_auth_from_hash(&enc_pwd);
-                let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
-                writer.write_all(&cipher).await?;
-                // 等待 OK
-                let resp = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("Server closed during auth or {:?}",lines))?;
-                if server_open(&resp).ok_or_else(|| anyhow!("{}",resp))?.trim() != "OK" {
-                    return Err(anyhow!("Server declined: {}", resp));
-                }
+use super::utils::{
+    build_auth_hello_line, build_auth_proof_line, build_invite_hello_line,
+    build_invite_ready_line, build_invite_proof_line, handshake_writeall_macro,
+    open_invite_blob, parse_auth_challenge_line, parse_invitation, parse_invite_challenge_line,
+    parse_invite_ok_line,
+};
 
+pub type SharedTransportCrypto = Arc<Mutex<TransportCrypto>>;
 
-                // 与原流程相同：读取 "ROOMS ..." 横幅
-                let first = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("server closed during handshake"))?;
-                let first = server_open(&first).unwrap_or(first);
-                if !first.starts_with("ROOMS") {
-                    return Err(anyhow!("unexpected banner: {}", first));
-                }
-        
-                // 3) 直接拼 JOIN 指令，无需交互
-                let digest = Md5::digest(format!("{room_id}{pwd}"));
-                crypto::set_room_key(&hex::encode(digest));
-                let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
-                mac.update(b"Hello");
-                let credential = hex::encode(mac.finalize().into_bytes());
-                let cmd = handshake_writeall_macro(format!("JOIN_INVITE {room_id} {invite_token} {credential} {nickname}"));
-                writer.write_all(&cmd).await?;
-                // 4) 等待服务器 OK
-                let resp = lines.next_line().await?
-                    .ok_or_else(|| anyhow!("Server closed during handshake-2"))?;
-                let resp = server_open(&resp).unwrap_or(resp);
-                if !resp.starts_with("OK") {
-                    return Err(anyhow!("Server refused: {}", resp));
-                }
-                return Ok((lines, writer, room_id, pwd, None));
-            }
-    // 0. TCP 连接
+pub struct ConnectedSession {
+    pub lines: Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    pub writer: tokio::net::tcp::OwnedWriteHalf,
+    pub server_addr: String,
+    pub room_crypto: RoomCryptoState,
+    pub transport: SharedTransportCrypto,
+    pub owner_capability: Option<String>,
+}
 
+pub async fn connect_and_login(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+    if server_addr_or_invite.starts_with("/INVITE:") {
+        return connect_with_invite(server_addr_or_invite, nickname).await;
+    }
 
-    let mut iter = server_addr_or_invite.splitn(2, '&');
-    let server = iter.next().unwrap_or("");
-    let password = iter.next().unwrap_or("");
+    connect_with_password(server_addr_or_invite, nickname).await
+}
 
-    let stream = TcpStream::connect(server).await?;
+async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+    let (server_addr, token_secret_b64, blob_key_b64) =
+        parse_invitation(server_addr_or_invite).ok_or_else(|| anyhow!("Invalid invitation"))?;
+    let token_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token_secret_b64.as_bytes())
+        .map_err(|_| anyhow!("Invalid invitation token"))?;
+    let token_id = compute_invite_token_id(&token_secret);
+    let client_nonce = random_nonce32();
+
+    let stream = TcpStream::connect(&server_addr).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    let auth = enc_auth(password);
-    set_server_key(pwd_hash(password));
 
-    let cipher = handshake_writeall_macro(format!("AUTH {auth}"));
-    writer.write_all(&cipher).await?;
-    // 等待 OK
-    let resp = lines.next_line().await?
-        .ok_or_else(|| anyhow!("Server closed during auth or {:?}",lines))?;
-    if server_open(&resp).ok_or_else(|| anyhow!("{}",resp))?.trim() != "OK" {
-        return Err(anyhow!("Server declined: {}", resp));
-    }
+    writer
+        .write_all(
+            handshake_writeall_macro(build_invite_hello_line(
+                &hex::encode(token_id),
+                &hex::encode(client_nonce),
+            ))
+            .as_slice(),
+        )
+        .await?;
 
-    // 1. 服务器首条消息：房间列表
-    let first = lines
+    let challenge = lines
         .next_line()
         .await?
-        .ok_or_else(|| anyhow!("server closed during handshake"))?;
-    let first = server_open(&first).unwrap_or(first);
-    if !first.starts_with("ROOMS") {
-        return Err(anyhow!("unexpected banner: {}", first));
+        .ok_or_else(|| anyhow!("Server closed during invite challenge"))?;
+    if challenge.starts_with("ERR ") {
+        return Err(anyhow!("邀请码无效或已过期"));
     }
-    let rooms: Vec<String> = first.split_whitespace().skip(1).map(|s| s.to_owned()).collect();
-    if rooms.is_empty() {
-        println!("\n{}","— No Rooms Available —".green().bold());
-    } else {
-        println!("\n{} \n {}","— Available Rooms —".green().bold(), rooms.join("; "));
+    let server_nonce_hex =
+        parse_invite_challenge_line(&challenge).ok_or_else(|| anyhow!("Invalid invite challenge"))?;
+    let server_nonce = decode_hex_32(&server_nonce_hex)?;
+    let transport_key =
+        derive_invite_transport_key(&token_secret, &token_id, &client_nonce, &server_nonce);
+    let proof = compute_invite_proof(&token_secret, &token_id, &client_nonce, &server_nonce);
+
+    writer
+        .write_all(handshake_writeall_macro(build_invite_proof_line(&hex::encode(proof))).as_slice())
+        .await?;
+
+    let mut transport = TransportCrypto::new(transport_key);
+    let invite_ok_cipher = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during invite auth"))?;
+    let invite_ok = transport
+        .open(&invite_ok_cipher)
+        .ok_or_else(|| anyhow!("Invalid encrypted invite response"))?;
+    let (_room_id_from_server, blob_b64) =
+        parse_invite_ok_line(&invite_ok).ok_or_else(|| anyhow!("Invalid INVITE_OK"))?;
+    let (room_id, room_credential) = open_invite_blob(&blob_b64, &blob_key_b64)
+        .ok_or_else(|| anyhow!("Invalid invitation blob"))?;
+    let room_crypto = RoomCryptoState::from_room_credential(room_id, room_credential);
+
+    let ready_line = build_invite_ready_line(nickname);
+    let ready_cipher = transport.seal(&ready_line);
+    writer
+        .write_all(handshake_writeall_macro(ready_cipher).as_slice())
+        .await?;
+
+    let ok_cipher = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during invite finalize"))?;
+    let ok_plain = transport
+        .open(&ok_cipher)
+        .ok_or_else(|| anyhow!("Invalid encrypted invite finalize response"))?;
+    if !ok_plain.starts_with("OK") {
+        return Err(anyhow!("Server refused invite: {ok_plain}"));
     }
 
-    // 2. 本地交互：输入房间号 & 密码
-    let (room_id, pwd, action) = loop {
-        print!("{}","Enter \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold());
-        print!("{}","Room ID: ".blue());
+    Ok(ConnectedSession {
+        lines,
+        writer,
+        server_addr,
+        room_crypto,
+        transport: Arc::new(Mutex::new(transport)),
+        owner_capability: None,
+    })
+}
+
+async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+    let mut iter = server_addr_or_invite.splitn(2, '&');
+    let server_addr = iter.next().unwrap_or("").to_string();
+    let password = iter.next().unwrap_or("");
+    let server_pwd_hash = pwd_hash(password);
+    let client_nonce = random_nonce32();
+
+    let stream = TcpStream::connect(&server_addr).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer
+        .write_all(
+            handshake_writeall_macro(build_auth_hello_line(&hex::encode(client_nonce))).as_slice(),
+        )
+        .await?;
+
+    let challenge = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during auth challenge"))?;
+    if challenge.starts_with("ERR ") {
+        return Err(anyhow!("Server declined: {challenge}"));
+    }
+    let server_nonce_hex =
+        parse_auth_challenge_line(&challenge).ok_or_else(|| anyhow!("Invalid auth challenge"))?;
+    let server_nonce = decode_hex_32(&server_nonce_hex)?;
+    let transport_key = derive_password_transport_key(&server_pwd_hash, &client_nonce, &server_nonce);
+    let proof = compute_password_auth_proof(&server_pwd_hash, &client_nonce, &server_nonce);
+
+    writer
+        .write_all(handshake_writeall_macro(build_auth_proof_line(&hex::encode(proof))).as_slice())
+        .await?;
+
+    let mut transport = TransportCrypto::new(transport_key);
+    let ok_cipher = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during auth"))?;
+    let ok_plain = transport
+        .open(&ok_cipher)
+        .ok_or_else(|| anyhow!("Invalid encrypted auth response"))?;
+    if ok_plain.trim() != "OK" {
+        return Err(anyhow!("Server declined: {ok_plain}"));
+    }
+
+    let rooms_cipher = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during room banner"))?;
+    let rooms_plain = transport
+        .open(&rooms_cipher)
+        .ok_or_else(|| anyhow!("Invalid encrypted room banner"))?;
+    if !rooms_plain.starts_with("ROOMS") {
+        return Err(anyhow!("unexpected banner: {rooms_plain}"));
+    }
+    let rooms: Vec<String> = rooms_plain
+        .split_whitespace()
+        .skip(1)
+        .map(|s| s.to_owned())
+        .collect();
+    if rooms.is_empty() {
+        println!("\n{}", "— No Rooms Available —".green().bold());
+    } else {
+        println!("\n{} \n {}", "— Available Rooms —".green().bold(), rooms.join("; "));
+    }
+
+    let (room_id, room_credential, action) = prompt_room_selection(&rooms)?;
+    let room_crypto = RoomCryptoState::from_room_credential(room_id, room_credential);
+    let join_credential = room_crypto.join_credential();
+    let join_plain = format!("{action} {} {join_credential} {nickname}", room_crypto.room_id());
+    let join_cipher = transport.seal(&join_plain);
+    writer
+        .write_all(handshake_writeall_macro(join_cipher).as_slice())
+        .await?;
+
+    let response_cipher = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow!("Server closed during room join"))?;
+    let response_plain = transport
+        .open(&response_cipher)
+        .ok_or_else(|| anyhow!("Invalid encrypted room join response"))?;
+    if !response_plain.starts_with("OK") {
+        return Err(anyhow!("server refused: {response_plain}"));
+    }
+    let owner_capability = parse_owner_capability(&response_plain);
+
+    Ok(ConnectedSession {
+        lines,
+        writer,
+        server_addr,
+        room_crypto,
+        transport: Arc::new(Mutex::new(transport)),
+        owner_capability,
+    })
+}
+
+fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static str)> {
+    loop {
+        print!(
+            "{}",
+            "Enter \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold()
+        );
+        print!("{}", "Room ID: ".blue());
         io::stdout().flush()?;
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
 
-        if id.trim()=="/q"{
+        if id.trim() == "/q" {
             return Err(anyhow!("Disconnected"));
-        } else if id.trim() =="'" {
+        }
+        if id.trim() == "'" {
             let room_id: String = rand::rng()
                 .sample_iter(&Alphanumeric)
-                .take(9)                                // 8‒10 都行，这里用 9
+                .take(9)
                 .map(char::from)
                 .collect();
-
-            // 2. 随机密码（16 字符，含部分符号提升复杂度）
-            const CHARSET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                abcdefghijklmnopqrstuvwxyz\
-                0123456789-_@#";
-            let pwd: String = (0..32)
+            const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
+            let room_credential: String = (0..32)
                 .map(|_| {
                     let idx = rand::rng().random_range(0..CHARSET.len());
                     CHARSET[idx] as char
                 })
                 .collect();
-            break (room_id, pwd, "CREATE");
+            return Ok((room_id, room_credential, "CREATE"));
         }
 
-        let id = if id.trim().is_empty() {"Public"} else {id.trim()} ;
+        let id = if id.trim().is_empty() { "Public" } else { id.trim() };
         if id != "Public" {
-            print!("{}","It wouldn't display while typing,".yellow().bold());
-            print!("{}","Password:".red());
+            print!("{}", "It wouldn't display while typing,".yellow().bold());
+            print!("{}", "Password:".red());
             io::stdout().flush()?;
-            let pwd = read_password()?;
-            let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-            break (id.to_owned(), pwd, act);
-        } else {
-        let pwd = String::from("");
-        let act = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
-        break (id.to_owned(), pwd, act);
+            let room_credential = read_password()?;
+            let action = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
+            return Ok((id.to_owned(), room_credential, action));
         }
-        
-    };
 
-    // 3. 计算 md5，作为房间密钥 & 凭据
-    let digest = Md5::digest(format!("{room_id}{pwd}").as_bytes()); // 16 B
-    let md5_hex = hex::encode(digest);
-    // ① 把 md5 设置为本房间的会话密钥
-    crypto::set_room_key(&md5_hex);
-    // ② 用它把 “Hello” 包装成密文，作为凭据
-    let mut mac = Hmac::<Sha256>::new_from_slice(&digest).unwrap();
-    mac.update(b"Hello");
-    let tag = mac.finalize().into_bytes();
-    let credential = hex::encode(tag);
-
-    // 4. 发送指令：<ACTION> <ROOM> <CRED> <NICK>
-    let cmd = handshake_writeall_macro(format!("{action} {room_id} {credential} {nickname}"));
-    writer.write_all(&cmd).await?;
-    // 5. 等待握手结果
-    let resp = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| anyhow!("server closed during handshake‑2"))?;
-    let resp = server_open(&resp).unwrap_or(resp);
-    if !resp.starts_with("OK") {
-        return Err(anyhow!("server refused: {}", resp));
+        let action = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
+        return Ok((id.to_owned(), String::new(), action));
     }
-    let owner_capability = parse_owner_capability(&resp);
-    Ok((lines, writer, room_id, pwd, owner_capability))
 }
 
 fn parse_owner_capability(resp: &str) -> Option<String> {
@@ -207,4 +277,16 @@ fn parse_owner_capability(resp: &str) -> Option<String> {
         Some("OWNER") => parts.next().map(|s| s.to_string()),
         _ => None,
     }
+}
+
+fn random_nonce32() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    rand::rng().fill_bytes(&mut nonce);
+    nonce
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(value, &mut out).map_err(|_| anyhow!("Invalid 32-byte hex field"))?;
+    Ok(out)
 }

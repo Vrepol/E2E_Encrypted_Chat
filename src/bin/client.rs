@@ -62,14 +62,14 @@ async fn main() -> Result<()> {
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel::<String>();     // UI → 网络
 
     //得到服务器地址后开始握手
-    let (lines, writer, room_id, pwd, owner_capability) = loop {
+    let session = loop {
         if server_addr.is_empty() {
             let new_addr = initial_serveraddr()?;
             server_addr = new_addr;
         }
         match handshake::connect_and_login(&server_addr, &username).await {
-            Ok((lines, writer, room_id, pwd, owner_capability)) => {
-                break (lines, writer, room_id, pwd, owner_capability);
+            Ok(session) => {
+                break session;
             }
             Err(e) if e.to_string().contains("邀请码无效") => {
                 eprintln!("❌ 邀请码无效或已过期，请重新选择服务器或输入新的邀请码。\n");
@@ -88,12 +88,21 @@ async fn main() -> Result<()> {
         }
         
     };
+    let room_id = session.room_crypto.room_id().to_string();
+    let room_credential = session.room_crypto.room_credential().to_string();
+    let owner_capability = session.owner_capability.clone();
+    let mut active_server_addr = session.server_addr.clone();
     //特性：受邀请者退出房间后回到服务器选择界面，而且在房间中无法生成正确的邀请码
     server_addr=inviation_clear(&server_addr);
 
     /* ---------- 3. 启动网络任务（自动重连 + 心跳） ---------- */
+    let room_crypto = session.room_crypto.clone();
+    let ui_room_crypto = session.room_crypto.clone();
+    let transport = session.transport.clone();
+    let lines = session.lines;
+    let writer = session.writer;
     tokio::spawn(async move {
-        if let Err(e) = network::chat_loop(lines, writer, net_tx, out_rx).await {
+        if let Err(e) = network::chat_loop(lines, writer, net_tx, out_rx, room_crypto, transport).await {
             eprintln!("chat_loop error: {e}");
         }
     });
@@ -186,9 +195,9 @@ async fn main() -> Result<()> {
                     member_list: &mut member_list,
                     undo_mgr:    &mut undo_mgr,
                     out_tx:      &out_tx,
-                    server_addr: &mut server_addr,
+                    server_addr: &mut active_server_addr,
                     room_id:     &room_id,
-                    pwd:         &pwd,
+                    pwd:         &room_credential,
                     username:    &username,
                     attachment_dir: room_tempdir.path(),
                     attachment_store: &attachment_store,
@@ -210,6 +219,7 @@ async fn main() -> Result<()> {
             &mut net_rx,
             &mut messages,
             &username,
+            &ui_room_crypto,
             &attachment_store,
             &mut member_list,
             &mut receiver_state,

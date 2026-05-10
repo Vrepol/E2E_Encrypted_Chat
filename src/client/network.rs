@@ -18,7 +18,8 @@ use tokio::{
 };
 use tokio::net::tcp::OwnedWriteHalf;
 
-use super::crypto::{seal, server_open, server_seal};
+use super::crypto::RoomCryptoState;
+use super::handshake::SharedTransportCrypto;
 use super::utils::{
     build_attachment_chunk_line, build_attachment_meta_line, build_local_notice_line,
     build_local_transfer_begin_line, build_local_transfer_done_line,
@@ -182,6 +183,8 @@ pub async fn chat_loop(
     mut writer: OwnedWriteHalf,
     net_tx: UnboundedSender<String>,
     mut out_rx: UnboundedReceiver<String>,
+    room_crypto: RoomCryptoState,
+    transport: SharedTransportCrypto,
 ) -> Result<()> {
     let mut hb = interval(Duration::from_secs(30));
     let mut send_pump = interval(Duration::from_millis(5));
@@ -192,6 +195,7 @@ pub async fn chat_loop(
     let read_ack_registry = ack_registry.clone();
     let read_invite_registry = invite_registry.clone();
     let read_net_tx = net_tx.clone();
+    let read_transport = transport.clone();
     let mut pending_uploads = VecDeque::<PathBuf>::new();
     let mut active_upload: Option<AttachmentJob> = None;
 
@@ -200,13 +204,13 @@ pub async fn chat_loop(
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    if line == "/ping_ack" || line == "$$ping$$" {
-                        continue;
-                    }
-
-                    let Some(plain) = server_open(&line) else {
+                    let Some(plain) = transport_open_line(&read_transport, &line) else {
                         continue;
                     };
+
+                    if should_drop_transport_control_message(&plain) {
+                        continue;
+                    }
 
                     if let Some(packet_id) = parse_ack_line(&plain) {
                         read_ack_registry.mark_acked(packet_id).await;
@@ -251,6 +255,8 @@ pub async fn chat_loop(
                             &mut writer,
                             &text,
                             &net_tx,
+                            &room_crypto,
+                            transport.clone(),
                             ack_registry.clone(),
                             invite_registry.clone(),
                             &mut pending_uploads,
@@ -269,6 +275,8 @@ pub async fn chat_loop(
                 pump_attachment_upload(
                     &mut writer,
                     &net_tx,
+                    &room_crypto,
+                    transport.clone(),
                     ack_registry.clone(),
                     &mut pending_uploads,
                     &mut active_upload,
@@ -276,7 +284,11 @@ pub async fn chat_loop(
             }
 
             _ = hb.tick() => {
-                if writer.write_all(b"$$ping$$\n").await.is_err() {
+                let ping_cipher = match transport_seal_line(&transport, "/ping") {
+                    Some(line) => line,
+                    None => break,
+                };
+                if write_cipher_line(&mut writer, &ping_cipher).await.is_err() {
                     break;
                 }
             }
@@ -291,6 +303,8 @@ async fn handle_outgoing_input(
     writer: &mut OwnedWriteHalf,
     text: &str,
     net_tx: &UnboundedSender<String>,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     invite_registry: Arc<InviteRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
@@ -301,13 +315,13 @@ async fn handle_outgoing_input(
     }
 
     if let Some(req) = parse_local_invite_request_line(text) {
-        return handle_invite_request(writer, net_tx, ack_registry, invite_registry, req).await;
+        return handle_invite_request(writer, net_tx, transport, ack_registry, invite_registry, req).await;
     }
 
     match classify_outgoing_input(text)? {
         OutgoingPayload::Text(plain) => {
             let packet_id = packet_id_for_text();
-            send_room_payload_with_ack(writer, &packet_id, &plain, ack_registry).await
+            send_room_payload_with_ack(writer, &packet_id, &plain, room_crypto, transport, ack_registry).await
         }
         OutgoingPayload::AttachmentPath(path) => {
             pending_uploads.push_back(path);
@@ -320,14 +334,14 @@ async fn handle_outgoing_input(
 async fn handle_invite_request(
     writer: &mut OwnedWriteHalf,
     net_tx: &UnboundedSender<String>,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     invite_registry: Arc<InviteRegistry>,
     req: super::utils::LocalInviteRequest,
 ) -> Result<()> {
     let (blob_b64, blob_key_b64) = create_invite_blob(
-        req.server_pwd_hash,
         req.room_id.clone(),
-        req.room_key.clone(),
+        req.room_credential.clone(),
     )?;
     let notify = invite_registry
         .register(
@@ -344,7 +358,15 @@ async fn handle_invite_request(
         &blob_b64,
     );
     let packet_id = packet_id_for_text();
-    if let Err(err) = send_server_payload_with_ack(writer, &packet_id, &server_line, ack_registry).await {
+    if let Err(err) = send_server_payload_with_ack(
+        writer,
+        &packet_id,
+        &server_line,
+        transport,
+        ack_registry,
+    )
+    .await
+    {
         invite_registry.drop_request(&req.request_id).await;
         return Err(err);
     }
@@ -367,8 +389,8 @@ async fn handle_invite_request(
     };
 
     match response {
-        Ok((token, _expires_at)) => {
-            let invite = create_invitation(server_addr, token, blob_key_b64)?;
+        Ok((token_secret_b64, _expires_at)) => {
+            let invite = create_invitation(server_addr, token_secret_b64, blob_key_b64)?;
             net_tx.send(build_local_notice_line(&invite)).ok();
             Ok(())
         }
@@ -392,6 +414,8 @@ async fn wait_for_invite_response(
 async fn pump_attachment_upload(
     writer: &mut OwnedWriteHalf,
     net_tx: &UnboundedSender<String>,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
     active_upload: &mut Option<AttachmentJob>,
@@ -438,7 +462,16 @@ async fn pump_attachment_upload(
             &job.sha256_hex,
         );
         let packet_id = packet_id_for_attachment_meta(&job.transfer_id);
-        match send_room_payload_with_ack(writer, &packet_id, &meta_line, ack_registry.clone()).await {
+        match send_room_payload_with_ack(
+            writer,
+            &packet_id,
+            &meta_line,
+            room_crypto,
+            transport.clone(),
+            ack_registry.clone(),
+        )
+        .await
+        {
             Ok(_) => {
                 job.meta_sent = true;
                 if job.total_chunks == 0 {
@@ -456,7 +489,16 @@ async fn pump_attachment_upload(
         return;
     }
 
-    if let Err(err) = process_attachment_window(writer, net_tx, ack_registry.clone(), job).await {
+    if let Err(err) = process_attachment_window(
+        writer,
+        net_tx,
+        room_crypto,
+        transport,
+        ack_registry.clone(),
+        job,
+    )
+    .await
+    {
         cleanup_attachment_window(ack_registry.clone(), job).await;
         net_tx
             .send(build_local_transfer_failed_line(
@@ -480,6 +522,8 @@ async fn pump_attachment_upload(
 async fn process_attachment_window(
     writer: &mut OwnedWriteHalf,
     net_tx: &UnboundedSender<String>,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     job: &mut AttachmentJob,
 ) -> Result<()> {
@@ -517,6 +561,8 @@ async fn process_attachment_window(
                 writer,
                 &job.in_flight[idx].packet_id,
                 &job.in_flight[idx].chunk_line,
+                room_crypto,
+                transport.clone(),
             )
             .await?;
             job.in_flight[idx].attempts += 1;
@@ -539,7 +585,7 @@ async fn process_attachment_window(
 
         let chunk_line = build_attachment_chunk_line(&job.transfer_id, chunk_index, &buf[..read]);
         let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, chunk_index);
-        send_room_payload_now(writer, &packet_id, &chunk_line).await?;
+        send_room_payload_now(writer, &packet_id, &chunk_line, room_crypto, transport.clone()).await?;
         job.in_flight.push(InFlightChunk {
             packet_id,
             chunk_line,
@@ -594,38 +640,45 @@ async fn send_room_payload_with_ack(
     writer: &mut OwnedWriteHalf,
     packet_id: &str,
     plain: &str,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
 ) -> Result<()> {
-    let room_cipher = seal(plain);
-    send_transport_payload_with_ack(writer, packet_id, &room_cipher, ack_registry).await
+    let room_cipher = room_crypto.seal(plain);
+    send_transport_payload_with_ack(writer, packet_id, &room_cipher, transport, ack_registry).await
 }
 
 async fn send_room_payload_now(
     writer: &mut OwnedWriteHalf,
     packet_id: &str,
     plain: &str,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
 ) -> Result<()> {
-    let room_cipher = seal(plain);
-    send_transport_payload_now(writer, packet_id, &room_cipher).await
+    let room_cipher = room_crypto.seal(plain);
+    send_transport_payload_now(writer, packet_id, &room_cipher, transport).await
 }
 
 async fn send_server_payload_with_ack(
     writer: &mut OwnedWriteHalf,
     packet_id: &str,
     plain: &str,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
 ) -> Result<()> {
-    send_transport_payload_with_ack(writer, packet_id, plain, ack_registry).await
+    send_transport_payload_with_ack(writer, packet_id, plain, transport, ack_registry).await
 }
 
 async fn send_transport_payload_with_ack(
     writer: &mut OwnedWriteHalf,
     packet_id: &str,
     payload: &str,
+    transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
 ) -> Result<()> {
     let transport_line = build_transport_packet_line(packet_id, payload);
-    let cipher_line = server_seal(transport_line);
+    let cipher_line = transport_seal_line(&transport, &transport_line)
+        .ok_or_else(|| anyhow!("Transport state unavailable"))?;
     let timeout_duration = Duration::from_millis(PACKET_ACK_TIMEOUT_MS);
 
     for _attempt in 0..=PACKET_RETRY_LIMIT {
@@ -653,9 +706,11 @@ async fn send_transport_payload_now(
     writer: &mut OwnedWriteHalf,
     packet_id: &str,
     payload: &str,
+    transport: SharedTransportCrypto,
 ) -> Result<()> {
     let transport_line = build_transport_packet_line(packet_id, payload);
-    let cipher_line = server_seal(transport_line);
+    let cipher_line = transport_seal_line(&transport, &transport_line)
+        .ok_or_else(|| anyhow!("Transport state unavailable"))?;
     write_cipher_line(writer, &cipher_line).await
 }
 
@@ -688,4 +743,22 @@ async fn hash_file(path: &Path) -> Result<String> {
     }
 
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn transport_open_line(transport: &SharedTransportCrypto, cipher_line: &str) -> Option<String> {
+    let mut guard = transport.lock().ok()?;
+    guard.open(cipher_line)
+}
+
+fn transport_seal_line(transport: &SharedTransportCrypto, plain: &str) -> Option<String> {
+    let mut guard = transport.lock().ok()?;
+    Some(guard.seal(plain))
+}
+
+fn should_drop_transport_control_message(plain: &str) -> bool {
+    plain == "/ping_ack"
+        || plain == "/ping"
+        || plain == "OK"
+        || plain.starts_with("OK ")
+        || plain.starts_with("INVITE_OK ")
 }

@@ -5,7 +5,7 @@ pub mod app_config;
 
 #[cfg(test)]
 mod tests {
-    use crate::client::crypto::{open, seal, set_room_key};
+    use crate::client::crypto::RoomCryptoState;
     use crate::client::notifier;
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
@@ -61,17 +61,15 @@ mod tests {
 
     #[test]
     fn test_room_cipher_round_trip() {
-        set_room_key("00112233445566778899aabbccddeeff");
-        let cipher = seal("hello room");
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let cipher = room_crypto.seal("hello room");
         assert!(cipher.starts_with("ENC:"));
-        assert_eq!(open(&cipher).as_deref(), Some("hello room"));
+        assert_eq!(room_crypto.open(&cipher).as_deref(), Some("hello room"));
     }
 
     #[test]
     fn test_invite_round_trip() {
-        let server_hash = [7u8; 32];
         let (blob_b64, blob_key_b64) = create_invite_blob(
-            server_hash,
             "room-a".to_string(),
             "room-password".to_string(),
         )
@@ -85,12 +83,11 @@ mod tests {
 
         let (server, token, parsed_blob_key) =
             parse_invitation(&invite).expect("invite should parse");
-        let (parsed_hash, room_id, room_key) =
+        let (room_id, room_credential) =
             open_invite_blob(&blob_b64, &parsed_blob_key).expect("invite blob should open");
         assert_eq!(server, "127.0.0.1:6655");
-        assert_eq!(parsed_hash, server_hash);
         assert_eq!(room_id, "room-a");
-        assert_eq!(room_key, "room-password");
+        assert_eq!(room_credential, "room-password");
         assert_eq!(token, "invite-token-123");
         assert_eq!(parsed_blob_key, blob_key_b64);
     }
@@ -99,16 +96,14 @@ mod tests {
     fn test_local_invite_request_round_trip_with_empty_room_key() {
         let line = build_local_invite_request_line(
             "127.0.0.1:6655",
-            [9u8; 32],
             "Public",
             "",
             "owner-cap-1",
         );
         let parsed = parse_local_invite_request_line(&line).expect("request should parse");
         assert_eq!(parsed.server_addr, "127.0.0.1:6655");
-        assert_eq!(parsed.server_pwd_hash, [9u8; 32]);
         assert_eq!(parsed.room_id, "Public");
-        assert_eq!(parsed.room_key, "");
+        assert_eq!(parsed.room_credential, "");
         assert_eq!(parsed.owner_capability, "owner-cap-1");
     }
 

@@ -21,7 +21,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::crypto::{open, server_seal};
+use super::crypto::RoomCryptoState;
 use super::receiver::{AttachmentKind, ChatMessage, TransferStage};
 
 pub const HELP_TEXT: &str = r#"快捷键与命令说明：
@@ -58,12 +58,12 @@ pub const INVITE_TTL_SECS: i64 = 600;
 const EMPTY_FIELD_SENTINEL: &str = "~";
 
 pub fn handshake_writeall_macro(line: String) -> Vec<u8> {
-    let mut buf = server_seal(line).into_bytes();
+    let mut buf = line.into_bytes();
     buf.push(b'\n');
     buf
 }
 
-pub fn parse_text_img(line: &str) -> (String, String) {
+pub fn parse_text_img(line: &str, room_crypto: &RoomCryptoState) -> (String, String) {
     let (name, after_name) = if let Some(start) = line.find('[') {
         if let Some(end_rel) = line[start + 1..].find(']') {
             let end = start + 1 + end_rel;
@@ -78,7 +78,9 @@ pub fn parse_text_img(line: &str) -> (String, String) {
     };
 
     let body_slice = after_name.trim_start();
-    let body_plain = open(body_slice).unwrap_or_else(|| body_slice.to_owned());
+    let body_plain = room_crypto
+        .open(body_slice)
+        .unwrap_or_else(|| body_slice.to_owned());
 
     (name, body_plain)
 }
@@ -112,9 +114,7 @@ pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
                 ("??:??:??".into(), after_name)
             };
 
-            let body_slice = after_time.trim_start();
-            let body_plain = open(body_slice).unwrap_or_else(|| body_slice.to_owned());
-
+            let body_plain = after_time.trim_start().to_owned();
             (name, time, body_plain)
         }
         ChatMessage::Attachment {
@@ -403,20 +403,18 @@ fn decode_optional_url_field(value: &str) -> Option<String> {
 
 pub fn build_local_invite_request_line(
     server_addr: &str,
-    server_pwd_hash: [u8; 32],
     room_id: &str,
-    room_key: &str,
+    room_credential: &str,
     owner_capability: &str,
 ) -> String {
     let request_id = Uuid::new_v4().simple().to_string();
     let server_b64 = encode_optional_url_field(server_addr);
     let room_b64 = URL_SAFE_NO_PAD.encode(room_id.as_bytes());
-    let room_key_b64 = encode_optional_url_field(room_key);
+    let room_credential_b64 = encode_optional_url_field(room_credential);
     let owner_b64 = URL_SAFE_NO_PAD.encode(owner_capability.as_bytes());
-    let server_hash_hex = hex::encode(server_pwd_hash);
 
     format!(
-        "/LOCALINVITE REQUEST {request_id} {server_b64} {server_hash_hex} {room_b64} {room_key_b64} {owner_b64}"
+        "/LOCALINVITE REQUEST {request_id} {server_b64} {room_b64} {room_credential_b64} {owner_b64}"
     )
 }
 
@@ -424,9 +422,8 @@ pub fn build_local_invite_request_line(
 pub struct LocalInviteRequest {
     pub request_id: String,
     pub server_addr: String,
-    pub server_pwd_hash: [u8; 32],
     pub room_id: String,
-    pub room_key: String,
+    pub room_credential: String,
     pub owner_capability: String,
 }
 
@@ -438,18 +435,15 @@ pub fn parse_local_invite_request_line(line: &str) -> Option<LocalInviteRequest>
 
     let request_id = parts.next()?.to_string();
     let server_addr = decode_optional_url_field(parts.next()?)?;
-    let mut server_pwd_hash = [0u8; 32];
-    hex::decode_to_slice(parts.next()?, &mut server_pwd_hash).ok()?;
     let room_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
-    let room_key = decode_optional_url_field(parts.next()?)?;
+    let room_credential = decode_optional_url_field(parts.next()?)?;
     let owner_capability = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
 
     Some(LocalInviteRequest {
         request_id,
         server_addr,
-        server_pwd_hash,
         room_id,
-        room_key,
+        room_credential,
         owner_capability,
     })
 }
@@ -491,9 +485,8 @@ pub fn parse_server_invite_request_line(line: &str) -> Option<ServerInviteReques
     })
 }
 
-pub fn build_invite_token_line(request_id: &str, token: &str, expires_at: i64) -> String {
-    let token_b64 = URL_SAFE_NO_PAD.encode(token.as_bytes());
-    format!("/INVITE_TOKEN {request_id} {token_b64} {expires_at}")
+pub fn build_invite_token_line(request_id: &str, token_secret_b64: &str, expires_at: i64) -> String {
+    format!("/INVITE_TOKEN {request_id} {token_secret_b64} {expires_at}")
 }
 
 pub fn parse_invite_token_line(line: &str) -> Option<(String, String, i64)> {
@@ -503,9 +496,9 @@ pub fn parse_invite_token_line(line: &str) -> Option<(String, String, i64)> {
     }
 
     let request_id = parts.next()?.to_string();
-    let token = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let token_secret_b64 = parts.next()?.to_string();
     let expires_at = parts.next()?.parse().ok()?;
-    Some((request_id, token, expires_at))
+    Some((request_id, token_secret_b64, expires_at))
 }
 
 pub fn build_invite_error_line(request_id: &str, reason: &str) -> String {
@@ -524,28 +517,96 @@ pub fn parse_invite_error_line(line: &str) -> Option<(String, String)> {
     Some((request_id, reason))
 }
 
-pub fn build_invite_fetch_line(token: &str) -> String {
-    let token_b64 = URL_SAFE_NO_PAD.encode(token.as_bytes());
-    format!("/INVITE_FETCH {token_b64}")
+pub fn build_auth_hello_line(client_nonce_hex: &str) -> String {
+    format!("/AUTH_HELLO {client_nonce_hex}")
 }
 
-pub fn parse_invite_fetch_line(line: &str) -> Option<String> {
+pub fn parse_auth_hello_line(line: &str) -> Option<String> {
+    line.strip_prefix("/AUTH_HELLO ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn build_auth_challenge_line(server_nonce_hex: &str) -> String {
+    format!("/AUTH_CHALLENGE {server_nonce_hex}")
+}
+
+pub fn parse_auth_challenge_line(line: &str) -> Option<String> {
+    line.strip_prefix("/AUTH_CHALLENGE ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn build_auth_proof_line(proof_hex: &str) -> String {
+    format!("/AUTH_PROOF {proof_hex}")
+}
+
+pub fn parse_auth_proof_line(line: &str) -> Option<String> {
+    line.strip_prefix("/AUTH_PROOF ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn build_invite_hello_line(token_id_hex: &str, client_nonce_hex: &str) -> String {
+    format!("/INVITE_HELLO {token_id_hex} {client_nonce_hex}")
+}
+
+pub fn parse_invite_hello_line(line: &str) -> Option<(String, String)> {
     let mut parts = line.split_whitespace();
-    if parts.next()? != "/INVITE_FETCH" {
+    if parts.next()? != "/INVITE_HELLO" {
         return None;
     }
-    String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()
+    Some((parts.next()?.to_string(), parts.next()?.to_string()))
 }
 
-pub fn build_invite_blob_line(blob_b64: &str) -> String {
-    format!("/INVITE_BLOB {blob_b64}")
+pub fn build_invite_challenge_line(server_nonce_hex: &str) -> String {
+    format!("/INVITE_CHALLENGE {server_nonce_hex}")
 }
 
-pub fn parse_invite_blob_line(line: &str) -> Option<String> {
-    line.strip_prefix("/INVITE_BLOB ")
+pub fn parse_invite_challenge_line(line: &str) -> Option<String> {
+    line.strip_prefix("/INVITE_CHALLENGE ")
         .map(str::trim)
-        .filter(|blob| !blob.is_empty())
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+pub fn build_invite_proof_line(proof_hex: &str) -> String {
+    format!("/INVITE_PROOF {proof_hex}")
+}
+
+pub fn parse_invite_proof_line(line: &str) -> Option<String> {
+    line.strip_prefix("/INVITE_PROOF ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub fn build_invite_ok_line(room_id: &str, blob_b64: &str) -> String {
+    let room_b64 = URL_SAFE_NO_PAD.encode(room_id.as_bytes());
+    format!("INVITE_OK {room_b64} {blob_b64}")
+}
+
+pub fn parse_invite_ok_line(line: &str) -> Option<(String, String)> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "INVITE_OK" {
+        return None;
+    }
+    let room_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let blob_b64 = parts.next()?.to_string();
+    Some((room_id, blob_b64))
+}
+
+pub fn build_invite_ready_line(nickname: &str) -> String {
+    let nickname_b64 = URL_SAFE_NO_PAD.encode(nickname.as_bytes());
+    format!("/INVITE_READY {nickname_b64}")
+}
+
+pub fn parse_invite_ready_line(line: &str) -> Option<String> {
+    let encoded = line.strip_prefix("/INVITE_READY ")?;
+    String::from_utf8(URL_SAFE_NO_PAD.decode(encoded.trim()).ok()?).ok()
 }
 
 pub fn parse_local_ui_event(line: &str) -> Option<LocalUiEvent> {
@@ -743,15 +804,13 @@ pub fn parse_clipboard_file_paths(text: &str) -> Option<Vec<PathBuf>> {
 
 #[derive(Serialize, Deserialize)]
 struct InvitePayload {
-    server_pwd_hash: [u8; 32],
     room_id: String,
-    room_key: String,
+    room_credential: String,
 }
 
 pub fn create_invite_blob(
-    server_pwd_hash: [u8; 32],
     room_id: String,
-    room_key: String,
+    room_credential: String,
 ) -> Result<(String, String)> {
     let mut nonce = [0u8; 12];
     let mut blob_key = [0u8; 16];
@@ -759,9 +818,8 @@ pub fn create_invite_blob(
     rand::rng().fill_bytes(&mut blob_key);
 
     let payload = InvitePayload {
-        server_pwd_hash,
         room_id,
-        room_key,
+        room_credential,
     };
 
     let key_bytes = Sha256::digest(blob_key);
@@ -779,7 +837,7 @@ pub fn create_invite_blob(
     ))
 }
 
-pub fn open_invite_blob(blob_b64: &str, blob_key_b64: &str) -> Option<([u8; 32], String, String)> {
+pub fn open_invite_blob(blob_b64: &str, blob_key_b64: &str) -> Option<(String, String)> {
     let bytes = URL_SAFE_NO_PAD.decode(blob_b64).ok()?;
     let blob_key = URL_SAFE_NO_PAD.decode(blob_key_b64).ok()?;
 
@@ -793,7 +851,7 @@ pub fn open_invite_blob(blob_b64: &str, blob_key_b64: &str) -> Option<([u8; 32],
     let plain = cipher.decrypt(Nonce::from_slice(nonce), cipher_bytes).ok()?;
 
     serde_json::from_slice::<InvitePayload>(&plain)
-        .map(|payload| (payload.server_pwd_hash, payload.room_id, payload.room_key))
+        .map(|payload| (payload.room_id, payload.room_credential))
         .ok()
 }
 

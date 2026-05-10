@@ -13,6 +13,7 @@ use crate::client::utils::{
 };
 
 use super::attachment_store::AttachmentStore;
+use super::crypto::RoomCryptoState;
 use super::notifier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,12 +177,17 @@ pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<ChatMessage>,
     my_name: &str,
+    room_crypto: &RoomCryptoState,
     attachment_store: &AttachmentStore,
     members: &mut Vec<String>,
     receiver_state: &mut ReceiverState,
     transfer_ui_state: &mut TransferUiState,
 ) {
     while let Ok(line) = net_rx.try_recv() {
+        if should_drop_unframed_control_line(&line) {
+            continue;
+        }
+
         if line.starts_with("/member_list ") {
             members.clear();
             members.extend(
@@ -202,7 +208,7 @@ pub fn drain_messages(
             continue;
         }
 
-        let (sender, body) = parse_text_img(&line);
+        let (sender, body) = parse_text_img(&line, room_crypto);
         let hms = Local::now().format("%H:%M:%S").to_string();
 
         let result = match parse_attachment_frame(&body) {
@@ -215,7 +221,7 @@ pub fn drain_messages(
             None if body.starts_with("/IMGDATA") => {
                 Ok(decode_legacy_image(&sender, &body, attachment_store, &hms))
             }
-            None => Ok(Some(ChatMessage::Text(format_text_message(&line, &hms)))),
+            None => Ok(Some(ChatMessage::Text(format_text_message(&sender, &body, &hms)))),
         };
 
         let Some(message) = (match result {
@@ -363,13 +369,8 @@ fn decode_legacy_image(
     })
 }
 
-fn format_text_message(line: &str, hms: &str) -> String {
-    if let Some(pos) = line.find(']') {
-        let (left, right) = line.split_at(pos + 1);
-        format!("{} [{}]{}", left, hms, right)
-    } else {
-        format!("[{}] {}", hms, line)
-    }
+fn format_text_message(sender: &str, body: &str, hms: &str) -> String {
+    format!("[{sender}] [{hms}] {body}")
 }
 
 fn push_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
@@ -378,4 +379,14 @@ fn push_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {
     if messages.len() > 500 {
         messages.drain(..100);
     }
+}
+
+fn should_drop_unframed_control_line(line: &str) -> bool {
+    !line.starts_with('[')
+        && (line == "/ping_ack"
+            || line == "/ping"
+            || line == "OK"
+            || line.starts_with("OK ")
+            || line.starts_with("/ACK ")
+            || line.starts_with("INVITE_OK "))
 }

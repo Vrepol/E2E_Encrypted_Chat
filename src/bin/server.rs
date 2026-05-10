@@ -1,15 +1,21 @@
 use anyhow::Result;
+use base64::Engine;
 use clap::Parser;
 use futures_util::FutureExt;
 use once_cell::sync::OnceCell;
-use rand::{distr::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, Rng, RngCore};
 use rust_chat::app_config::{DEFAULT_SERVER_PASSWORD, DEFAULT_SERVER_PORT};
 use rust_chat::client::{
-    crypto::{dec_auth, pwd_hash, server_open, server_seal},
+    crypto::{
+        compute_invite_proof, compute_password_auth_proof, compute_invite_token_id,
+        derive_invite_transport_key, derive_password_transport_key, pwd_hash, TransportCrypto,
+    },
     utils::{
-        build_ack_line, build_invite_blob_line, build_invite_error_line, build_invite_token_line,
-        handshake_writeall_macro, parse_invite_fetch_line, parse_server_invite_request_line,
-        parse_transport_packet_line, INVITE_TTL_SECS,
+        build_ack_line, build_auth_challenge_line, build_invite_challenge_line,
+        build_invite_error_line, build_invite_ok_line, build_invite_token_line,
+        handshake_writeall_macro, parse_auth_hello_line, parse_auth_proof_line,
+        parse_invite_hello_line, parse_invite_proof_line, parse_invite_ready_line,
+        parse_server_invite_request_line, parse_transport_packet_line, INVITE_TTL_SECS,
     },
 };
 use std::{
@@ -32,21 +38,37 @@ struct Args {
 }
 
 static SERVER_PWD_HASH: OnceCell<[u8; 32]> = OnceCell::new();
+const INVITE_PENDING_TTL_SECS: i64 = 30;
+
+#[derive(Clone, Debug)]
+enum ServerEvent {
+    Plain(String),
+}
 
 struct RoomInfo {
-    tx: broadcast::Sender<String>,
-    credential: String,
+    tx: broadcast::Sender<ServerEvent>,
+    join_credential: String,
     members: HashSet<String>,
     owner_nickname: Option<String>,
     owner_capability: Option<String>,
 }
 
+enum InviteUseState {
+    Unused,
+    Pending {
+        client_nonce: [u8; 32],
+        server_nonce: [u8; 32],
+        pending_until: i64,
+    },
+    Used,
+}
+
 struct InviteTokenInfo {
     room_id: String,
-    credential: String,
     expires_at: i64,
-    used: bool,
     blob_b64: String,
+    token_secret: [u8; 32],
+    state: InviteUseState,
 }
 
 type Rooms = Arc<Mutex<HashMap<String, RoomInfo>>>;
@@ -56,13 +78,14 @@ struct RoomGuard {
     rooms: Rooms,
     room_id: String,
     nickname: String,
-    tx: broadcast::Sender<String>,
+    tx: broadcast::Sender<ServerEvent>,
 }
 
 impl Drop for RoomGuard {
     fn drop(&mut self) {
-        let server_enc = server_seal(format!("⚡ [{}] left.", self.nickname));
-        let _ = self.tx.send(format!("{}\n", server_enc));
+        let _ = self
+            .tx
+            .send(ServerEvent::Plain(format!("⚡ [{}] left.", self.nickname)));
 
         let mut map = self.rooms.lock().unwrap();
         if let Some(info) = map.get_mut(&self.room_id) {
@@ -81,15 +104,15 @@ impl Drop for RoomGuard {
 
 fn broadcast_member_list(info: &RoomInfo) {
     let names: Vec<_> = info.members.iter().cloned().collect();
-    let cipher = server_seal(format!("/member_list {}", names.join(",")));
-    let _ = info.tx.send(format!("{}\n", cipher));
+    let _ = info
+        .tx
+        .send(ServerEvent::Plain(format!("/member_list {}", names.join(","))));
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
     SERVER_PWD_HASH.set(pwd_hash(&args.password)).unwrap();
-    rust_chat::client::crypto::set_server_key(pwd_hash(&args.password));
 
     let bind_addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -128,35 +151,55 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
         None => return Ok(()),
     };
 
-    let enc_line = if let Some(token) = parse_invite_fetch_line(&first_line) {
-        let response = fetch_invite_blob(&invites, &token)
-            .unwrap_or_else(|| "ERR InviteInvalid".to_string());
-        writer.write_all(format!("{response}\n").as_bytes()).await?;
-        match lines.next_line().await? {
-            Some(line) => line.trim_end().to_owned(),
-            None => return Ok(()),
-        }
-    } else {
-        first_line
-    };
+    if let Some(client_nonce_hex) = parse_auth_hello_line(&first_line) {
+        let client_nonce = decode_hex_32(&client_nonce_hex)?;
+        return handle_password_client(lines, &mut writer, rooms, invites, client_nonce).await;
+    }
 
-    let auth_line = match server_open(&enc_line) {
-        Some(line) => line,
+    if let Some((token_id_hex, client_nonce_hex)) = parse_invite_hello_line(&first_line) {
+        let token_id = decode_hex_32(&token_id_hex)?;
+        let client_nonce = decode_hex_32(&client_nonce_hex)?;
+        return handle_invite_client(lines, &mut writer, rooms, invites, token_id, client_nonce).await;
+    }
+
+    writer.write_all(b"ERR NeedHandshake\n").await?;
+    Ok(())
+}
+
+async fn handle_password_client(
+    mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    rooms: Rooms,
+    invites: Invites,
+    client_nonce: [u8; 32],
+) -> Result<()> {
+    let server_nonce = random_nonce32();
+    writer
+        .write_all(handshake_writeall_macro(build_auth_challenge_line(&hex::encode(server_nonce))).as_slice())
+        .await?;
+
+    let proof_line = match lines.next_line().await? {
+        Some(line) => line.trim_end().to_owned(),
+        None => return Ok(()),
+    };
+    let proof_hex = match parse_auth_proof_line(&proof_line) {
+        Some(value) => value,
         None => {
-            writer.write_all(b"ERR NeedAUTH\n").await?;
+            writer.write_all(b"ERR NeedAuthProof\n").await?;
             return Ok(());
         }
     };
-    if !auth_line.starts_with("AUTH ") {
-        writer.write_all(b"ERR NeedAUTH\n").await?;
-        return Ok(());
-    }
-    let auth_ok = dec_auth(&auth_line[5..], SERVER_PWD_HASH.get().unwrap());
-    if !auth_ok {
+    let proof = decode_hex_32(&proof_hex)?;
+    let expected = compute_password_auth_proof(SERVER_PWD_HASH.get().unwrap(), &client_nonce, &server_nonce);
+    if proof != expected {
         writer.write_all(b"ERR BadAuth\n").await?;
         return Ok(());
     }
-    writer.write_all(&handshake_writeall_macro("OK".to_string())).await?;
+
+    let transport_key =
+        derive_password_transport_key(SERVER_PWD_HASH.get().unwrap(), &client_nonce, &server_nonce);
+    let mut transport = TransportCrypto::new(transport_key);
+    write_transport_plain(writer, &mut transport, "OK").await?;
 
     let room_line = {
         let map = rooms.lock().unwrap();
@@ -165,35 +208,181 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
             line.push(' ');
             line.push_str(id);
         }
-        line.push('\n');
         line
     };
-    writer.write_all(server_seal(room_line).as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    write_transport_plain(writer, &mut transport, &room_line).await?;
 
-    let cmd = match lines.next_line().await? {
+    let cmd_cipher = match lines.next_line().await? {
         Some(c) => c.trim_end().to_owned(),
         None => return Ok(()),
     };
-    let cmd = server_open(&cmd).unwrap_or(cmd);
+    let cmd = match transport.open(&cmd_cipher) {
+        Some(value) => value,
+        None => {
+            write_transport_plain(writer, &mut transport, "ERR InvalidCmd").await?;
+            return Ok(());
+        }
+    };
+
+    let handshake = match parse_join_command(&rooms, &cmd) {
+        Ok(Some(handshake)) => handshake,
+        Ok(None) => {
+            write_transport_plain(writer, &mut transport, "ERR InvalidCmd").await?;
+            return Ok(());
+        }
+        Err(reason) => {
+            write_transport_plain(writer, &mut transport, &format!("ERR {reason}")).await?;
+            return Ok(());
+        }
+    };
+
+    enter_room_loop(lines, writer, rooms, invites, transport, handshake).await
+}
+
+async fn handle_invite_client(
+    mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    rooms: Rooms,
+    invites: Invites,
+    token_id: [u8; 32],
+    client_nonce: [u8; 32],
+) -> Result<()> {
+    let token_id_hex = hex::encode(token_id);
+    let now = chrono::Utc::now().timestamp();
+    let invite_prep = {
+        let mut invites_map = invites.lock().unwrap();
+        normalize_invites(&mut invites_map, now);
+        match invites_map.get_mut(&token_id_hex) {
+            Some(info) => match info.state {
+                InviteUseState::Unused => {
+                    let server_nonce = random_nonce32();
+                    let token_secret = info.token_secret;
+                    let room_id = info.room_id.clone();
+                    let blob_b64 = info.blob_b64.clone();
+                    info.state = InviteUseState::Pending {
+                        client_nonce,
+                        server_nonce,
+                        pending_until: now + INVITE_PENDING_TTL_SECS,
+                    };
+                    Some((server_nonce, token_secret, room_id, blob_b64))
+                }
+                _ => None,
+            },
+            None => None,
+        }
+    };
+    let Some((server_nonce, token_secret, room_id, blob_b64)) = invite_prep else {
+        writer.write_all(b"ERR InviteInvalid\n").await?;
+        return Ok(());
+    };
+
+    writer
+        .write_all(
+            handshake_writeall_macro(build_invite_challenge_line(&hex::encode(server_nonce))).as_slice(),
+        )
+        .await?;
+
+    let proof_line = match lines.next_line().await? {
+        Some(line) => line.trim_end().to_owned(),
+        None => {
+            reset_invite_to_unused(&invites, &token_id_hex);
+            return Ok(());
+        }
+    };
+    let proof_hex = match parse_invite_proof_line(&proof_line) {
+        Some(value) => value,
+        None => {
+            reset_invite_to_unused(&invites, &token_id_hex);
+            writer.write_all(b"ERR NeedInviteProof\n").await?;
+            return Ok(());
+        }
+    };
+    let proof = decode_hex_32(&proof_hex)?;
+    let expected = compute_invite_proof(&token_secret, &token_id, &client_nonce, &server_nonce);
+    if proof != expected {
+        reset_invite_to_unused(&invites, &token_id_hex);
+        writer.write_all(b"ERR InviteInvalid\n").await?;
+        return Ok(());
+    }
+
+    let transport_key = derive_invite_transport_key(&token_secret, &token_id, &client_nonce, &server_nonce);
+    let mut transport = TransportCrypto::new(transport_key);
+    write_transport_plain(writer, &mut transport, &build_invite_ok_line(&room_id, &blob_b64)).await?;
+
+    let ready_cipher = match lines.next_line().await? {
+        Some(line) => line.trim_end().to_owned(),
+        None => {
+            reset_invite_to_unused(&invites, &token_id_hex);
+            return Ok(());
+        }
+    };
+    let ready_plain = match transport.open(&ready_cipher) {
+        Some(value) => value,
+        None => {
+            reset_invite_to_unused(&invites, &token_id_hex);
+            return Ok(());
+        }
+    };
+    let nickname = match parse_invite_ready_line(&ready_plain) {
+        Some(value) => value,
+        None => {
+            reset_invite_to_unused(&invites, &token_id_hex);
+            return Ok(());
+        }
+    };
+
+    let invite_ok = consume_invite_ready(&invites, &token_id_hex, &client_nonce, &server_nonce);
+    if !invite_ok {
+        write_transport_plain(writer, &mut transport, "ERR InviteInvalid").await?;
+        return Ok(());
+    }
+
+    let tx = match {
+        let mut map = rooms.lock().unwrap();
+        if let Some(info) = map.get_mut(&room_id) {
+            info.members.insert(nickname.clone());
+            Some(info.tx.clone())
+        } else {
+            None
+        }
+    } {
+        Some(tx) => tx,
+        None => {
+            write_transport_plain(writer, &mut transport, "ERR NoSuchRoom").await?;
+            return Ok(());
+        }
+    };
+
+    write_transport_plain(writer, &mut transport, "OK").await?;
+    let handshake = RoomHandshake::Join {
+        room_id,
+        nickname,
+        tx,
+        owner_capability: None,
+    };
+    enter_room_loop(lines, writer, rooms, invites, transport, handshake).await
+}
+
+enum RoomHandshake {
+    Create {
+        room_id: String,
+        nickname: String,
+        tx: broadcast::Sender<ServerEvent>,
+        owner_capability: Option<String>,
+    },
+    Join {
+        room_id: String,
+        nickname: String,
+        tx: broadcast::Sender<ServerEvent>,
+        owner_capability: Option<String>,
+    },
+}
+
+fn parse_join_command(rooms: &Rooms, cmd: &str) -> Result<Option<RoomHandshake>, &'static str> {
     let mut parts = cmd.split_whitespace();
     let action = parts.next().unwrap_or_default();
 
-    enum Handshake {
-        Create {
-            room_id: String,
-            nickname: String,
-            tx: broadcast::Sender<String>,
-            owner_capability: String,
-        },
-        Join {
-            room_id: String,
-            nickname: String,
-            tx: broadcast::Sender<String>,
-        },
-    }
-
-    let handshake: Result<Option<Handshake>, &'static str> = match action {
+    match action {
         "CREATE" => {
             let room_id = parts.next().unwrap_or_default().to_string();
             let cred = parts.next().unwrap_or_default().to_string();
@@ -210,25 +399,25 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
                         .take(32)
                         .map(char::from)
                         .collect();
-                    let (tx, _) = broadcast::channel::<String>(500);
+                    let (tx, _) = broadcast::channel::<ServerEvent>(500);
                     let mut set = HashSet::new();
                     set.insert(nickname.clone());
                     map.insert(
                         room_id.clone(),
                         RoomInfo {
                             tx: tx.clone(),
-                            credential: cred,
+                            join_credential: cred,
                             members: set,
                             owner_nickname: Some(nickname.clone()),
                             owner_capability: Some(owner_capability.clone()),
                         },
                     );
 
-                    Ok(Some(Handshake::Create {
+                    Ok(Some(RoomHandshake::Create {
                         room_id,
                         nickname,
                         tx,
-                        owner_capability,
+                        owner_capability: Some(owner_capability),
                     }))
                 }
             }
@@ -243,7 +432,7 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
                 match {
                     let mut map = rooms.lock().unwrap();
                     if let Some(info) = map.get_mut(&room_id) {
-                        if info.credential != cred {
+                        if info.join_credential != cred {
                             Err("BadCredential")
                         } else {
                             info.members.insert(nickname.clone());
@@ -253,93 +442,50 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
                         Err("NoSuchRoom")
                     }
                 } {
-                    Ok(tx) => Ok(Some(Handshake::Join {
+                    Ok(tx) => Ok(Some(RoomHandshake::Join {
                         room_id,
                         nickname,
                         tx,
+                        owner_capability: None,
                     })),
                     Err(reason) => Err(reason),
                 }
             }
         }
-        "JOIN_INVITE" => {
-            let room_id = parts.next().unwrap_or_default().to_string();
-            let token = parts.next().unwrap_or_default().to_string();
-            let credential = parts.next().unwrap_or_default().to_string();
-            let nickname = parts.next().unwrap_or_default().to_string();
-            if room_id.is_empty() || token.is_empty() || credential.is_empty() || nickname.is_empty() {
-                Ok(None)
-            } else {
-                let now = chrono::Utc::now().timestamp();
-                let invite_ok = {
-                    let mut invites_map = invites.lock().unwrap();
-                    invites_map.retain(|_, info| !info.used && info.expires_at >= now);
-                    match invites_map.get_mut(&token) {
-                        Some(info)
-                            if !info.used
-                                && info.expires_at >= now
-                                && info.room_id == room_id
-                                && info.credential == credential =>
-                        {
-                            info.used = true;
-                            true
-                        }
-                        _ => false,
-                    }
-                };
+        _ => Err("UnknownAction"),
+    }
+}
 
-                if !invite_ok {
-                    Err("InviteInvalid")
-                } else {
-                    match {
-                        let mut map = rooms.lock().unwrap();
-                        if let Some(info) = map.get_mut(&room_id) {
-                            info.members.insert(nickname.clone());
-                            Ok(info.tx.clone())
-                        } else {
-                            Err("NoSuchRoom")
-                        }
-                    } {
-                        Ok(tx) => Ok(Some(Handshake::Join {
-                            room_id,
-                            nickname,
-                            tx,
-                        })),
-                        Err(reason) => Err(reason),
-                    }
-                }
-            }
-        }
-        _ => {
-            Err("UnknownAction")
-        }
-    };
-
-    let handshake = match handshake {
-        Ok(Some(handshake)) => handshake,
-        Ok(None) => {
-            writer.write_all(b"ERR InvalidCmd\n").await?;
-            return Ok(());
-        }
-        Err(reason) => {
-            return write_error_and_return(&mut writer, reason).await;
-        }
-    };
-
+async fn enter_room_loop(
+    mut lines: tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    rooms: Rooms,
+    invites: Invites,
+    mut transport: TransportCrypto,
+    handshake: RoomHandshake,
+) -> Result<()> {
     let (room_id, nickname, room_tx, owner_capability) = match handshake {
-        Handshake::Create {
+        RoomHandshake::Create {
             room_id,
             nickname,
             tx,
             owner_capability,
         } => {
-            let reply = handshake_writeall_macro(format!("OK OWNER {owner_capability}"));
-            writer.write_all(&reply).await?;
-            (room_id, nickname, tx, Some(owner_capability))
+            if let Some(owner_capability) = owner_capability.as_deref() {
+                write_transport_plain(writer, &mut transport, &format!("OK OWNER {owner_capability}")).await?;
+            } else {
+                write_transport_plain(writer, &mut transport, "OK").await?;
+            }
+            (room_id, nickname, tx, owner_capability)
         }
-        Handshake::Join { room_id, nickname, tx } => {
-            writer.write_all(&handshake_writeall_macro("OK".to_string())).await?;
-            (room_id, nickname, tx, None)
+        RoomHandshake::Join {
+            room_id,
+            nickname,
+            tx,
+            owner_capability,
+        } => {
+            write_transport_plain(writer, &mut transport, "OK").await?;
+            (room_id, nickname, tx, owner_capability)
         }
     };
 
@@ -350,8 +496,7 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
         tx: room_tx.clone(),
     };
 
-    let server_enc = server_seal(format!("⚡ [{}] joined.", nickname));
-    let _ = room_tx.send(format!("{}\n", server_enc));
+    let _ = room_tx.send(ServerEvent::Plain(format!("⚡ [{}] joined.", nickname)));
     let mut room_rx = room_tx.subscribe();
     {
         let map = rooms.lock().unwrap();
@@ -365,15 +510,18 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
             result = lines.next_line() => {
                 match result? {
                     Some(line) => {
-                        if line == "$$ping$$" {
-                            let _ = writer.write_all(b"/ping_ack\n").await;
+                        let Some(server_plain) = transport.open(line.trim_end()) else {
+                            continue;
+                        };
+
+                        if server_plain == "/ping" {
+                            let _ = write_transport_plain(writer, &mut transport, "/ping_ack").await;
                             continue;
                         }
 
-                        let server_plain = server_open(&line).unwrap_or(line);
                         let broadcast_payload = if let Some((packet_id, room_cipher)) = parse_transport_packet_line(&server_plain) {
-                            let ack = handshake_writeall_macro(build_ack_line(&packet_id));
-                            let _ = writer.write_all(&ack).await;
+                            let ack = build_ack_line(&packet_id);
+                            let _ = write_transport_plain(writer, &mut transport, &ack).await;
                             room_cipher
                         } else {
                             server_plain
@@ -388,18 +536,18 @@ async fn handle_client(socket: TcpStream, rooms: Rooms, invites: Invites) -> Res
                                 owner_capability.as_deref(),
                                 inv_req,
                             );
-                            let _ = writer.write_all(&handshake_writeall_macro(response)).await;
+                            let _ = write_transport_plain(writer, &mut transport, &response).await;
                             continue;
                         }
 
-                        let server_enc = server_seal(format!("[{}] {}", nickname, broadcast_payload));
-                        let _ = room_tx.send(format!("{}\n", server_enc));
+                        let _ = room_tx.send(ServerEvent::Plain(format!("[{}] {}", nickname, broadcast_payload)));
                     }
                     None => break,
                 }
             }
-            Ok(msg) = room_rx.recv() => {
-                if writer.write_all(msg.as_bytes()).await.is_err() {
+            Ok(event) = room_rx.recv() => {
+                let ServerEvent::Plain(plain) = event;
+                if write_transport_plain(writer, &mut transport, &plain).await.is_err() {
                     break;
                 }
             }
@@ -421,8 +569,8 @@ fn handle_invite_request(
         return build_invite_error_line(&request.request_id, "RoomMismatch");
     }
 
-    let mut rooms_map = rooms.lock().unwrap();
-    let Some(info) = rooms_map.get_mut(room_id) else {
+    let rooms_map = rooms.lock().unwrap();
+    let Some(info) = rooms_map.get(room_id) else {
         return build_invite_error_line(&request.request_id, "NoSuchRoom");
     };
 
@@ -437,52 +585,92 @@ fn handle_invite_request(
         return build_invite_error_line(&request.request_id, "InviteNotAllowed");
     }
 
-    let token: String = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(40)
-        .map(char::from)
-        .collect();
+    let mut token_secret = [0u8; 32];
+    rand::rng().fill_bytes(&mut token_secret);
+    let token_id = compute_invite_token_id(&token_secret);
+    let token_id_hex = hex::encode(token_id);
+    let token_secret_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_secret);
     let expires_at = chrono::Utc::now().timestamp() + INVITE_TTL_SECS;
-
     drop(rooms_map);
 
     let mut invites_map = invites.lock().unwrap();
     invites_map.insert(
-        token.clone(),
+        token_id_hex,
         InviteTokenInfo {
             room_id: room_id.to_string(),
-            credential: info_credential(rooms, room_id),
             expires_at,
-            used: false,
             blob_b64: request.blob_b64,
+            token_secret,
+            state: InviteUseState::Unused,
         },
     );
 
-    build_invite_token_line(&request.request_id, &token, expires_at)
+    build_invite_token_line(&request.request_id, &token_secret_b64, expires_at)
 }
 
-fn fetch_invite_blob(invites: &Invites, token: &str) -> Option<String> {
+async fn write_transport_plain(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    transport: &mut TransportCrypto,
+    plain: &str,
+) -> Result<()> {
+    let cipher_line = transport.seal(plain);
+    writer.write_all(handshake_writeall_macro(cipher_line).as_slice()).await?;
+    Ok(())
+}
+
+fn normalize_invites(invites_map: &mut HashMap<String, InviteTokenInfo>, now: i64) {
+    invites_map.retain(|_, info| info.expires_at >= now && !matches!(info.state, InviteUseState::Used));
+    for info in invites_map.values_mut() {
+        if let InviteUseState::Pending { pending_until, .. } = info.state {
+            if pending_until < now {
+                info.state = InviteUseState::Unused;
+            }
+        }
+    }
+}
+
+fn reset_invite_to_unused(invites: &Invites, token_id_hex: &str) {
     let now = chrono::Utc::now().timestamp();
     let mut invites_map = invites.lock().unwrap();
-    invites_map.retain(|_, info| !info.used && info.expires_at >= now);
-    let info = invites_map.get(token)?;
-    Some(build_invite_blob_line(&info.blob_b64))
+    normalize_invites(&mut invites_map, now);
+    if let Some(info) = invites_map.get_mut(token_id_hex) {
+        info.state = InviteUseState::Unused;
+    }
 }
 
-fn info_credential(rooms: &Rooms, room_id: &str) -> String {
-    let rooms_map = rooms.lock().unwrap();
-    rooms_map
-        .get(room_id)
-        .map(|info| info.credential.clone())
-        .unwrap_or_default()
+fn consume_invite_ready(
+    invites: &Invites,
+    token_id_hex: &str,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let mut invites_map = invites.lock().unwrap();
+    normalize_invites(&mut invites_map, now);
+    let Some(info) = invites_map.get_mut(token_id_hex) else {
+        return false;
+    };
+    match info.state {
+        InviteUseState::Pending {
+            client_nonce: pending_client_nonce,
+            server_nonce: pending_server_nonce,
+            ..
+        } if &pending_client_nonce == client_nonce && &pending_server_nonce == server_nonce => {
+            info.state = InviteUseState::Used;
+            true
+        }
+        _ => false,
+    }
 }
 
-async fn write_error_and_return(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    reason: &str,
-) -> Result<()> {
-    writer
-        .write_all(format!("ERR {reason}\n").as_bytes())
-        .await?;
-    Ok(())
+fn random_nonce32() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    rand::rng().fill_bytes(&mut nonce);
+    nonce
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(value, &mut out)?;
+    Ok(out)
 }
