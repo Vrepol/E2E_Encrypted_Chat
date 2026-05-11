@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap,
-};
+use std::collections::HashMap;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
@@ -16,6 +14,8 @@ use crate::client::utils::{
 use super::attachment_store::AttachmentStore;
 use super::crypto::RoomCryptoState;
 use super::notifier;
+
+const DRAIN_BATCH_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentKind {
@@ -55,9 +55,15 @@ pub enum ChatMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStage {
-    Sending,
+    Active,
     Done,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    Sending,
+    Receiving,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +73,7 @@ pub struct TransferStatus {
     pub total_chunks: usize,
     pub acked_chunks: usize,
     pub total_size: u64,
+    pub direction: TransferDirection,
     pub stage: TransferStage,
     pub detail: Option<String>,
 }
@@ -74,7 +81,7 @@ pub struct TransferStatus {
 #[derive(Default)]
 pub struct TransferUiState {
     order: Vec<String>,
-    outgoing: HashMap<String, TransferStatus>,
+    transfers: HashMap<String, TransferStatus>,
 }
 
 impl TransferUiState {
@@ -89,7 +96,7 @@ impl TransferUiState {
                 if !self.order.contains(&transfer_id) {
                     self.order.push(transfer_id.clone());
                 }
-                self.outgoing.insert(
+                self.transfers.insert(
                     transfer_id.clone(),
                     TransferStatus {
                         transfer_id,
@@ -97,7 +104,8 @@ impl TransferUiState {
                         total_chunks,
                         acked_chunks: 0,
                         total_size,
-                        stage: TransferStage::Sending,
+                        direction: TransferDirection::Sending,
+                        stage: TransferStage::Active,
                         detail: None,
                     },
                 );
@@ -108,24 +116,27 @@ impl TransferUiState {
                 acked_chunks,
                 total_chunks,
             } => {
-                if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+                if let Some(status) = self.transfers.get_mut(&transfer_id) {
                     status.acked_chunks = acked_chunks;
                     status.total_chunks = total_chunks;
-                    status.stage = TransferStage::Sending;
+                    status.stage = TransferStage::Active;
                     status.detail = None;
                 }
                 None
             }
             LocalUiEvent::TransferDone { transfer_id } => {
-                if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+                if let Some(status) = self.transfers.get_mut(&transfer_id) {
                     status.acked_chunks = status.total_chunks;
                     status.stage = TransferStage::Done;
                     status.detail = Some("server acked".to_string());
                 }
                 None
             }
-            LocalUiEvent::TransferFailed { transfer_id, reason } => {
-                let file_name = if let Some(status) = self.outgoing.get_mut(&transfer_id) {
+            LocalUiEvent::TransferFailed {
+                transfer_id,
+                reason,
+            } => {
+                let file_name = if let Some(status) = self.transfers.get_mut(&transfer_id) {
                     status.stage = TransferStage::Failed;
                     status.detail = Some(reason.clone());
                     status.file_name.clone()
@@ -134,7 +145,62 @@ impl TransferUiState {
                 };
                 Some(format!("传输失败: {file_name} - {reason}"))
             }
+            LocalUiEvent::EchoText { .. } | LocalUiEvent::EchoAttachment { .. } => None,
             LocalUiEvent::Notice(message) => Some(message),
+        }
+    }
+
+    pub fn begin_incoming(
+        &mut self,
+        transfer_id: String,
+        file_name: String,
+        total_chunks: usize,
+        total_size: u64,
+    ) {
+        if !self.order.contains(&transfer_id) {
+            self.order.push(transfer_id.clone());
+        }
+        self.transfers.insert(
+            transfer_id.clone(),
+            TransferStatus {
+                transfer_id,
+                file_name,
+                total_chunks,
+                acked_chunks: 0,
+                total_size,
+                direction: TransferDirection::Receiving,
+                stage: TransferStage::Active,
+                detail: None,
+            },
+        );
+    }
+
+    pub fn progress_incoming(
+        &mut self,
+        transfer_id: &str,
+        received_chunks: usize,
+        total_chunks: usize,
+    ) {
+        if let Some(status) = self.transfers.get_mut(transfer_id) {
+            status.acked_chunks = received_chunks;
+            status.total_chunks = total_chunks;
+            status.stage = TransferStage::Active;
+            status.detail = None;
+        }
+    }
+
+    pub fn finish_incoming(&mut self, transfer_id: &str) {
+        if let Some(status) = self.transfers.get_mut(transfer_id) {
+            status.acked_chunks = status.total_chunks;
+            status.stage = TransferStage::Done;
+            status.detail = Some("received".to_string());
+        }
+    }
+
+    pub fn fail_incoming(&mut self, transfer_id: &str, reason: &str) {
+        if let Some(status) = self.transfers.get_mut(transfer_id) {
+            status.stage = TransferStage::Failed;
+            status.detail = Some(reason.to_string());
         }
     }
 
@@ -142,10 +208,11 @@ impl TransferUiState {
         let mut lines = Vec::new();
 
         for transfer_id in self.order.iter().rev().take(limit) {
-            if let Some(status) = self.outgoing.get(transfer_id) {
+            if let Some(status) = self.transfers.get(transfer_id) {
                 lines.push(render_transfer_line(
                     &status.file_name,
                     status.total_size,
+                    status.direction,
                     status.stage,
                     status.acked_chunks,
                     status.total_chunks,
@@ -185,9 +252,15 @@ pub fn drain_messages(
     transfer_ui_state: &mut TransferUiState,
 ) -> bool {
     let mut member_list_changed = false;
+    let mut processed = 0usize;
 
     while let Ok(line) = net_rx.try_recv() {
+        processed += 1;
+
         if should_drop_unframed_control_line(&line) {
+            if processed >= DRAIN_BATCH_LIMIT {
+                break;
+            }
             continue;
         }
 
@@ -195,13 +268,18 @@ pub fn drain_messages(
             members.clear();
             members.extend(parsed_members);
             member_list_changed = true;
+            if processed >= DRAIN_BATCH_LIMIT {
+                break;
+            }
             continue;
         }
 
         if let Some(event) = parse_local_ui_event(&line) {
-            if let Some(notice) = transfer_ui_state.apply(event) {
-                let hms = Local::now().format("%H:%M:%S").to_string();
-                push_message(messages, ChatMessage::Text(format!("[System] [{hms}] {notice}")));
+            let hms = Local::now().format("%H:%M:%S").to_string();
+            if let Some(message) =
+                handle_local_ui_event(event, my_name, attachment_store, transfer_ui_state, &hms)
+            {
+                push_message(messages, message);
             }
             continue;
         }
@@ -210,16 +288,27 @@ pub fn drain_messages(
         let hms = Local::now().format("%H:%M:%S").to_string();
 
         let result = match parse_attachment_frame(&body) {
-            Some(AttachmentFrame::Meta(meta)) => {
-                register_attachment(receiver_state, sender.clone(), meta, attachment_store, &hms)
-            }
-            Some(AttachmentFrame::Chunk(chunk)) => {
-                append_attachment_chunk(receiver_state, chunk, attachment_store, &hms)
-            }
+            Some(AttachmentFrame::Meta(meta)) => register_attachment(
+                receiver_state,
+                sender.clone(),
+                meta,
+                attachment_store,
+                transfer_ui_state,
+                &hms,
+            ),
+            Some(AttachmentFrame::Chunk(chunk)) => append_attachment_chunk(
+                receiver_state,
+                chunk,
+                attachment_store,
+                transfer_ui_state,
+                &hms,
+            ),
             None if body.starts_with("/IMGDATA") => {
                 Ok(decode_legacy_image(&sender, &body, attachment_store, &hms))
             }
-            None => Ok(Some(ChatMessage::Text(format_text_message(&sender, &body, &hms)))),
+            None => Ok(Some(ChatMessage::Text(format_text_message(
+                &sender, &body, &hms,
+            )))),
         };
 
         let Some(message) = (match result {
@@ -233,6 +322,10 @@ pub fn drain_messages(
             notifier::notify();
         }
         push_message(messages, message);
+
+        if processed >= DRAIN_BATCH_LIMIT {
+            break;
+        }
     }
 
     member_list_changed
@@ -243,8 +336,16 @@ fn register_attachment(
     sender: String,
     meta: AttachmentMeta,
     attachment_store: &AttachmentStore,
+    transfer_ui_state: &mut TransferUiState,
     hms: &str,
 ) -> Result<Option<ChatMessage>, String> {
+    transfer_ui_state.begin_incoming(
+        meta.transfer_id.clone(),
+        meta.file_name.clone(),
+        meta.total_chunks,
+        meta.total_size,
+    );
+
     let incoming = IncomingAttachment {
         sender,
         file_name: meta.file_name,
@@ -257,7 +358,17 @@ fn register_attachment(
     };
 
     if meta.total_chunks == 0 {
-        return finalize_attachment(meta.transfer_id, incoming, attachment_store, hms).map(Some);
+        let result = finalize_attachment(meta.transfer_id.clone(), incoming, attachment_store, hms);
+        return match result {
+            Ok(message) => {
+                transfer_ui_state.finish_incoming(&meta.transfer_id);
+                Ok(Some(message))
+            }
+            Err(err) => {
+                transfer_ui_state.fail_incoming(&meta.transfer_id, &err);
+                Err(err)
+            }
+        };
     }
 
     receiver_state.incoming.insert(meta.transfer_id, incoming);
@@ -268,9 +379,11 @@ fn append_attachment_chunk(
     receiver_state: &mut ReceiverState,
     chunk: AttachmentChunk,
     attachment_store: &AttachmentStore,
+    transfer_ui_state: &mut TransferUiState,
     hms: &str,
 ) -> Result<Option<ChatMessage>, String> {
     let mut ready = false;
+    let (received_chunks, total_chunks);
 
     {
         let Some(incoming) = receiver_state.incoming.get_mut(&chunk.transfer_id) else {
@@ -286,10 +399,14 @@ fn append_attachment_chunk(
             incoming.received_chunks += 1;
         }
 
+        (received_chunks, total_chunks) = (incoming.received_chunks, incoming.total_chunks);
+
         if incoming.received_chunks == incoming.total_chunks {
             ready = true;
         }
     }
+
+    transfer_ui_state.progress_incoming(&chunk.transfer_id, received_chunks, total_chunks);
 
     if !ready {
         return Ok(None);
@@ -300,7 +417,17 @@ fn append_attachment_chunk(
         .remove(&chunk.transfer_id)
         .ok_or_else(|| "Attachment state missing during finalize".to_string())?;
 
-    finalize_attachment(chunk.transfer_id, incoming, attachment_store, hms).map(Some)
+    let result = finalize_attachment(chunk.transfer_id.clone(), incoming, attachment_store, hms);
+    match result {
+        Ok(message) => {
+            transfer_ui_state.finish_incoming(&chunk.transfer_id);
+            Ok(Some(message))
+        }
+        Err(err) => {
+            transfer_ui_state.fail_incoming(&chunk.transfer_id, &err);
+            Err(err)
+        }
+    }
 }
 
 fn finalize_attachment(
@@ -332,7 +459,10 @@ fn finalize_attachment(
 
     let digest = hex::encode(hasher.finalize());
     if digest != incoming.sha256_hex {
-        return Err(format!("Attachment checksum mismatch for {}", incoming.file_name));
+        return Err(format!(
+            "Attachment checksum mismatch for {}",
+            incoming.file_name
+        ));
     }
 
     let attachment_id = attachment_store
@@ -357,7 +487,9 @@ fn decode_legacy_image(
 ) -> Option<ChatMessage> {
     let b64_data = &body["/IMGDATA".len()..];
     let bytes = general_purpose::STANDARD.decode(b64_data).ok()?;
-    let attachment_id = attachment_store.store_attachment("clipboard.png", &bytes).ok()?;
+    let attachment_id = attachment_store
+        .store_attachment("clipboard.png", &bytes)
+        .ok()?;
 
     Some(ChatMessage::Attachment {
         attachment_id,
@@ -371,6 +503,36 @@ fn decode_legacy_image(
 
 fn format_text_message(sender: &str, body: &str, hms: &str) -> String {
     format!("[{sender}] [{hms}] {body}")
+}
+
+fn handle_local_ui_event(
+    event: LocalUiEvent,
+    my_name: &str,
+    _attachment_store: &AttachmentStore,
+    transfer_ui_state: &mut TransferUiState,
+    hms: &str,
+) -> Option<ChatMessage> {
+    match event {
+        LocalUiEvent::EchoText { body } => {
+            Some(ChatMessage::Text(format_text_message(my_name, &body, hms)))
+        }
+        LocalUiEvent::EchoAttachment {
+            attachment_id,
+            file_name,
+            total_size,
+            kind,
+        } => Some(ChatMessage::Attachment {
+            attachment_id,
+            sender: my_name.to_string(),
+            ts: hms.to_string(),
+            name: file_name,
+            size: total_size,
+            kind,
+        }),
+        other => transfer_ui_state
+            .apply(other)
+            .map(|notice| ChatMessage::Text(format!("[System] [{hms}] {notice}"))),
+    }
 }
 
 fn push_message(messages: &mut Vec<ChatMessage>, message: ChatMessage) {

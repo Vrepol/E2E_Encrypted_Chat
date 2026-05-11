@@ -1,17 +1,14 @@
 // client/notifier.rs
 #[cfg(target_os = "windows")]
 pub fn notify() {
+    use super::sounds;
     use windows::Win32::{
         Foundation::HWND,
         System::Console::GetConsoleWindow,
-        UI::WindowsAndMessaging::{
-            FlashWindowEx,
-            FLASHWINFO, FLASHW_ALL,
-        },
+        UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL},
     };
-    use super::sounds;
-        // 任务栏闪烁
-        unsafe {
+    // 任务栏闪烁
+    unsafe {
         let hwnd = GetConsoleWindow();
         if hwnd != HWND(0) {
             let mut info = FLASHWINFO {

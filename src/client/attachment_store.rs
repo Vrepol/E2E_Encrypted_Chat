@@ -43,8 +43,9 @@ impl AttachmentStore {
     pub fn new_in(root: PathBuf) -> Result<Self> {
         let mut local_storage_key = [0u8; KEY_LEN];
         rand::rng().fill_bytes(&mut local_storage_key);
-        fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create attachment store root {}", root.display()))?;
+        fs::create_dir_all(&root).with_context(|| {
+            format!("failed to create attachment store root {}", root.display())
+        })?;
 
         Ok(Self {
             root,
@@ -65,22 +66,27 @@ impl AttachmentStore {
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce);
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.derive_attachment_key(&salt, &attachment_id)?));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(
+            &self.derive_attachment_key(&salt, &attachment_id)?,
+        ));
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), bytes)
             .map_err(|_| anyhow!("failed to encrypt attachment bytes"))?;
 
-        let mut encoded = Vec::with_capacity(
-            HEADER_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ciphertext.len(),
-        );
+        let mut encoded =
+            Vec::with_capacity(HEADER_MAGIC.len() + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
         encoded.extend_from_slice(&HEADER_MAGIC);
         encoded.push(HEADER_VERSION);
         encoded.extend_from_slice(&salt);
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);
 
-        fs::write(&cipher_path, encoded)
-            .with_context(|| format!("failed to write encrypted attachment {}", cipher_path.display()))?;
+        fs::write(&cipher_path, encoded).with_context(|| {
+            format!(
+                "failed to write encrypted attachment {}",
+                cipher_path.display()
+            )
+        })?;
 
         self.records
             .lock()
@@ -99,9 +105,14 @@ impl AttachmentStore {
     pub fn open_temp_and_cleanup_after_delay(&self, attachment_id: &str) -> Result<PathBuf> {
         let record = self.record_for(attachment_id)?;
         let bytes = self.decrypt_attachment(attachment_id)?;
-        let temp_plain_path = self.unique_random_path(extension_for(&record.display_name).as_deref())?;
-        fs::write(&temp_plain_path, bytes)
-            .with_context(|| format!("failed to write temp attachment {}", temp_plain_path.display()))?;
+        let temp_plain_path =
+            self.unique_random_path(extension_for(&record.display_name).as_deref())?;
+        fs::write(&temp_plain_path, bytes).with_context(|| {
+            format!(
+                "failed to write temp attachment {}",
+                temp_plain_path.display()
+            )
+        })?;
         set_readonly(&temp_plain_path)?;
 
         if let Err(err) = (self.opener)(&temp_plain_path) {
@@ -121,8 +132,12 @@ impl AttachmentStore {
 
     pub fn decrypt_attachment(&self, attachment_id: &str) -> Result<Vec<u8>> {
         let record = self.record_for(attachment_id)?;
-        let encoded = fs::read(&record.cipher_path)
-            .with_context(|| format!("failed to read encrypted attachment {}", record.cipher_path.display()))?;
+        let encoded = fs::read(&record.cipher_path).with_context(|| {
+            format!(
+                "failed to read encrypted attachment {}",
+                record.cipher_path.display()
+            )
+        })?;
 
         Self::decrypt_encoded_bytes(&self.local_storage_key, attachment_id, &encoded)
     }
@@ -136,7 +151,11 @@ impl AttachmentStore {
             .ok_or_else(|| anyhow!("attachment not found: {attachment_id}"))
     }
 
-    fn derive_attachment_key(&self, salt: &[u8; SALT_LEN], attachment_id: &str) -> Result<[u8; KEY_LEN]> {
+    fn derive_attachment_key(
+        &self,
+        salt: &[u8; SALT_LEN],
+        attachment_id: &str,
+    ) -> Result<[u8; KEY_LEN]> {
         Self::derive_attachment_key_from_master(&self.local_storage_key, salt, attachment_id)
     }
 
@@ -279,9 +298,15 @@ mod tests {
             Arc::new(|_| Ok(())),
             Duration::from_millis(50),
         );
-        let attachment_id = store.store_attachment("secret-plan.pdf", b"payload").unwrap();
+        let attachment_id = store
+            .store_attachment("secret-plan.pdf", b"payload")
+            .unwrap();
         let cipher_path = store.encrypted_path_for_test(&attachment_id);
-        let file_name = cipher_path.file_name().unwrap().to_string_lossy().to_lowercase();
+        let file_name = cipher_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
 
         assert!(!file_name.contains("secret"));
         assert!(!file_name.contains("plan"));
@@ -302,7 +327,9 @@ mod tests {
         let attachment_id = store.store_attachment("evidence.bin", payload).unwrap();
         let cipher_bytes = fs::read(store.encrypted_path_for_test(&attachment_id)).unwrap();
 
-        assert!(!cipher_bytes.windows(payload.len()).any(|window| window == payload));
+        assert!(!cipher_bytes
+            .windows(payload.len())
+            .any(|window| window == payload));
     }
 
     #[test]
@@ -332,7 +359,9 @@ mod tests {
             Arc::new(|_| Ok(())),
             Duration::from_millis(50),
         );
-        let attachment_id = store.store_attachment("slides.pptx", b"office bytes").unwrap();
+        let attachment_id = store
+            .store_attachment("slides.pptx", b"office bytes")
+            .unwrap();
         let cipher_bytes = fs::read(store.encrypted_path_for_test(&attachment_id)).unwrap();
 
         let mut fake_room_server_key = [0u8; 32];
@@ -362,14 +391,19 @@ mod tests {
             Duration::from_millis(200),
         );
         let attachment_id = store.store_attachment("photo.jpeg", b"img-bytes").unwrap();
-        let temp_plain_path = store.open_temp_and_cleanup_after_delay(&attachment_id).unwrap();
+        let temp_plain_path = store
+            .open_temp_and_cleanup_after_delay(&attachment_id)
+            .unwrap();
 
-        assert_eq!(temp_plain_path.extension().and_then(|ext| ext.to_str()), Some("jpeg"));
         assert_eq!(
-            opened_path.lock().unwrap().as_ref(),
-            Some(&temp_plain_path)
+            temp_plain_path.extension().and_then(|ext| ext.to_str()),
+            Some("jpeg")
         );
-        assert!(fs::metadata(&temp_plain_path).unwrap().permissions().readonly());
+        assert_eq!(opened_path.lock().unwrap().as_ref(), Some(&temp_plain_path));
+        assert!(fs::metadata(&temp_plain_path)
+            .unwrap()
+            .permissions()
+            .readonly());
         assert_eq!(fs::read(&temp_plain_path).unwrap(), b"img-bytes");
     }
 
@@ -383,7 +417,9 @@ mod tests {
             Duration::from_millis(75),
         );
         let attachment_id = store.store_attachment("report.pdf", b"pdf-bytes").unwrap();
-        let temp_plain_path = store.open_temp_and_cleanup_after_delay(&attachment_id).unwrap();
+        let temp_plain_path = store
+            .open_temp_and_cleanup_after_delay(&attachment_id)
+            .unwrap();
         assert!(temp_plain_path.exists());
 
         thread::sleep(Duration::from_millis(250));
@@ -399,8 +435,12 @@ mod tests {
             Arc::new(|_| Ok(())),
             Duration::from_millis(30),
         );
-        let attachment_id = store.store_attachment("archive.tar.gz", b"archive").unwrap();
-        let temp_plain_path = store.open_temp_and_cleanup_after_delay(&attachment_id).unwrap();
+        let attachment_id = store
+            .store_attachment("archive.tar.gz", b"archive")
+            .unwrap();
+        let temp_plain_path = store
+            .open_temp_and_cleanup_after_delay(&attachment_id)
+            .unwrap();
         thread::sleep(Duration::from_millis(120));
 
         let entries: Vec<String> = fs::read_dir(dir.path())

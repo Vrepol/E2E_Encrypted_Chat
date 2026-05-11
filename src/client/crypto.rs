@@ -31,7 +31,10 @@ pub struct RoomCryptoState {
 }
 
 impl RoomCryptoState {
-    pub fn from_room_credential(room_id: impl Into<String>, room_credential: impl Into<String>) -> Self {
+    pub fn from_room_credential(
+        room_id: impl Into<String>,
+        room_credential: impl Into<String>,
+    ) -> Self {
         let room_id = room_id.into();
         let room_credential = room_credential.into();
         let digest = md5::Md5::digest(format!("{room_id}{room_credential}").as_bytes());
@@ -54,8 +57,8 @@ impl RoomCryptoState {
     }
 
     pub fn join_credential(&self) -> String {
-        let mut mac =
-            <Hmac<Sha256> as Mac>::new_from_slice(&self.room_key[..16]).expect("room join credential");
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.room_key[..16])
+            .expect("room join credential");
         mac.update(ROOM_JOIN_LABEL);
         hex::encode(mac.finalize().into_bytes())
     }
@@ -249,10 +252,11 @@ pub fn derive_password_transport_key(
     client_nonce: &[u8],
     server_nonce: &[u8],
 ) -> [u8; 32] {
-    derive_transport_key(server_pwd_hash, b"rust-chat password transport v1", &[
-        client_nonce,
-        server_nonce,
-    ])
+    derive_transport_key(
+        server_pwd_hash,
+        b"rust-chat password transport v1",
+        &[client_nonce, server_nonce],
+    )
 }
 
 pub fn compute_password_auth_proof(
@@ -260,7 +264,11 @@ pub fn compute_password_auth_proof(
     client_nonce: &[u8],
     server_nonce: &[u8],
 ) -> [u8; 32] {
-    compute_handshake_proof(server_pwd_hash, AUTH_PROOF_LABEL, &[client_nonce, server_nonce])
+    compute_handshake_proof(
+        server_pwd_hash,
+        AUTH_PROOF_LABEL,
+        &[client_nonce, server_nonce],
+    )
 }
 
 pub fn compute_invite_token_id(token_secret: &[u8]) -> [u8; 32] {
@@ -276,11 +284,11 @@ pub fn derive_invite_transport_key(
     client_nonce: &[u8],
     server_nonce: &[u8],
 ) -> [u8; 32] {
-    derive_transport_key(token_secret, b"rust-chat invite transport v1", &[
-        token_id,
-        client_nonce,
-        server_nonce,
-    ])
+    derive_transport_key(
+        token_secret,
+        b"rust-chat invite transport v1",
+        &[token_id, client_nonce, server_nonce],
+    )
 }
 
 pub fn compute_invite_proof(

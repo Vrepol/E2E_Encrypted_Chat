@@ -1,7 +1,7 @@
 // lib.rs
 
-pub mod client;
 pub mod app_config;
+pub mod client;
 
 #[cfg(test)]
 mod tests {
@@ -9,12 +9,12 @@ mod tests {
     use crate::client::notifier;
     use crate::client::receiver::AttachmentKind;
     use crate::client::utils::{
-        build_ack_line, build_attachment_frames_from_bytes, build_local_invite_request_line,
-        create_invite_blob, normalize_clipboard_rgba, open_invite_blob,
-        parse_clipboard_file_paths,
-        build_transport_packet_line, create_invitation, parse_ack_line, parse_attachment_frame,
-        parse_invitation, parse_local_invite_request_line, parse_transport_packet_line,
-        AttachmentFrame,
+        build_ack_line, build_attachment_frames_from_bytes, build_local_echo_attachment_line,
+        build_local_echo_text_line, build_local_invite_request_line, build_transport_packet_line,
+        create_invitation, create_invite_blob, normalize_clipboard_rgba, open_invite_blob,
+        parse_ack_line, parse_attachment_frame, parse_clipboard_file_paths, parse_invitation,
+        parse_local_invite_request_line, parse_local_ui_event, parse_transport_packet_line,
+        AttachmentFrame, LocalUiEvent,
     };
 
     #[test]
@@ -69,11 +69,9 @@ mod tests {
 
     #[test]
     fn test_invite_round_trip() {
-        let (blob_b64, blob_key_b64) = create_invite_blob(
-            "room-a".to_string(),
-            "room-password".to_string(),
-        )
-        .expect("invite blob should build");
+        let (blob_b64, blob_key_b64) =
+            create_invite_blob("room-a".to_string(), "room-password".to_string())
+                .expect("invite blob should build");
         let invite = create_invitation(
             "127.0.0.1:6655".to_string(),
             "invite-token-123".to_string(),
@@ -94,12 +92,7 @@ mod tests {
 
     #[test]
     fn test_local_invite_request_round_trip_with_empty_room_key() {
-        let line = build_local_invite_request_line(
-            "127.0.0.1:6655",
-            "Public",
-            "",
-            "owner-cap-1",
-        );
+        let line = build_local_invite_request_line("127.0.0.1:6655", "Public", "", "owner-cap-1");
         let parsed = parse_local_invite_request_line(&line).expect("request should parse");
         assert_eq!(parsed.server_addr, "127.0.0.1:6655");
         assert_eq!(parsed.room_id, "Public");
@@ -109,19 +102,11 @@ mod tests {
 
     #[test]
     fn test_normalize_clipboard_rgba_fills_missing_alpha() {
-        let raw = vec![
-            10, 20, 30, 0,
-            40, 50, 60, 0,
-        ];
+        let raw = vec![10, 20, 30, 0, 40, 50, 60, 0];
 
-        let normalized = normalize_clipboard_rgba(&raw, 2, 1).expect("clipboard rgba should normalize");
-        assert_eq!(
-            normalized,
-            vec![
-                10, 20, 30, 255,
-                40, 50, 60, 255,
-            ]
-        );
+        let normalized =
+            normalize_clipboard_rgba(&raw, 2, 1).expect("clipboard rgba should normalize");
+        assert_eq!(normalized, vec![10, 20, 30, 255, 40, 50, 60, 255,]);
     }
 
     #[test]
@@ -148,5 +133,29 @@ mod tests {
 
         let _ = std::fs::remove_file(path_a);
         let _ = std::fs::remove_file(path_b);
+    }
+
+    #[test]
+    fn test_local_echo_text_round_trip() {
+        let line = build_local_echo_text_line("hello local echo");
+        assert!(matches!(
+            parse_local_ui_event(&line),
+            Some(LocalUiEvent::EchoText { body }) if body == "hello local echo"
+        ));
+    }
+
+    #[test]
+    fn test_local_echo_attachment_round_trip() {
+        let line =
+            build_local_echo_attachment_line("attachment-1", "demo.txt", 42, AttachmentKind::File);
+        assert!(matches!(
+            parse_local_ui_event(&line),
+            Some(LocalUiEvent::EchoAttachment {
+                attachment_id,
+                file_name,
+                total_size,
+                kind: AttachmentKind::File,
+            }) if attachment_id == "attachment-1" && file_name == "demo.txt" && total_size == 42
+        ));
     }
 }

@@ -1,20 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use base64::{
-    engine::general_purpose,
-    engine::general_purpose::URL_SAFE_NO_PAD,
-    Engine as _,
-};
+use base64::{engine::general_purpose, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
-use image::{
-    codecs::png::PngEncoder,
-    ColorType,
-    ImageEncoder,
-};
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -22,7 +14,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use super::crypto::RoomCryptoState;
-use super::receiver::{AttachmentKind, ChatMessage, TransferStage};
+use super::receiver::{AttachmentKind, ChatMessage, TransferDirection, TransferStage};
 
 pub const HELP_TEXT: &str = r#"快捷键与命令说明：
 
@@ -183,6 +175,15 @@ pub enum LocalUiEvent {
     TransferFailed {
         transfer_id: String,
         reason: String,
+    },
+    EchoText {
+        body: String,
+    },
+    EchoAttachment {
+        attachment_id: String,
+        file_name: String,
+        total_size: u64,
+        kind: AttachmentKind,
     },
     Notice(String),
 }
@@ -395,7 +396,10 @@ pub fn parse_member_list_line(line: &str) -> Option<Vec<MemberIdentity>> {
             let mut parts = entry.splitn(2, ':');
             let member_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
             let nickname = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
-            Some(MemberIdentity { member_id, nickname })
+            Some(MemberIdentity {
+                member_id,
+                nickname,
+            })
         })
         .collect()
 }
@@ -430,6 +434,25 @@ pub fn build_local_transfer_failed_line(transfer_id: &str, reason: &str) -> Stri
 pub fn build_local_notice_line(message: &str) -> String {
     let msg_b64 = URL_SAFE_NO_PAD.encode(message.as_bytes());
     format!("/LOCALNOTICE {msg_b64}")
+}
+
+pub fn build_local_echo_text_line(body: &str) -> String {
+    let body_b64 = URL_SAFE_NO_PAD.encode(body.as_bytes());
+    format!("/LOCALECHO TEXT {body_b64}")
+}
+
+pub fn build_local_echo_attachment_line(
+    attachment_id: &str,
+    file_name: &str,
+    total_size: u64,
+    kind: AttachmentKind,
+) -> String {
+    let attachment_b64 = URL_SAFE_NO_PAD.encode(attachment_id.as_bytes());
+    let file_b64 = URL_SAFE_NO_PAD.encode(file_name.as_bytes());
+    format!(
+        "/LOCALECHO ATTACHMENT {attachment_b64} {file_b64} {total_size} {}",
+        kind.as_protocol_tag()
+    )
 }
 
 fn encode_optional_url_field(value: &str) -> String {
@@ -532,7 +555,11 @@ pub fn parse_server_invite_request_line(line: &str) -> Option<ServerInviteReques
     })
 }
 
-pub fn build_invite_token_line(request_id: &str, token_secret_b64: &str, expires_at: i64) -> String {
+pub fn build_invite_token_line(
+    request_id: &str,
+    token_secret_b64: &str,
+    expires_at: i64,
+) -> String {
     format!("/INVITE_TOKEN {request_id} {token_secret_b64} {expires_at}")
 }
 
@@ -684,6 +711,31 @@ pub fn parse_local_ui_event(line: &str) -> Option<LocalUiEvent> {
         return Some(LocalUiEvent::Notice(message));
     }
 
+    if let Some(payload) = line.strip_prefix("/LOCALECHO ") {
+        let mut parts = payload.split_whitespace();
+        return match parts.next()? {
+            "TEXT" => {
+                let body = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+                Some(LocalUiEvent::EchoText { body })
+            }
+            "ATTACHMENT" => {
+                let attachment_id =
+                    String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+                let file_name =
+                    String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+                let total_size = parts.next()?.parse().ok()?;
+                let kind = AttachmentKind::from_protocol_tag(parts.next()?)?;
+                Some(LocalUiEvent::EchoAttachment {
+                    attachment_id,
+                    file_name,
+                    total_size,
+                    kind,
+                })
+            }
+            _ => None,
+        };
+    }
+
     let mut parts = line.split_whitespace();
     if parts.next()? != "/LOCALTX" {
         return None;
@@ -718,7 +770,10 @@ pub fn parse_local_ui_event(line: &str) -> Option<LocalUiEvent> {
         "FAIL" => {
             let transfer_id = parts.next()?.to_string();
             let reason = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
-            Some(LocalUiEvent::TransferFailed { transfer_id, reason })
+            Some(LocalUiEvent::TransferFailed {
+                transfer_id,
+                reason,
+            })
         }
         _ => None,
     }
@@ -761,13 +816,16 @@ pub fn format_file_size(size: u64) -> String {
 pub fn render_transfer_line(
     file_name: &str,
     total_size: u64,
+    direction: TransferDirection,
     stage: TransferStage,
     acked_chunks: usize,
     total_chunks: usize,
     detail: Option<&str>,
 ) -> String {
-    let status = match stage {
-        TransferStage::Sending => {
+    let status = match (direction, stage) {
+        (_, TransferStage::Done) => "done".to_string(),
+        (_, TransferStage::Failed) => "failed".to_string(),
+        (TransferDirection::Sending, TransferStage::Active) => {
             if total_chunks == 0 {
                 "sending 0%".to_string()
             } else {
@@ -775,8 +833,14 @@ pub fn render_transfer_line(
                 format!("sending {pct}%")
             }
         }
-        TransferStage::Done => "done".to_string(),
-        TransferStage::Failed => "failed".to_string(),
+        (TransferDirection::Receiving, TransferStage::Active) => {
+            if total_chunks == 0 {
+                "receiving 0%".to_string()
+            } else {
+                let pct = (acked_chunks.saturating_mul(100)) / total_chunks.max(1);
+                format!("receiving {pct}%")
+            }
+        }
     };
 
     let mut line = format!("{status} | {file_name} | {}", format_file_size(total_size));
@@ -877,10 +941,7 @@ struct InvitePayload {
     room_credential: String,
 }
 
-pub fn create_invite_blob(
-    room_id: String,
-    room_credential: String,
-) -> Result<(String, String)> {
+pub fn create_invite_blob(room_id: String, room_credential: String) -> Result<(String, String)> {
     let mut nonce = [0u8; 12];
     let mut blob_key = [0u8; 16];
     rand::rng().fill_bytes(&mut nonce);
@@ -894,7 +955,10 @@ pub fn create_invite_blob(
     let key_bytes = Sha256::digest(blob_key);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), serde_json::to_vec(&payload)?.as_ref())
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            serde_json::to_vec(&payload)?.as_ref(),
+        )
         .map_err(|_| anyhow!("Failed to encrypt invite blob"))?;
 
     let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
@@ -917,7 +981,9 @@ pub fn open_invite_blob(blob_b64: &str, blob_key_b64: &str) -> Option<(String, S
     let (nonce, cipher_bytes) = bytes.split_at(12);
     let key_bytes = Sha256::digest(&blob_key);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-    let plain = cipher.decrypt(Nonce::from_slice(nonce), cipher_bytes).ok()?;
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), cipher_bytes)
+        .ok()?;
 
     serde_json::from_slice::<InvitePayload>(&plain)
         .map(|payload| (payload.room_id, payload.room_credential))
@@ -930,7 +996,9 @@ pub fn create_invitation(
     blob_key_b64: String,
 ) -> Result<String> {
     let server_b64 = URL_SAFE_NO_PAD.encode(server_addr.as_bytes());
-    Ok(format!("/INVITE:{server_b64}.{invite_token}.{blob_key_b64}"))
+    Ok(format!(
+        "/INVITE:{server_b64}.{invite_token}.{blob_key_b64}"
+    ))
 }
 
 pub fn parse_invitation(inv: &str) -> Option<(String, String, String)> {

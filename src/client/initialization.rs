@@ -1,10 +1,10 @@
-use std::io::{self, Write};
-use fake::Fake;
-use fake::locales::{FR_FR};
-use fake::faker::name::raw::*;
 use colored::*;
+use fake::faker::name::raw::*;
+use fake::locales::FR_FR;
+use fake::Fake;
 use std::io::IsTerminal;
-use supports_color::{self,Stream as ColorStream};
+use std::io::{self, Write};
+use supports_color::{self, Stream as ColorStream};
 
 use crate::app_config::{
     default_client_server, CLIENT_SERVER_PRESETS, DEFAULT_SERVER_PASSWORD, DEFAULT_SERVER_PORT,
@@ -28,7 +28,7 @@ pub fn init_color() {
 #[cfg(windows)]
 fn enable_windows_vt_processing() -> bool {
     use windows::Win32::System::Console::{
-        CONSOLE_MODE, GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_PROCESSED_OUTPUT,
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_PROCESSED_OUTPUT,
         ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
     };
 
@@ -41,9 +41,8 @@ fn enable_windows_vt_processing() -> bool {
             return false;
         }
 
-        let desired_mode = CONSOLE_MODE(
-            mode.0 | ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
-        );
+        let desired_mode =
+            CONSOLE_MODE(mode.0 | ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0);
         SetConsoleMode(handle, desired_mode).is_ok()
     }
 }
@@ -52,7 +51,7 @@ fn enable_windows_vt_processing() -> bool {
 fn enable_windows_vt_processing() -> bool {
     true
 }
-fn get_password_or_default()->String {
+fn get_password_or_default() -> String {
     let mut inp = String::new();
     let _ = io::stdin().read_line(&mut inp);
     if inp.trim().is_empty() {
@@ -91,10 +90,13 @@ fn choose_local_advertised_addr(port: u16) -> io::Result<String> {
         println!("  {}. {} ({})", i + 1, candidate.addr, candidate.label);
     }
     println!("  manual. Enter a custom IP or hostname");
-    print!("Choice / IP / hostname [{}]: ", candidates
-        .first()
-        .map(|item| item.addr.as_str())
-        .unwrap_or("127.0.0.1"));
+    print!(
+        "Choice / IP / hostname [{}]: ",
+        candidates
+            .first()
+            .map(|item| item.addr.as_str())
+            .unwrap_or("127.0.0.1")
+    );
     io::stdout().flush()?;
 
     let mut inp = String::new();
@@ -133,8 +135,8 @@ fn choose_local_advertised_addr(port: u16) -> io::Result<String> {
 pub fn initial_name() -> io::Result<String> {
     // ---------- 询问昵称 ----------
     let username = loop {
-        println!("{}","Continue with fake name".purple());
-        print!("{}","      Or customize here: ".purple());
+        println!("{}", "Continue with fake name".purple());
+        print!("{}", "      Or customize here: ".purple());
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
@@ -143,10 +145,14 @@ pub fn initial_name() -> io::Result<String> {
             break name.to_owned();
         } else {
             let name: String = FirstName(FR_FR).fake();
-            break name.to_owned()
+            break name.to_owned();
         }
     };
-    println!("{} {}","Enjoy youself, ".green(),username.clone().to_string().green());
+    println!(
+        "{} {}",
+        "Enjoy youself, ".green(),
+        username.clone().to_string().green()
+    );
     Ok(username)
 }
 pub fn initial_serveraddr() -> io::Result<String> {

@@ -5,14 +5,10 @@ use super::utils::MemberIdentity;
 pub const SAFETY_PROTOCOL_V0: &str = "rust-chat-safety-v0";
 
 const SAFETY_EMOJIS: &[&str] = &[
-    "🦊", "🌙", "🧊", "🍀", "🦀", "🌊", "🔥", "🌿",
-    "⭐", "🍎", "🛰", "🪨", "🐳", "🌻", "🍋", "🦉",
-    "🌈", "🍁", "🫐", "⚙️", "🧭", "🥝", "🐼", "🌵",
-    "🍄", "🦋", "☁️", "🌺", "🐧", "🌲", "🍇", "🌞",
-    "🪐", "🥥", "🦜", "🌼", "🍓", "🐢", "🌪", "🫧",
-    "🐝", "🍉", "🌴", "❄️", "🦌", "🌸", "🍒", "🐬",
-    "🌅", "🥑", "🦔", "🌱", "🍐", "🐙", "🌌", "🪵",
-    "🍊", "🦝", "🌾", "🫚", "🍍", "🐚", "🌧", "🪻",
+    "🦊", "🌙", "🧊", "🍀", "🦀", "🌊", "🔥", "🌿", "⭐", "🍎", "🛰", "🪨", "🐳", "🌻", "🍋", "🦉",
+    "🌈", "🍁", "🫐", "⚙️", "🧭", "🥝", "🐼", "🌵", "🍄", "🦋", "☁️", "🌺", "🐧", "🌲", "🍇", "🌞",
+    "🪐", "🥥", "🦜", "🌼", "🍓", "🐢", "🌪", "🫧", "🐝", "🍉", "🌴", "❄️", "🦌", "🌸", "🍒", "🐬",
+    "🌅", "🥑", "🦔", "🌱", "🍐", "🐙", "🌌", "🪵", "🍊", "🦝", "🌾", "🫚", "🍍", "🐚", "🌧", "🪻",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +31,8 @@ impl SafetyTranscript {
                 x25519_pubkey: None,
             })
             .collect::<Vec<_>>();
-        transcript_members.sort_by(|a, b| canonical_member_bytes(a).cmp(&canonical_member_bytes(b)));
+        transcript_members
+            .sort_by(|a, b| canonical_member_bytes(a).cmp(&canonical_member_bytes(b)));
 
         Self {
             protocol_version: SAFETY_PROTOCOL_V0.to_string(),
@@ -138,11 +135,7 @@ fn canonical_member_bytes(member: &SafetyMember) -> Vec<u8> {
         "identity_pubkey",
         member.identity_pubkey.as_deref(),
     );
-    push_optional_bytes_field(
-        &mut bytes,
-        "x25519_pubkey",
-        member.x25519_pubkey.as_deref(),
-    );
+    push_optional_bytes_field(&mut bytes, "x25519_pubkey", member.x25519_pubkey.as_deref());
     bytes
 }
 

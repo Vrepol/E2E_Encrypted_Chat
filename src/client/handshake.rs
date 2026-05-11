@@ -18,10 +18,10 @@ use super::crypto::{
     TransportCrypto, TransportOpenResult, TransportSide,
 };
 use super::utils::{
-    build_auth_hello_line, build_auth_proof_line, build_invite_hello_line,
-    build_invite_ready_line, build_invite_proof_line, handshake_writeall_macro,
-    open_invite_blob, parse_auth_challenge_line, parse_invitation, parse_invite_challenge_line,
-    parse_invite_ok_line, parse_session_ok_line, MemberIdentity,
+    build_auth_hello_line, build_auth_proof_line, build_invite_hello_line, build_invite_proof_line,
+    build_invite_ready_line, handshake_writeall_macro, open_invite_blob, parse_auth_challenge_line,
+    parse_invitation, parse_invite_challenge_line, parse_invite_ok_line, parse_session_ok_line,
+    MemberIdentity,
 };
 
 pub type SharedTransportCrypto = Arc<Mutex<TransportCrypto>>;
@@ -36,7 +36,10 @@ pub struct ConnectedSession {
     pub owner_capability: Option<String>,
 }
 
-pub async fn connect_and_login(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+pub async fn connect_and_login(
+    server_addr_or_invite: &str,
+    nickname: &str,
+) -> Result<ConnectedSession> {
     if server_addr_or_invite.starts_with("/INVITE:") {
         return connect_with_invite(server_addr_or_invite, nickname).await;
     }
@@ -44,7 +47,10 @@ pub async fn connect_and_login(server_addr_or_invite: &str, nickname: &str) -> R
     connect_with_password(server_addr_or_invite, nickname).await
 }
 
-async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+async fn connect_with_invite(
+    server_addr_or_invite: &str,
+    nickname: &str,
+) -> Result<ConnectedSession> {
     let (server_addr, token_secret_b64, blob_key_b64) =
         parse_invitation(server_addr_or_invite).ok_or_else(|| anyhow!("Invalid invitation"))?;
     let token_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -74,15 +80,17 @@ async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Res
     if challenge.starts_with("ERR ") {
         return Err(anyhow!("邀请码无效或已过期"));
     }
-    let server_nonce_hex =
-        parse_invite_challenge_line(&challenge).ok_or_else(|| anyhow!("Invalid invite challenge"))?;
+    let server_nonce_hex = parse_invite_challenge_line(&challenge)
+        .ok_or_else(|| anyhow!("Invalid invite challenge"))?;
     let server_nonce = decode_hex_32(&server_nonce_hex)?;
     let transport_key =
         derive_invite_transport_key(&token_secret, &token_id, &client_nonce, &server_nonce);
     let proof = compute_invite_proof(&token_secret, &token_id, &client_nonce, &server_nonce);
 
     writer
-        .write_all(handshake_writeall_macro(build_invite_proof_line(&hex::encode(proof))).as_slice())
+        .write_all(
+            handshake_writeall_macro(build_invite_proof_line(&hex::encode(proof))).as_slice(),
+        )
         .await?;
 
     let mut transport = TransportCrypto::new(transport_key, TransportSide::Client);
@@ -130,7 +138,10 @@ async fn connect_with_invite(server_addr_or_invite: &str, nickname: &str) -> Res
     })
 }
 
-async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> Result<ConnectedSession> {
+async fn connect_with_password(
+    server_addr_or_invite: &str,
+    nickname: &str,
+) -> Result<ConnectedSession> {
     let mut iter = server_addr_or_invite.splitn(2, '&');
     let server_addr = iter.next().unwrap_or("").to_string();
     let password = iter.next().unwrap_or("");
@@ -157,7 +168,8 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
     let server_nonce_hex =
         parse_auth_challenge_line(&challenge).ok_or_else(|| anyhow!("Invalid auth challenge"))?;
     let server_nonce = decode_hex_32(&server_nonce_hex)?;
-    let transport_key = derive_password_transport_key(&server_pwd_hash, &client_nonce, &server_nonce);
+    let transport_key =
+        derive_password_transport_key(&server_pwd_hash, &client_nonce, &server_nonce);
     let proof = compute_password_auth_proof(&server_pwd_hash, &client_nonce, &server_nonce);
 
     writer
@@ -192,13 +204,20 @@ async fn connect_with_password(server_addr_or_invite: &str, nickname: &str) -> R
     if rooms.is_empty() {
         println!("\n{}", "— No Rooms Available —".green().bold());
     } else {
-        println!("\n{} \n {}", "— Available Rooms —".green().bold(), rooms.join("; "));
+        println!(
+            "\n{} \n {}",
+            "— Available Rooms —".green().bold(),
+            rooms.join("; ")
+        );
     }
 
     let (room_id, room_credential, action) = prompt_room_selection(&rooms)?;
     let room_crypto = RoomCryptoState::from_room_credential(room_id, room_credential);
     let join_credential = room_crypto.join_credential();
-    let join_plain = format!("{action} {} {join_credential} {nickname}", room_crypto.room_id());
+    let join_plain = format!(
+        "{action} {} {join_credential} {nickname}",
+        room_crypto.room_id()
+    );
     let join_cipher = transport.seal(&join_plain);
     writer
         .write_all(handshake_writeall_macro(join_cipher).as_slice())
@@ -231,7 +250,9 @@ fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static s
     loop {
         print!(
             "{}",
-            "Enter \"/q\" to disconnect, leave blank to join the Public Room,".yellow().bold()
+            "Enter \"/q\" to disconnect, leave blank to join the Public Room,"
+                .yellow()
+                .bold()
         );
         print!("{}", "Room ID: ".blue());
         io::stdout().flush()?;
@@ -247,7 +268,8 @@ fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static s
                 .take(9)
                 .map(char::from)
                 .collect();
-            const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
+            const CHARSET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
             let room_credential: String = (0..32)
                 .map(|_| {
                     let idx = rand::rng().random_range(0..CHARSET.len());
@@ -257,17 +279,29 @@ fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static s
             return Ok((room_id, room_credential, "CREATE"));
         }
 
-        let id = if id.trim().is_empty() { "Public" } else { id.trim() };
+        let id = if id.trim().is_empty() {
+            "Public"
+        } else {
+            id.trim()
+        };
         if id != "Public" {
             print!("{}", "It wouldn't display while typing,".yellow().bold());
             print!("{}", "Password:".red());
             io::stdout().flush()?;
             let room_credential = read_password()?;
-            let action = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
+            let action = if rooms.contains(&id.to_string()) {
+                "JOIN"
+            } else {
+                "CREATE"
+            };
             return Ok((id.to_owned(), room_credential, action));
         }
 
-        let action = if rooms.contains(&id.to_string()) { "JOIN" } else { "CREATE" };
+        let action = if rooms.contains(&id.to_string()) {
+            "JOIN"
+        } else {
+            "CREATE"
+        };
         return Ok((id.to_owned(), String::new(), action));
     }
 }
@@ -284,7 +318,10 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn expect_fresh_transport_line(transport: &mut TransportCrypto, cipher_line: &str) -> Option<String> {
+fn expect_fresh_transport_line(
+    transport: &mut TransportCrypto,
+    cipher_line: &str,
+) -> Option<String> {
     match transport.open(cipher_line)? {
         TransportOpenResult::Fresh(plain) => Some(plain),
         TransportOpenResult::Duplicate(_) => None,

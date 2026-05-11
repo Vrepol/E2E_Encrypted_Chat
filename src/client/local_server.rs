@@ -1,6 +1,5 @@
 use std::{
-    env,
-    io,
+    env, io,
     net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -73,10 +72,7 @@ fn primary_local_ipv4() -> Option<Ipv4Addr> {
 }
 
 fn is_advertisable_ipv4(ip: &Ipv4Addr) -> bool {
-    !ip.is_loopback()
-        && !ip.is_link_local()
-        && !ip.is_unspecified()
-        && *ip != Ipv4Addr::BROADCAST
+    !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() && *ip != Ipv4Addr::BROADCAST
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,7 +196,8 @@ mod tests {
     #[test]
     fn test_parse_windows_ip_candidates_filters_invalid_addrs() {
         let json = r#"[{"InterfaceAlias":"Wi-Fi","IPAddress":"192.168.1.23"},{"InterfaceAlias":"Loopback","IPAddress":"127.0.0.1"},{"InterfaceAlias":"LinkLocal","IPAddress":"169.254.10.20"}]"#;
-        let parsed = parse_windows_ip_candidates(json).expect("windows candidate json should parse");
+        let parsed =
+            parse_windows_ip_candidates(json).expect("windows candidate json should parse");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].addr, "192.168.1.23");
         assert_eq!(parsed[0].label, "Wi-Fi");

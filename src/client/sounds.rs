@@ -1,6 +1,6 @@
 use cpal::traits::*;
-use once_cell::sync::Lazy;
 use crossbeam_channel::{unbounded, Sender};
+use once_cell::sync::Lazy;
 use std::{
     f32::consts::PI,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -32,61 +32,63 @@ pub fn play_async() {
 fn spawn_audio_thread(rx: crossbeam_channel::Receiver<usize>) {
     thread::spawn(move || {
         // 1. 打设备、建流
-        let host   = cpal::default_host();
+        let host = cpal::default_host();
         let device = host.default_output_device().expect("no output device");
-        let cfg    = device.default_output_config().expect("bad config");
-        let sr     = cfg.sample_rate().0 as f32;
+        let cfg = device.default_output_config().expect("bad config");
+        let sr = cfg.sample_rate().0 as f32;
 
         // 2. 回调内部维护自己的队列
         let mut play_queue: Vec<(usize, f32)> = Vec::new();
-        let beep_dur  = 0.3;
+        let beep_dur = 0.3;
         let pause_dur = 0.05;
-        let cycle     = beep_dur + pause_dur;
+        let cycle = beep_dur + pause_dur;
 
-        let stream = device.build_output_stream(
-            &cfg.into(),
-            move |data: &mut [f32], _| {
-                // 收新请求
-                while let Ok(n) = rx.try_recv() {
-                    play_queue.push((n, 0.0));
-                }
+        let stream = device
+            .build_output_stream(
+                &cfg.into(),
+                move |data: &mut [f32], _| {
+                    // 收新请求
+                    while let Ok(n) = rx.try_recv() {
+                        play_queue.push((n, 0.0));
+                    }
 
-                for s in data.iter_mut() {
-                    if let Some((left, t)) = play_queue.first_mut() {
-                        if *left == 0 {
-                            play_queue.remove(0);
-                            continue;
-                        }
-                        let pos = *t % cycle;
-                        if pos <= beep_dur {
-                            let tone = (2.0 * PI * 880.0 * pos).sin() * 0.6
-                                     + (2.0 * PI * 1320.0 * pos).sin() * 0.4;
-                            let fade = if pos < 0.005 {
-                                pos / 0.005
-                            } else if pos > beep_dur - 0.005 {
-                                (beep_dur - pos) / 0.005
+                    for s in data.iter_mut() {
+                        if let Some((left, t)) = play_queue.first_mut() {
+                            if *left == 0 {
+                                play_queue.remove(0);
+                                continue;
+                            }
+                            let pos = *t % cycle;
+                            if pos <= beep_dur {
+                                let tone = (2.0 * PI * 880.0 * pos).sin() * 0.6
+                                    + (2.0 * PI * 1320.0 * pos).sin() * 0.4;
+                                let fade = if pos < 0.005 {
+                                    pos / 0.005
+                                } else if pos > beep_dur - 0.005 {
+                                    (beep_dur - pos) / 0.005
+                                } else {
+                                    1.0
+                                };
+                                *s = tone * 0.25 * fade;
                             } else {
-                                1.0
-                            };
-                            *s = tone * 0.25 * fade;
+                                *s = 0.0;
+                            }
+                            *t += 1.0 / sr;
+                            // 周期结束，次数--
+                            if *t >= cycle {
+                                *left -= 1;
+                                *t = 0.0;
+                                REMAINING.fetch_sub(1, Ordering::SeqCst);
+                            }
                         } else {
                             *s = 0.0;
                         }
-                        *t += 1.0 / sr;
-                        // 周期结束，次数--
-                        if *t >= cycle {
-                            *left -= 1;
-                            *t = 0.0;
-                            REMAINING.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    } else {
-                        *s = 0.0;
                     }
-                }
-            },
-            |_| eprintln!("audio error"),
-            None,
-        ).expect("build_output_stream failed");
+                },
+                |_| eprintln!("audio error"),
+                None,
+            )
+            .expect("build_output_stream failed");
 
         stream.play().expect("play failed");
 

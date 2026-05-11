@@ -1,18 +1,18 @@
 // src/client/utils/ui.rs
+use super::receiver::ChatMessage;
+use super::safety::SafetyCode;
+use super::utils::parse_name_body;
+use super::utils::MemberIdentity;
 use tui::{
     backend::Backend,
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    Frame,
 };
-use unicode_width::UnicodeWidthStr;
-use super::safety::SafetyCode;
-use super::utils::MemberIdentity;
-use super::utils::parse_name_body;
-use super::receiver::ChatMessage;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
 pub struct RenderedChatRow {
@@ -23,9 +23,9 @@ pub struct RenderedChatRow {
 
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
-     .nth(n)
-     .map(|(idx, _)| idx)
-     .unwrap_or_else(|| s.len())
+        .nth(n)
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| s.len())
 }
 
 fn wrap_graphemes(text: &str, max_width: u16) -> Vec<String> {
@@ -149,9 +149,9 @@ pub fn draw_chat<B: Backend>(
         .margin(1)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(3),   // 成员栏
-            Constraint::Length(4),   // 传输状态
-            Constraint::Length(5),   // 输入框
+            Constraint::Length(3), // 成员栏
+            Constraint::Length(4), // 传输状态
+            Constraint::Length(5), // 输入框
         ])
         .split(size);
 
@@ -159,9 +159,7 @@ pub fn draw_chat<B: Backend>(
         .iter()
         .map(|row| {
             let style = if row.text.starts_with("┌-") {
-                Style::default()
-                    .fg(row.color)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(row.color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(row.color)
             };
@@ -171,10 +169,12 @@ pub fn draw_chat<B: Backend>(
 
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default()
-                .borders(Borders::ALL)
-                .title(format!("<Room: {}>", room_id))
-                .style(Style::default().fg(Color::Rgb(0, 135, 0))))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("<Room: {}>", room_id))
+                    .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+            )
             .highlight_symbol(">"),
         chunks[0],
         list_state,
@@ -191,9 +191,12 @@ pub fn draw_chat<B: Backend>(
             .join(", ")
     };
     f.render_widget(
-        Paragraph::new(members_text)
-            .block(Block::default().borders(Borders::ALL).title(members_title(safety_code))
-            .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
+        Paragraph::new(members_text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(members_title(safety_code))
+                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+        ),
         chunks[1],
     );
 
@@ -204,9 +207,12 @@ pub fn draw_chat<B: Backend>(
         transfer_lines.join("\n")
     };
     f.render_widget(
-        Paragraph::new(transfers_text)
-            .block(Block::default().borders(Borders::ALL).title("Transfers")
-            .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
+        Paragraph::new(transfers_text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Transfers")
+                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+        ),
         chunks[2],
     );
 
@@ -214,11 +220,12 @@ pub fn draw_chat<B: Backend>(
     let inner_width = (chunks[3].width - 2).max(1);
     let wrapped_input = wrap_graphemes(input, inner_width);
     f.render_widget(
-        Paragraph::new(wrapped_input.join("\n"))
-            .block(Block::default()
+        Paragraph::new(wrapped_input.join("\n")).block(
+            Block::default()
                 .borders(Borders::ALL)
                 .title(format!("{} >", username))
-                .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
+                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+        ),
         chunks[3],
     );
 
@@ -229,7 +236,7 @@ pub fn draw_chat<B: Backend>(
 
 pub fn members_title(safety_code: Option<&SafetyCode>) -> String {
     match safety_code {
-        Some(code) => format!("Members | Verify Code: {} ", code.emoji()),
+        Some(code) => format!("Members | Verify Code: {}", code.emoji()),
         None => "Members | Verify Code: ...".to_string(),
     }
 }
@@ -266,11 +273,14 @@ mod tests {
     fn members_title_shows_verify_code() {
         let code = SafetyCode {
             hash: [
-                0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
+                0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
             ],
         };
 
-        assert_eq!(members_title(Some(&code)), "Members | Verify Code: 🦊 🌙 🧊 🍀");
+        assert_eq!(
+            members_title(Some(&code)),
+            "Members | Verify Code: 🦊 🌙 🧊 🍀"
+        );
     }
 }

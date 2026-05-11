@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use sha2::{Digest as ShaDigest, Sha256};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt, BufReader, Lines},
@@ -14,21 +15,22 @@ use tokio::{
         mpsc::{UnboundedReceiver, UnboundedSender},
         Mutex, Notify,
     },
+    task::JoinHandle,
     time::{interval, timeout, Duration, Instant, MissedTickBehavior},
 };
-use tokio::net::tcp::OwnedWriteHalf;
 
+use super::attachment_store::AttachmentStore;
 use super::crypto::{RoomCryptoState, TransportOpenResult};
 use super::handshake::SharedTransportCrypto;
 use super::utils::{
-    build_attachment_chunk_line, build_attachment_meta_line, build_local_notice_line,
-    build_local_transfer_begin_line, build_local_transfer_done_line,
-    build_local_transfer_failed_line, build_local_transfer_progress_line,
-    build_server_invite_request_line, build_transport_packet_line, classify_outgoing_input,
-    create_invite_blob, create_invitation, file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
-    packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line,
-    parse_invite_error_line, parse_invite_token_line, parse_local_invite_request_line,
-    parse_local_ui_event,
+    build_attachment_chunk_line, build_attachment_meta_line, build_local_echo_attachment_line,
+    build_local_echo_text_line, build_local_notice_line, build_local_transfer_begin_line,
+    build_local_transfer_done_line, build_local_transfer_failed_line,
+    build_local_transfer_progress_line, build_server_invite_request_line,
+    build_transport_packet_line, classify_outgoing_input, create_invitation, create_invite_blob,
+    file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
+    packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line, parse_invite_error_line,
+    parse_invite_token_line, parse_local_invite_request_line, parse_local_ui_event,
     OutgoingPayload, ATTACHMENT_CHUNK_SIZE, ATTACHMENT_WINDOW_SIZE, PACKET_ACK_TIMEOUT_MS,
     PACKET_RETRY_LIMIT,
 };
@@ -134,11 +136,7 @@ impl InviteRegistry {
     ) -> Option<(String, String, Result<(String, i64), String>)> {
         let mut state = self.state.lock().await;
         let pending = state.pending.remove(request_id)?;
-        Some((
-            pending.server_addr,
-            pending.blob_key_b64,
-            pending.response?,
-        ))
+        Some((pending.server_addr, pending.blob_key_b64, pending.response?))
     }
 
     async fn has_response(&self, request_id: &str) -> bool {
@@ -162,11 +160,14 @@ struct AttachmentJob {
     file_name: String,
     total_size: u64,
     total_chunks: usize,
-    sha256_hex: String,
     next_chunk_index: usize,
     acked_chunks: usize,
     file: File,
     meta_sent: bool,
+    meta_packet_id: String,
+    meta_line: String,
+    meta_attempts: usize,
+    meta_last_sent_at: Option<Instant>,
     in_flight: Vec<InFlightChunk>,
 }
 
@@ -178,6 +179,11 @@ struct InFlightChunk {
     last_sent_at: Instant,
 }
 
+struct PreparingUpload {
+    path: PathBuf,
+    task: JoinHandle<Result<AttachmentJob>>,
+}
+
 pub async fn chat_loop(
     lines: Lines<BufReader<OwnedReadHalf>>,
     mut writer: OwnedWriteHalf,
@@ -185,6 +191,7 @@ pub async fn chat_loop(
     mut out_rx: UnboundedReceiver<String>,
     room_crypto: RoomCryptoState,
     transport: SharedTransportCrypto,
+    attachment_store: Arc<AttachmentStore>,
 ) -> Result<()> {
     let mut hb = interval(Duration::from_secs(30));
     let mut send_pump = interval(Duration::from_millis(5));
@@ -198,6 +205,7 @@ pub async fn chat_loop(
     let read_transport = transport.clone();
     let mut pending_uploads = VecDeque::<PathBuf>::new();
     let mut active_upload: Option<AttachmentJob> = None;
+    let mut preparing_upload: Option<PreparingUpload> = None;
 
     let reader = tokio::spawn(async move {
         let mut lines = lines;
@@ -227,7 +235,9 @@ pub async fn chat_loop(
                         continue;
                     }
                     if let Some((request_id, reason)) = parse_invite_error_line(&plain) {
-                        read_invite_registry.resolve_error(&request_id, reason).await;
+                        read_invite_registry
+                            .resolve_error(&request_id, reason)
+                            .await;
                         continue;
                     }
 
@@ -264,6 +274,7 @@ pub async fn chat_loop(
                             ack_registry.clone(),
                             invite_registry.clone(),
                             &mut pending_uploads,
+                            attachment_store.clone(),
                         ).await {
                             net_tx.send(build_local_notice_line(&format!("发送失败: {err}"))).ok();
                         }
@@ -275,7 +286,7 @@ pub async fn chat_loop(
                 }
             }
 
-            _ = send_pump.tick(), if active_upload.is_some() || !pending_uploads.is_empty() => {
+            _ = send_pump.tick(), if active_upload.is_some() || preparing_upload.is_some() || !pending_uploads.is_empty() => {
                 pump_attachment_upload(
                     &mut writer,
                     &net_tx,
@@ -283,7 +294,9 @@ pub async fn chat_loop(
                     transport.clone(),
                     ack_registry.clone(),
                     &mut pending_uploads,
+                    &mut preparing_upload,
                     &mut active_upload,
+                    attachment_store.clone(),
                 ).await;
             }
 
@@ -312,6 +325,7 @@ async fn handle_outgoing_input(
     ack_registry: Arc<AckRegistry>,
     invite_registry: Arc<InviteRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
+    _attachment_store: Arc<AttachmentStore>,
 ) -> Result<()> {
     if parse_local_ui_event(text).is_some() {
         net_tx.send(text.to_string()).ok();
@@ -319,17 +333,37 @@ async fn handle_outgoing_input(
     }
 
     if let Some(req) = parse_local_invite_request_line(text) {
-        return handle_invite_request(writer, net_tx, transport, ack_registry, invite_registry, req).await;
+        return handle_invite_request(
+            writer,
+            net_tx,
+            transport,
+            ack_registry,
+            invite_registry,
+            req,
+        )
+        .await;
     }
 
     match classify_outgoing_input(text)? {
         OutgoingPayload::Text(plain) => {
             let packet_id = packet_id_for_text();
-            send_room_payload_with_ack(writer, &packet_id, &plain, room_crypto, transport, ack_registry).await
+            send_room_payload_with_ack(
+                writer,
+                &packet_id,
+                &plain,
+                room_crypto,
+                transport,
+                ack_registry,
+            )
+            .await?;
+            net_tx.send(build_local_echo_text_line(&plain)).ok();
+            Ok(())
         }
         OutgoingPayload::AttachmentPath(path) => {
             pending_uploads.push_back(path);
-            net_tx.send(build_local_notice_line("附件已加入发送队列")).ok();
+            net_tx
+                .send(build_local_notice_line("附件已加入发送队列"))
+                .ok();
             Ok(())
         }
     }
@@ -343,10 +377,8 @@ async fn handle_invite_request(
     invite_registry: Arc<InviteRegistry>,
     req: super::utils::LocalInviteRequest,
 ) -> Result<()> {
-    let (blob_b64, blob_key_b64) = create_invite_blob(
-        req.room_id.clone(),
-        req.room_credential.clone(),
-    )?;
+    let (blob_b64, blob_key_b64) =
+        create_invite_blob(req.room_id.clone(), req.room_credential.clone())?;
     let notify = invite_registry
         .register(
             req.request_id.clone(),
@@ -362,14 +394,9 @@ async fn handle_invite_request(
         &blob_b64,
     );
     let packet_id = packet_id_for_text();
-    if let Err(err) = send_server_payload_with_ack(
-        writer,
-        &packet_id,
-        &server_line,
-        transport,
-        ack_registry,
-    )
-    .await
+    if let Err(err) =
+        send_server_payload_with_ack(writer, &packet_id, &server_line, transport, ack_registry)
+            .await
     {
         invite_registry.drop_request(&req.request_id).await;
         return Err(err);
@@ -422,34 +449,61 @@ async fn pump_attachment_upload(
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
+    preparing_upload: &mut Option<PreparingUpload>,
     active_upload: &mut Option<AttachmentJob>,
+    attachment_store: Arc<AttachmentStore>,
 ) {
     if active_upload.is_none() {
-        let Some(path) = pending_uploads.pop_front() else {
-            return;
-        };
-        match initialize_attachment_job(&path).await {
-            Ok(job) => {
-                net_tx
-                    .send(build_local_transfer_begin_line(
-                        &job.transfer_id,
-                        &job.file_name,
-                        job.total_chunks,
-                        job.total_size,
-                    ))
-                    .ok();
-                *active_upload = Some(job);
-            }
-            Err(err) => {
-                net_tx
-                    .send(build_local_notice_line(&format!(
-                        "附件初始化失败 {}: {err}",
-                        path.display()
-                    )))
-                    .ok();
+        if let Some(preparing) = preparing_upload.as_ref() {
+            if !preparing.task.is_finished() {
                 return;
             }
         }
+
+        if let Some(preparing) = preparing_upload.take() {
+            match preparing.task.await {
+                Ok(Ok(job)) => {
+                    net_tx
+                        .send(build_local_transfer_begin_line(
+                            &job.transfer_id,
+                            &job.file_name,
+                            job.total_chunks,
+                            job.total_size,
+                        ))
+                        .ok();
+                    *active_upload = Some(job);
+                }
+                Ok(Err(err)) => {
+                    net_tx
+                        .send(build_local_notice_line(&format!(
+                            "附件初始化失败 {}: {err}",
+                            preparing.path.display()
+                        )))
+                        .ok();
+                }
+                Err(err) => {
+                    net_tx
+                        .send(build_local_notice_line(&format!(
+                            "附件初始化任务失败 {}: {err}",
+                            preparing.path.display()
+                        )))
+                        .ok();
+                }
+            }
+            if active_upload.is_none() {
+                return;
+            }
+        }
+
+        let Some(path) = pending_uploads.pop_front() else {
+            return;
+        };
+        let prep_path = path.clone();
+        *preparing_upload = Some(PreparingUpload {
+            path,
+            task: tokio::spawn(async move { initialize_attachment_job_owned(prep_path).await }),
+        });
+        return;
     }
 
     let Some(job) = active_upload.as_mut() else {
@@ -457,35 +511,38 @@ async fn pump_attachment_upload(
     };
 
     if !job.meta_sent {
-        let meta_line = build_attachment_meta_line(
-            &job.transfer_id,
-            infer_attachment_kind(&job.path),
-            &job.file_name,
-            job.total_size,
-            job.total_chunks,
-            &job.sha256_hex,
-        );
-        let packet_id = packet_id_for_attachment_meta(&job.transfer_id);
-        match send_room_payload_with_ack(
+        match process_attachment_meta(
             writer,
-            &packet_id,
-            &meta_line,
             room_crypto,
             transport.clone(),
             ack_registry.clone(),
+            job,
         )
         .await
         {
-            Ok(_) => {
-                job.meta_sent = true;
+            Ok(true) => {
                 if job.total_chunks == 0 {
-                    net_tx.send(build_local_transfer_done_line(&job.transfer_id)).ok();
+                    if let Err(err) =
+                        emit_local_attachment_echo(net_tx, attachment_store.as_ref(), job).await
+                    {
+                        net_tx
+                            .send(build_local_notice_line(&format!("附件本地回显失败: {err}")))
+                            .ok();
+                    }
+                    net_tx
+                        .send(build_local_transfer_done_line(&job.transfer_id))
+                        .ok();
                     *active_upload = None;
                 }
             }
+            Ok(false) => {}
             Err(err) => {
+                ack_registry.finish(&job.meta_packet_id).await;
                 net_tx
-                    .send(build_local_transfer_failed_line(&job.transfer_id, &err.to_string()))
+                    .send(build_local_transfer_failed_line(
+                        &job.transfer_id,
+                        &err.to_string(),
+                    ))
                     .ok();
                 *active_upload = None;
             }
@@ -518,7 +575,14 @@ async fn pump_attachment_upload(
         && job.next_chunk_index >= job.total_chunks
         && job.in_flight.is_empty()
     {
-        net_tx.send(build_local_transfer_done_line(&job.transfer_id)).ok();
+        if let Err(err) = emit_local_attachment_echo(net_tx, attachment_store.as_ref(), job).await {
+            net_tx
+                .send(build_local_notice_line(&format!("附件本地回显失败: {err}")))
+                .ok();
+        }
+        net_tx
+            .send(build_local_transfer_done_line(&job.transfer_id))
+            .ok();
         *active_upload = None;
     }
 }
@@ -589,7 +653,14 @@ async fn process_attachment_window(
 
         let chunk_line = build_attachment_chunk_line(&job.transfer_id, chunk_index, &buf[..read]);
         let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, chunk_index);
-        send_room_payload_now(writer, &packet_id, &chunk_line, room_crypto, transport.clone()).await?;
+        send_room_payload_now(
+            writer,
+            &packet_id,
+            &chunk_line,
+            room_crypto,
+            transport.clone(),
+        )
+        .await?;
         job.in_flight.push(InFlightChunk {
             packet_id,
             chunk_line,
@@ -609,8 +680,8 @@ async fn cleanup_attachment_window(ack_registry: Arc<AckRegistry>, job: &Attachm
     }
 }
 
-async fn initialize_attachment_job(path: &Path) -> Result<AttachmentJob> {
-    let metadata = tokio::fs::metadata(path).await?;
+async fn initialize_attachment_job_owned(path: PathBuf) -> Result<AttachmentJob> {
+    let metadata = tokio::fs::metadata(&path).await?;
     if !metadata.is_file() {
         return Err(anyhow!("Path is not a file: {}", path.display()));
     }
@@ -621,23 +692,98 @@ async fn initialize_attachment_job(path: &Path) -> Result<AttachmentJob> {
     } else {
         usize::try_from(total_size)?.div_ceil(ATTACHMENT_CHUNK_SIZE)
     };
-    let file_name = file_name_or_default(path);
-    let sha256_hex = hash_file(path).await?;
-    let file = File::open(path).await?;
+    let file_name = file_name_or_default(&path);
+    let sha256_hex = hash_file(&path).await?;
+    let file = File::open(&path).await?;
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string();
 
     Ok(AttachmentJob {
-        path: path.to_path_buf(),
-        transfer_id: uuid::Uuid::new_v4().simple().to_string(),
+        meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
+        meta_line: build_attachment_meta_line(
+            &transfer_id,
+            infer_attachment_kind(&path),
+            &file_name,
+            total_size,
+            total_chunks,
+            &sha256_hex,
+        ),
+        path,
+        transfer_id,
         file_name,
         total_size,
         total_chunks,
-        sha256_hex,
         next_chunk_index: 0,
         acked_chunks: 0,
         file,
         meta_sent: false,
+        meta_attempts: 0,
+        meta_last_sent_at: None,
         in_flight: Vec::new(),
     })
+}
+
+async fn process_attachment_meta(
+    writer: &mut OwnedWriteHalf,
+    room_crypto: &RoomCryptoState,
+    transport: SharedTransportCrypto,
+    ack_registry: Arc<AckRegistry>,
+    job: &mut AttachmentJob,
+) -> Result<bool> {
+    let max_attempts = PACKET_RETRY_LIMIT + 1;
+
+    if ack_registry.is_acked(&job.meta_packet_id).await {
+        ack_registry.finish(&job.meta_packet_id).await;
+        job.meta_sent = true;
+        return Ok(true);
+    }
+
+    let should_send = match job.meta_last_sent_at {
+        None => true,
+        Some(last_sent_at)
+            if last_sent_at.elapsed() >= Duration::from_millis(PACKET_ACK_TIMEOUT_MS) =>
+        {
+            if job.meta_attempts >= max_attempts {
+                ack_registry.finish(&job.meta_packet_id).await;
+                return Err(anyhow!("ACK timeout for attachment metadata"));
+            }
+            true
+        }
+        Some(_) => false,
+    };
+
+    if should_send {
+        ack_registry.subscribe(&job.meta_packet_id).await;
+        send_room_payload_now(
+            writer,
+            &job.meta_packet_id,
+            &job.meta_line,
+            room_crypto,
+            transport,
+        )
+        .await?;
+        job.meta_attempts += 1;
+        job.meta_last_sent_at = Some(Instant::now());
+    }
+
+    Ok(false)
+}
+
+async fn emit_local_attachment_echo(
+    net_tx: &UnboundedSender<String>,
+    attachment_store: &AttachmentStore,
+    job: &AttachmentJob,
+) -> Result<()> {
+    let bytes = tokio::fs::read(&job.path).await?;
+    let attachment_id = attachment_store.store_attachment(&job.file_name, &bytes)?;
+    net_tx
+        .send(build_local_echo_attachment_line(
+            &attachment_id,
+            &job.file_name,
+            job.total_size,
+            infer_attachment_kind(&job.path),
+        ))
+        .ok();
+    Ok(())
 }
 
 async fn send_room_payload_with_ack(
@@ -694,8 +840,11 @@ async fn send_transport_payload_with_ack(
             return Ok(());
         }
 
-        let ack_result =
-            timeout(timeout_duration, wait_for_ack(packet_id, notify, ack_registry.clone())).await;
+        let ack_result = timeout(
+            timeout_duration,
+            wait_for_ack(packet_id, notify, ack_registry.clone()),
+        )
+        .await;
         if ack_result.is_ok() {
             ack_registry.finish(packet_id).await;
             return Ok(());
