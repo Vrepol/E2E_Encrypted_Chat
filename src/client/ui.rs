@@ -8,6 +8,7 @@ use tui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
+use super::safety::SafetyCode;
 use super::utils::MemberIdentity;
 use super::utils::parse_name_body;
 use super::receiver::ChatMessage;
@@ -140,6 +141,7 @@ pub fn draw_chat<B: Backend>(
     cursor: usize,
     username: &str,
     room_id: &str,
+    safety_code: Option<&SafetyCode>,
 ) {
     let size = f.size();
     let chunks = Layout::default()
@@ -190,7 +192,7 @@ pub fn draw_chat<B: Backend>(
     };
     f.render_widget(
         Paragraph::new(members_text)
-            .block(Block::default().borders(Borders::ALL).title("Members")
+            .block(Block::default().borders(Borders::ALL).title(members_title(safety_code))
             .style(Style::default().fg(Color::Rgb(0, 135, 0)))),
         chunks[1],
     );
@@ -225,9 +227,17 @@ pub fn draw_chat<B: Backend>(
     f.set_cursor(chunks[3].x + 1 + cursor_x, chunks[3].y + 1 + cursor_y);
 }
 
+pub fn members_title(safety_code: Option<&SafetyCode>) -> String {
+    match safety_code {
+        Some(code) => format!("Members | Verify Code: {} ", code.emoji()),
+        None => "Members | Verify Code: ...".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{input_cursor_position, wrap_graphemes};
+    use super::{input_cursor_position, members_title, wrap_graphemes};
+    use crate::client::safety::SafetyCode;
 
     #[test]
     fn cursor_advances_for_trailing_space() {
@@ -250,5 +260,17 @@ mod tests {
             wrap_graphemes("很多都是 咔哒蚀刻换手机", 10),
             vec!["很多都是 ", "咔哒蚀刻换", "手机"]
         );
+    }
+
+    #[test]
+    fn members_title_shows_verify_code() {
+        let code = SafetyCode {
+            hash: [
+                0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0,
+            ],
+        };
+
+        assert_eq!(members_title(Some(&code)), "Members | Verify Code: 🦊 🌙 🧊 🍀");
     }
 }

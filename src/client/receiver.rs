@@ -183,7 +183,9 @@ pub fn drain_messages(
     members: &mut Vec<MemberIdentity>,
     receiver_state: &mut ReceiverState,
     transfer_ui_state: &mut TransferUiState,
-) {
+) -> bool {
+    let mut member_list_changed = false;
+
     while let Ok(line) = net_rx.try_recv() {
         if should_drop_unframed_control_line(&line) {
             continue;
@@ -192,6 +194,7 @@ pub fn drain_messages(
         if let Some(parsed_members) = parse_member_list_line(&line) {
             members.clear();
             members.extend(parsed_members);
+            member_list_changed = true;
             continue;
         }
 
@@ -231,6 +234,8 @@ pub fn drain_messages(
         }
         push_message(messages, message);
     }
+
+    member_list_changed
 }
 
 fn register_attachment(

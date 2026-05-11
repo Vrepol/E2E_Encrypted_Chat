@@ -26,6 +26,7 @@ use tui::{
 /* ---------- 本地 crate ---------- */
 use rust_chat::client::{
     attachment_store::AttachmentStore,
+    safety::{compute_room_safety_state, RoomSafetyState, SafetyTranscript},
     utils::inviation_clear,
     network,
     receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState},
@@ -143,6 +144,7 @@ async fn main() -> Result<()> {
     let ui_mode = UiMode::Chat;
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut member_list: Vec<MemberIdentity>   = Vec::new();
+    let mut room_safety_state: Option<RoomSafetyState> = None;
     let mut receiver_state = ReceiverState::default();
     let mut transfer_ui_state = TransferUiState::default();
     let mut input = String::new();
@@ -180,6 +182,7 @@ async fn main() -> Result<()> {
                     cursor,
                     &username,
                     &room_id,
+                    room_safety_state.as_ref().map(|state| &state.code),
                 ),
                 UiMode::_ImagePreview(_) => { /* 这里什么也不画，draw_image 会接管 */ }
             }
@@ -216,7 +219,7 @@ async fn main() -> Result<()> {
             .selected()
             .map(|i| i + 1 >= chat_rows.len())
             .unwrap_or(true);
-        drain_messages(
+        let member_list_changed = drain_messages(
             &mut net_rx,
             &mut messages,
             &username,
@@ -226,6 +229,10 @@ async fn main() -> Result<()> {
             &mut receiver_state,
             &mut transfer_ui_state,
         );
+        if member_list_changed {
+            let transcript = SafetyTranscript::room_v0(&room_id, &member_list);
+            room_safety_state = Some(compute_room_safety_state(transcript));
+        }
         let size = terminal.size()?;
         chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
         if was_at_bottom && !chat_rows.is_empty() {

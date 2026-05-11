@@ -11,3 +11,4 @@ pub mod attachment_store;
 pub mod keyboard;
 pub mod ui;
 pub mod local_server;
+pub mod safety;
