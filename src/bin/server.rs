@@ -610,13 +610,13 @@ async fn enter_room_loop(
                             continue;
                         }
 
-                        let (broadcast_priority, broadcast_payload) = if let Some((packet_id, room_cipher)) = parse_transport_packet_line(&server_plain) {
+                        let (broadcast_priority, broadcast_payload) = if let Some((packet_id, packet_payload)) = parse_transport_packet_line(&server_plain) {
                             let ack = build_ack_line(&packet_id);
                             let _ = write_transport_plain(writer, &mut transport, &ack).await;
                             if is_duplicate {
                                 continue;
                             }
-                            (packet_priority(&packet_id), room_cipher)
+                            (packet_priority(&packet_id), packet_payload)
                         } else {
                             if is_duplicate {
                                 continue;

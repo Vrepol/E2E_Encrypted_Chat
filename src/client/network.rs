@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use rand::RngCore;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::{
@@ -20,19 +21,19 @@ use tokio::{
 };
 
 use super::attachment_store::AttachmentStore;
-use super::crypto::{RoomCryptoState, TransportOpenResult};
-use super::handshake::SharedTransportCrypto;
+use super::crypto::{encrypt_message, zeroize, SecureMessageType, TransportOpenResult};
+use super::handshake::{SharedGroupCrypto, SharedTransportCrypto};
 use super::utils::{
-    build_attachment_chunk_line, build_attachment_meta_line, build_local_echo_attachment_line,
+    build_file_chunk2_line, build_file_manifest2_line, build_local_echo_attachment_line,
     build_local_echo_text_line, build_local_notice_line, build_local_transfer_begin_line,
     build_local_transfer_done_line, build_local_transfer_failed_line,
-    build_local_transfer_progress_line, build_server_invite_request_line,
+    build_local_transfer_progress_line, build_rmsg_line, build_server_invite_request_line,
     build_transport_packet_line, classify_outgoing_input, create_invitation, create_invite_blob,
-    file_name_or_default, infer_attachment_kind, packet_id_for_attachment_chunk,
-    packet_id_for_attachment_meta, packet_id_for_text, parse_ack_line, parse_invite_error_line,
-    parse_invite_token_line, parse_local_invite_request_line, parse_local_ui_event,
-    OutgoingPayload, ATTACHMENT_CHUNK_SIZE, ATTACHMENT_WINDOW_SIZE, PACKET_ACK_TIMEOUT_MS,
-    PACKET_RETRY_LIMIT,
+    file_name_or_default, infer_attachment_kind, is_epoch_control_line,
+    packet_id_for_attachment_chunk, packet_id_for_attachment_meta, packet_id_for_text,
+    parse_ack_line, parse_invite_error_line, parse_invite_token_line,
+    parse_local_invite_request_line, parse_local_ui_event, OutgoingPayload, ATTACHMENT_CHUNK_SIZE,
+    ATTACHMENT_WINDOW_SIZE, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
 };
 
 #[derive(Default)]
@@ -165,10 +166,20 @@ struct AttachmentJob {
     file: File,
     meta_sent: bool,
     meta_packet_id: String,
-    meta_line: String,
+    manifest_plain_line: String,
+    manifest_secure_line: Option<String>,
     meta_attempts: usize,
     meta_last_sent_at: Option<Instant>,
+    file_key: [u8; 32],
+    nonce_base: [u8; 8],
     in_flight: Vec<InFlightChunk>,
+}
+
+impl Drop for AttachmentJob {
+    fn drop(&mut self) {
+        zeroize(&mut self.file_key);
+        zeroize(&mut self.nonce_base);
+    }
 }
 
 struct InFlightChunk {
@@ -189,7 +200,7 @@ pub async fn chat_loop(
     mut writer: OwnedWriteHalf,
     net_tx: UnboundedSender<String>,
     mut out_rx: UnboundedReceiver<String>,
-    room_crypto: RoomCryptoState,
+    group_crypto: SharedGroupCrypto,
     transport: SharedTransportCrypto,
     attachment_store: Arc<AttachmentStore>,
 ) -> Result<()> {
@@ -269,7 +280,7 @@ pub async fn chat_loop(
                             &mut writer,
                             &text,
                             &net_tx,
-                            &room_crypto,
+                            group_crypto.clone(),
                             transport.clone(),
                             ack_registry.clone(),
                             invite_registry.clone(),
@@ -290,7 +301,7 @@ pub async fn chat_loop(
                 pump_attachment_upload(
                     &mut writer,
                     &net_tx,
-                    &room_crypto,
+                    group_crypto.clone(),
                     transport.clone(),
                     ack_registry.clone(),
                     &mut pending_uploads,
@@ -320,7 +331,7 @@ async fn handle_outgoing_input(
     writer: &mut OwnedWriteHalf,
     text: &str,
     net_tx: &UnboundedSender<String>,
-    room_crypto: &RoomCryptoState,
+    group_crypto: SharedGroupCrypto,
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     invite_registry: Arc<InviteRegistry>,
@@ -347,11 +358,29 @@ async fn handle_outgoing_input(
     match classify_outgoing_input(text)? {
         OutgoingPayload::Text(plain) => {
             let packet_id = packet_id_for_text();
-            send_room_payload_with_ack(
+            if is_epoch_control_line(&plain) {
+                send_transport_payload_with_ack(
+                    writer,
+                    &packet_id,
+                    &plain,
+                    transport,
+                    ack_registry,
+                )
+                .await?;
+                return Ok(());
+            }
+            let secure_line = {
+                let mut guard = group_crypto
+                    .lock()
+                    .map_err(|_| anyhow!("Group crypto state unavailable"))?;
+                let encrypted =
+                    encrypt_message(&mut guard, SecureMessageType::Text, plain.as_bytes())?;
+                build_rmsg_line(&encrypted)?
+            };
+            send_transport_payload_with_ack(
                 writer,
                 &packet_id,
-                &plain,
-                room_crypto,
+                &secure_line,
                 transport,
                 ack_registry,
             )
@@ -445,7 +474,7 @@ async fn wait_for_invite_response(
 async fn pump_attachment_upload(
     writer: &mut OwnedWriteHalf,
     net_tx: &UnboundedSender<String>,
-    room_crypto: &RoomCryptoState,
+    group_crypto: SharedGroupCrypto,
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     pending_uploads: &mut VecDeque<PathBuf>,
@@ -513,7 +542,7 @@ async fn pump_attachment_upload(
     if !job.meta_sent {
         match process_attachment_meta(
             writer,
-            room_crypto,
+            group_crypto,
             transport.clone(),
             ack_registry.clone(),
             job,
@@ -550,15 +579,8 @@ async fn pump_attachment_upload(
         return;
     }
 
-    if let Err(err) = process_attachment_window(
-        writer,
-        net_tx,
-        room_crypto,
-        transport,
-        ack_registry.clone(),
-        job,
-    )
-    .await
+    if let Err(err) =
+        process_attachment_window(writer, net_tx, transport, ack_registry.clone(), job).await
     {
         cleanup_attachment_window(ack_registry.clone(), job).await;
         net_tx
@@ -590,7 +612,6 @@ async fn pump_attachment_upload(
 async fn process_attachment_window(
     writer: &mut OwnedWriteHalf,
     net_tx: &UnboundedSender<String>,
-    room_crypto: &RoomCryptoState,
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     job: &mut AttachmentJob,
@@ -625,11 +646,10 @@ async fn process_attachment_window(
                 ));
             }
 
-            send_room_payload_now(
+            send_transport_payload_now(
                 writer,
                 &job.in_flight[idx].packet_id,
                 &job.in_flight[idx].chunk_line,
-                room_crypto,
                 transport.clone(),
             )
             .await?;
@@ -651,16 +671,15 @@ async fn process_attachment_window(
             ));
         }
 
-        let chunk_line = build_attachment_chunk_line(&job.transfer_id, chunk_index, &buf[..read]);
+        let chunk_line = build_file_chunk2_line(
+            &job.transfer_id,
+            chunk_index,
+            &buf[..read],
+            &job.file_key,
+            &job.nonce_base,
+        )?;
         let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, chunk_index);
-        send_room_payload_now(
-            writer,
-            &packet_id,
-            &chunk_line,
-            room_crypto,
-            transport.clone(),
-        )
-        .await?;
+        send_transport_payload_now(writer, &packet_id, &chunk_line, transport.clone()).await?;
         job.in_flight.push(InFlightChunk {
             packet_id,
             chunk_line,
@@ -696,17 +715,25 @@ async fn initialize_attachment_job_owned(path: PathBuf) -> Result<AttachmentJob>
     let sha256_hex = hash_file(&path).await?;
     let file = File::open(&path).await?;
     let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut file_key = [0u8; 32];
+    let mut nonce_base = [0u8; 8];
+    rand::rng().fill_bytes(&mut file_key);
+    rand::rng().fill_bytes(&mut nonce_base);
+    let manifest_plain_line = build_file_manifest2_line(
+        &transfer_id,
+        infer_attachment_kind(&path),
+        &file_name,
+        total_size,
+        total_chunks,
+        &sha256_hex,
+        &file_key,
+        &nonce_base,
+    )?;
 
     Ok(AttachmentJob {
         meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
-        meta_line: build_attachment_meta_line(
-            &transfer_id,
-            infer_attachment_kind(&path),
-            &file_name,
-            total_size,
-            total_chunks,
-            &sha256_hex,
-        ),
+        manifest_plain_line,
+        manifest_secure_line: None,
         path,
         transfer_id,
         file_name,
@@ -718,13 +745,15 @@ async fn initialize_attachment_job_owned(path: PathBuf) -> Result<AttachmentJob>
         meta_sent: false,
         meta_attempts: 0,
         meta_last_sent_at: None,
+        file_key,
+        nonce_base,
         in_flight: Vec::new(),
     })
 }
 
 async fn process_attachment_meta(
     writer: &mut OwnedWriteHalf,
-    room_crypto: &RoomCryptoState,
+    group_crypto: SharedGroupCrypto,
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     job: &mut AttachmentJob,
@@ -753,14 +782,25 @@ async fn process_attachment_meta(
 
     if should_send {
         ack_registry.subscribe(&job.meta_packet_id).await;
-        send_room_payload_now(
-            writer,
-            &job.meta_packet_id,
-            &job.meta_line,
-            room_crypto,
-            transport,
-        )
-        .await?;
+        if job.manifest_secure_line.is_none() {
+            let secure_line = {
+                let mut guard = group_crypto
+                    .lock()
+                    .map_err(|_| anyhow!("Group crypto state unavailable"))?;
+                let encrypted = encrypt_message(
+                    &mut guard,
+                    SecureMessageType::FileManifest,
+                    job.manifest_plain_line.as_bytes(),
+                )?;
+                build_rmsg_line(&encrypted)?
+            };
+            job.manifest_secure_line = Some(secure_line);
+        }
+        let secure_line = job
+            .manifest_secure_line
+            .as_ref()
+            .ok_or_else(|| anyhow!("Attachment manifest is unavailable"))?;
+        send_transport_payload_now(writer, &job.meta_packet_id, secure_line, transport).await?;
         job.meta_attempts += 1;
         job.meta_last_sent_at = Some(Instant::now());
     }
@@ -784,29 +824,6 @@ async fn emit_local_attachment_echo(
         ))
         .ok();
     Ok(())
-}
-
-async fn send_room_payload_with_ack(
-    writer: &mut OwnedWriteHalf,
-    packet_id: &str,
-    plain: &str,
-    room_crypto: &RoomCryptoState,
-    transport: SharedTransportCrypto,
-    ack_registry: Arc<AckRegistry>,
-) -> Result<()> {
-    let room_cipher = room_crypto.seal(plain);
-    send_transport_payload_with_ack(writer, packet_id, &room_cipher, transport, ack_registry).await
-}
-
-async fn send_room_payload_now(
-    writer: &mut OwnedWriteHalf,
-    packet_id: &str,
-    plain: &str,
-    room_crypto: &RoomCryptoState,
-    transport: SharedTransportCrypto,
-) -> Result<()> {
-    let room_cipher = room_crypto.seal(plain);
-    send_transport_payload_now(writer, packet_id, &room_cipher, transport).await
 }
 
 async fn send_server_payload_with_ack(

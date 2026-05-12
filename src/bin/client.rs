@@ -28,8 +28,7 @@ use rust_chat::client::{
     network,
     receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState},
     safety::{compute_room_safety_state, RoomSafetyState, SafetyTranscript},
-    utils::inviation_clear,
-    utils::MemberIdentity,
+    utils::{build_epoch_commit_line, build_key_announce_line, inviation_clear, MemberIdentity},
 };
 /// 第 n 个字形单元（grapheme）在字符串中的字节偏移
 // ================== UI 事件枚举 ==================
@@ -92,8 +91,8 @@ async fn main() -> Result<()> {
         server_addr = inviation_clear(&server_addr);
 
         /* ---------- 3. 启动网络任务（自动重连 + 心跳） ---------- */
-        let room_crypto = session.room_crypto.clone();
-        let ui_room_crypto = session.room_crypto.clone();
+        let group_crypto = session.group_crypto.clone();
+        let ui_group_crypto = session.group_crypto.clone();
         let transport = session.transport.clone();
         let lines = session.lines;
         let writer = session.writer;
@@ -107,7 +106,7 @@ async fn main() -> Result<()> {
                 writer,
                 net_tx,
                 out_rx,
-                room_crypto,
+                group_crypto,
                 transport,
                 net_attachment_store,
             )
@@ -163,6 +162,7 @@ async fn main() -> Result<()> {
             build_chat_rows, chat_inner_width, draw_chat, RenderedChatRow,
         };
         let mut chat_rows: Vec<RenderedChatRow>;
+        trigger_phase2_actions(&out_tx, &ui_group_crypto);
         /* ---------- 7. 主循环 ---------- */
         'ui: loop {
             let size = terminal.size()?;
@@ -226,19 +226,22 @@ async fn main() -> Result<()> {
                 .selected()
                 .map(|i| i + 1 >= chat_rows.len())
                 .unwrap_or(true);
-            let member_list_changed = drain_messages(
+            let drain_outcome = drain_messages(
                 &mut net_rx,
                 &mut messages,
                 &username,
-                &ui_room_crypto,
+                &ui_group_crypto,
                 attachment_store.as_ref(),
                 &mut member_list,
                 &mut receiver_state,
                 &mut transfer_ui_state,
             );
-            if member_list_changed {
+            if drain_outcome.member_list_changed {
                 let transcript = SafetyTranscript::room_v0(&room_id, &member_list);
                 room_safety_state = Some(compute_room_safety_state(transcript));
+            }
+            if drain_outcome.phase2_action_needed {
+                trigger_phase2_actions(&out_tx, &ui_group_crypto);
             }
             let size = terminal.size()?;
             chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
@@ -263,5 +266,36 @@ async fn main() -> Result<()> {
             "========Press Crtl + C to quit========\n".red().bold()
         );
         continue;
+    }
+}
+
+fn trigger_phase2_actions(
+    out_tx: &tokio_mpsc::UnboundedSender<String>,
+    group_crypto: &handshake::SharedGroupCrypto,
+) {
+    let (announce_line, commit_line, local_commit) = {
+        let Ok(mut guard) = group_crypto.lock() else {
+            return;
+        };
+        let announce_line = build_key_announce_line(&guard.local_key_announce()).ok();
+        let local_commit = guard.build_join_epoch_commit().ok().flatten();
+        let commit_line = local_commit
+            .as_ref()
+            .and_then(|commit| build_epoch_commit_line(commit).ok());
+        (announce_line, commit_line, local_commit)
+    };
+
+    if let Some(line) = announce_line {
+        out_tx.send(line).ok();
+    }
+
+    if let Some(line) = commit_line {
+        out_tx.send(line).ok();
+    }
+
+    if let Some(commit) = local_commit {
+        if let Ok(mut guard) = group_crypto.lock() {
+            let _ = guard.apply_epoch_commit(&commit);
+        }
     }
 }

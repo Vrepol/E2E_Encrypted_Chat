@@ -1,21 +1,23 @@
 use std::collections::HashMap;
 
-use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
 use sha2::{Digest as ShaDigest, Sha256};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::client::utils::{
-    parse_attachment_frame, parse_local_ui_event, parse_member_list_line, parse_text_img,
-    render_transfer_line, sanitize_attachment_name, AttachmentChunk, AttachmentFrame,
-    AttachmentMeta, LocalUiEvent, MemberIdentity,
+    decrypt_file_chunk2, parse_attachment_frame, parse_display_body, parse_epoch_commit_line,
+    parse_key_announce_line, parse_local_ui_event, parse_member_list_line, parse_rmsg_line,
+    render_transfer_line, sanitize_attachment_name, AttachmentFrame, AttachmentMeta,
+    EncryptedAttachmentChunk, LocalUiEvent, MemberIdentity,
 };
 
 use super::attachment_store::AttachmentStore;
-use super::crypto::RoomCryptoState;
+use super::crypto::{decrypt_message, zeroize, EpochCommit};
+use super::handshake::SharedGroupCrypto;
 use super::notifier;
 
 const DRAIN_BATCH_LIMIT: usize = 128;
+const PENDING_EPOCH_COMMIT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentKind {
@@ -228,6 +230,7 @@ impl TransferUiState {
 #[derive(Default)]
 pub struct ReceiverState {
     incoming: HashMap<String, IncomingAttachment>,
+    pending_epoch_commits: Vec<EpochCommit>,
 }
 
 struct IncomingAttachment {
@@ -237,21 +240,36 @@ struct IncomingAttachment {
     total_chunks: usize,
     sha256_hex: String,
     kind: AttachmentKind,
+    file_key: [u8; 32],
+    nonce_base: [u8; 8],
     chunks: Vec<Option<Vec<u8>>>,
     received_chunks: usize,
+}
+
+impl Drop for IncomingAttachment {
+    fn drop(&mut self) {
+        zeroize(&mut self.file_key);
+        zeroize(&mut self.nonce_base);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrainOutcome {
+    pub member_list_changed: bool,
+    pub phase2_action_needed: bool,
 }
 
 pub fn drain_messages(
     net_rx: &mut UnboundedReceiver<String>,
     messages: &mut Vec<ChatMessage>,
     my_name: &str,
-    room_crypto: &RoomCryptoState,
+    group_crypto: &SharedGroupCrypto,
     attachment_store: &AttachmentStore,
     members: &mut Vec<MemberIdentity>,
     receiver_state: &mut ReceiverState,
     transfer_ui_state: &mut TransferUiState,
-) -> bool {
-    let mut member_list_changed = false;
+) -> DrainOutcome {
+    let mut outcome = DrainOutcome::default();
     let mut processed = 0usize;
 
     while let Ok(line) = net_rx.try_recv() {
@@ -266,8 +284,17 @@ pub fn drain_messages(
 
         if let Some(parsed_members) = parse_member_list_line(&line) {
             members.clear();
-            members.extend(parsed_members);
-            member_list_changed = true;
+            members.extend(parsed_members.clone());
+            if let Ok(mut guard) = group_crypto.lock() {
+                let _ = guard.replace_members(
+                    parsed_members
+                        .iter()
+                        .map(|member| (member.member_id.clone(), member.nickname.clone())),
+                );
+                retry_pending_epoch_commits(receiver_state, &mut guard);
+            }
+            outcome.member_list_changed = true;
+            outcome.phase2_action_needed = true;
             if processed >= DRAIN_BATCH_LIMIT {
                 break;
             }
@@ -284,8 +311,79 @@ pub fn drain_messages(
             continue;
         }
 
-        let (sender, body) = parse_text_img(&line, room_crypto);
         let hms = Local::now().format("%H:%M:%S").to_string();
+        let (outer_sender, raw_body) = parse_display_body(&line);
+        if let Some(announce) = parse_key_announce_line(&raw_body) {
+            if let Ok(mut guard) = group_crypto.lock() {
+                if guard.apply_key_announce(&announce).unwrap_or(false) {
+                    outcome.phase2_action_needed = true;
+                }
+                retry_pending_epoch_commits(receiver_state, &mut guard);
+            }
+            if processed >= DRAIN_BATCH_LIMIT {
+                break;
+            }
+            continue;
+        }
+        if let Some(commit) = parse_epoch_commit_line(&raw_body) {
+            if let Ok(mut guard) = group_crypto.lock() {
+                if guard.apply_epoch_commit(&commit).is_err() {
+                    queue_pending_epoch_commit(receiver_state, commit);
+                }
+            }
+            if processed >= DRAIN_BATCH_LIMIT {
+                break;
+            }
+            continue;
+        }
+        if let Some(AttachmentFrame::EncryptedChunk(chunk)) = parse_attachment_frame(&raw_body) {
+            let result = append_encrypted_attachment_chunk(
+                receiver_state,
+                chunk,
+                attachment_store,
+                transfer_ui_state,
+                &hms,
+            );
+            if let Some(message) = attachment_result_to_message(result, &hms) {
+                if outer_sender != my_name {
+                    notifier::notify();
+                }
+                push_message(messages, message);
+            }
+            if processed >= DRAIN_BATCH_LIMIT {
+                break;
+            }
+            continue;
+        }
+        let decrypted = parse_rmsg_line(&raw_body).and_then(|encrypted| {
+            let mut guard = group_crypto.lock().ok()?;
+            decrypt_message(&mut guard, &encrypted)
+                .ok()
+                .and_then(|message| {
+                    let body = String::from_utf8(message.plaintext).ok()?;
+                    let sender = guard
+                        .member_display_name(&message.header.sender_id)
+                        .unwrap_or_else(|| outer_sender.clone());
+                    Some((sender, message.header.msg_type, body))
+                })
+        });
+
+        let (sender, body) = match decrypted {
+            Some((sender, _msg_type, body)) => (sender, body),
+            None if raw_body.starts_with("/RMSG ") => {
+                if processed >= DRAIN_BATCH_LIMIT {
+                    break;
+                }
+                continue;
+            }
+            None if line.starts_with("⚡ ") => ("System".to_string(), line),
+            None => {
+                if processed >= DRAIN_BATCH_LIMIT {
+                    break;
+                }
+                continue;
+            }
+        };
 
         let result = match parse_attachment_frame(&body) {
             Some(AttachmentFrame::Meta(meta)) => register_attachment(
@@ -296,25 +394,19 @@ pub fn drain_messages(
                 transfer_ui_state,
                 &hms,
             ),
-            Some(AttachmentFrame::Chunk(chunk)) => append_attachment_chunk(
+            Some(AttachmentFrame::EncryptedChunk(chunk)) => append_encrypted_attachment_chunk(
                 receiver_state,
                 chunk,
                 attachment_store,
                 transfer_ui_state,
                 &hms,
             ),
-            None if body.starts_with("/IMGDATA") => {
-                Ok(decode_legacy_image(&sender, &body, attachment_store, &hms))
-            }
             None => Ok(Some(ChatMessage::Text(format_text_message(
                 &sender, &body, &hms,
             )))),
         };
 
-        let Some(message) = (match result {
-            Ok(message) => message,
-            Err(err) => Some(ChatMessage::Text(format!("[System] [{hms}] {err}"))),
-        }) else {
+        let Some(message) = attachment_result_to_message(result, &hms) else {
             continue;
         };
 
@@ -328,7 +420,49 @@ pub fn drain_messages(
         }
     }
 
-    member_list_changed
+    outcome
+}
+
+fn attachment_result_to_message(
+    result: Result<Option<ChatMessage>, String>,
+    hms: &str,
+) -> Option<ChatMessage> {
+    match result {
+        Ok(message) => message,
+        Err(err) => Some(ChatMessage::Text(format!("[System] [{hms}] {err}"))),
+    }
+}
+
+fn queue_pending_epoch_commit(receiver_state: &mut ReceiverState, commit: EpochCommit) {
+    if receiver_state
+        .pending_epoch_commits
+        .iter()
+        .any(|pending| pending == &commit)
+    {
+        return;
+    }
+    receiver_state.pending_epoch_commits.push(commit);
+    if receiver_state.pending_epoch_commits.len() > PENDING_EPOCH_COMMIT_LIMIT {
+        receiver_state.pending_epoch_commits.remove(0);
+    }
+}
+
+fn retry_pending_epoch_commits(
+    receiver_state: &mut ReceiverState,
+    group_crypto: &mut super::crypto::GroupCryptoState,
+) {
+    let mut idx = 0;
+    while idx < receiver_state.pending_epoch_commits.len() {
+        let commit = receiver_state.pending_epoch_commits[idx].clone();
+        match group_crypto.apply_epoch_commit(&commit) {
+            Ok(true) | Ok(false) => {
+                receiver_state.pending_epoch_commits.remove(idx);
+            }
+            Err(_) => {
+                idx += 1;
+            }
+        }
+    }
 }
 
 fn register_attachment(
@@ -353,6 +487,8 @@ fn register_attachment(
         total_chunks: meta.total_chunks,
         sha256_hex: meta.sha256_hex,
         kind: meta.kind,
+        file_key: meta.file_key,
+        nonce_base: meta.nonce_base,
         chunks: vec![None; meta.total_chunks],
         received_chunks: 0,
     };
@@ -375,9 +511,37 @@ fn register_attachment(
     Ok(None)
 }
 
+fn append_encrypted_attachment_chunk(
+    receiver_state: &mut ReceiverState,
+    encrypted_chunk: EncryptedAttachmentChunk,
+    attachment_store: &AttachmentStore,
+    transfer_ui_state: &mut TransferUiState,
+    hms: &str,
+) -> Result<Option<ChatMessage>, String> {
+    let (file_key, nonce_base) = {
+        let Some(incoming) = receiver_state.incoming.get(&encrypted_chunk.transfer_id) else {
+            return Ok(None);
+        };
+        (incoming.file_key, incoming.nonce_base)
+    };
+    let data = decrypt_file_chunk2(&encrypted_chunk, &file_key, &nonce_base)
+        .map_err(|err| err.to_string())?;
+    append_attachment_chunk(
+        receiver_state,
+        encrypted_chunk.transfer_id,
+        encrypted_chunk.index,
+        data,
+        attachment_store,
+        transfer_ui_state,
+        hms,
+    )
+}
+
 fn append_attachment_chunk(
     receiver_state: &mut ReceiverState,
-    chunk: AttachmentChunk,
+    transfer_id: String,
+    index: usize,
+    data: Vec<u8>,
     attachment_store: &AttachmentStore,
     transfer_ui_state: &mut TransferUiState,
     hms: &str,
@@ -386,16 +550,16 @@ fn append_attachment_chunk(
     let (received_chunks, total_chunks);
 
     {
-        let Some(incoming) = receiver_state.incoming.get_mut(&chunk.transfer_id) else {
+        let Some(incoming) = receiver_state.incoming.get_mut(&transfer_id) else {
             return Ok(None);
         };
 
-        if chunk.index >= incoming.total_chunks {
-            return Err(format!("Attachment chunk out of range: {}", chunk.index));
+        if index >= incoming.total_chunks {
+            return Err(format!("Attachment chunk out of range: {}", index));
         }
 
-        if incoming.chunks[chunk.index].is_none() {
-            incoming.chunks[chunk.index] = Some(chunk.data);
+        if incoming.chunks[index].is_none() {
+            incoming.chunks[index] = Some(data);
             incoming.received_chunks += 1;
         }
 
@@ -406,7 +570,7 @@ fn append_attachment_chunk(
         }
     }
 
-    transfer_ui_state.progress_incoming(&chunk.transfer_id, received_chunks, total_chunks);
+    transfer_ui_state.progress_incoming(&transfer_id, received_chunks, total_chunks);
 
     if !ready {
         return Ok(None);
@@ -414,17 +578,17 @@ fn append_attachment_chunk(
 
     let incoming = receiver_state
         .incoming
-        .remove(&chunk.transfer_id)
+        .remove(&transfer_id)
         .ok_or_else(|| "Attachment state missing during finalize".to_string())?;
 
-    let result = finalize_attachment(chunk.transfer_id.clone(), incoming, attachment_store, hms);
+    let result = finalize_attachment(transfer_id.clone(), incoming, attachment_store, hms);
     match result {
         Ok(message) => {
-            transfer_ui_state.finish_incoming(&chunk.transfer_id);
+            transfer_ui_state.finish_incoming(&transfer_id);
             Ok(Some(message))
         }
         Err(err) => {
-            transfer_ui_state.fail_incoming(&chunk.transfer_id, &err);
+            transfer_ui_state.fail_incoming(&transfer_id, &err);
             Err(err)
         }
     }
@@ -432,7 +596,7 @@ fn append_attachment_chunk(
 
 fn finalize_attachment(
     transfer_id: String,
-    incoming: IncomingAttachment,
+    mut incoming: IncomingAttachment,
     attachment_store: &AttachmentStore,
     hms: &str,
 ) -> Result<ChatMessage, String> {
@@ -441,7 +605,7 @@ fn finalize_attachment(
     let mut written_size = 0u64;
     let safe_name = sanitize_attachment_name(&incoming.file_name);
 
-    for chunk in incoming.chunks {
+    for chunk in std::mem::take(&mut incoming.chunks) {
         let chunk = chunk.ok_or_else(|| {
             format!("Attachment {transfer_id} is incomplete, missing one or more chunks")
         })?;
@@ -471,33 +635,11 @@ fn finalize_attachment(
 
     Ok(ChatMessage::Attachment {
         attachment_id,
-        sender: incoming.sender,
+        sender: std::mem::take(&mut incoming.sender),
         ts: hms.to_string(),
         name: safe_name,
         size: written_size,
         kind: incoming.kind,
-    })
-}
-
-fn decode_legacy_image(
-    sender: &str,
-    body: &str,
-    attachment_store: &AttachmentStore,
-    hms: &str,
-) -> Option<ChatMessage> {
-    let b64_data = &body["/IMGDATA".len()..];
-    let bytes = general_purpose::STANDARD.decode(b64_data).ok()?;
-    let attachment_id = attachment_store
-        .store_attachment("clipboard.png", &bytes)
-        .ok()?;
-
-    Some(ChatMessage::Attachment {
-        attachment_id,
-        sender: sender.to_string(),
-        ts: hms.to_string(),
-        name: "clipboard.png".to_string(),
-        size: bytes.len() as u64,
-        kind: AttachmentKind::Image,
     })
 }
 

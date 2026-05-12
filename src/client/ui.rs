@@ -236,9 +236,9 @@ pub fn draw_chat<B: Backend>(
 
 pub fn members_title(safety_code: Option<&SafetyCode>) -> String {
     match safety_code {
-        Some(code) => format!("Members | Verify Code: {} ", code.emoji()),
+        Some(code) => format!("Members | Verify Code: {} >", code.emoji()),
         //这里需要空一格，不然有点难看
-        None => "Members | Verify Code: ...".to_string(),
+        None => "<Members | Verify Code: ...>".to_string(),
     }
 }
 

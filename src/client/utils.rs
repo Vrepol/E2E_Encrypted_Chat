@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use base64::{engine::general_purpose, engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
@@ -13,7 +13,7 @@ use sha2::{Digest as ShaDigest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
-use super::crypto::RoomCryptoState;
+use super::crypto::{EncryptedMessage, EpochCommit, MemberKeyAnnounce};
 use super::receiver::{AttachmentKind, ChatMessage, TransferDirection, TransferStage};
 
 pub const HELP_TEXT: &str = r#"快捷键与命令说明：
@@ -48,6 +48,7 @@ pub const PACKET_ACK_TIMEOUT_MS: u64 = 4500;
 pub const PACKET_RETRY_LIMIT: usize = 2;
 pub const INVITE_TTL_SECS: i64 = 600;
 const EMPTY_FIELD_SENTINEL: &str = "~";
+const FILE_CHUNK2_AAD_LABEL: &[u8] = b"rust-chat filechunk2 v1";
 
 pub fn handshake_writeall_macro(line: String) -> Vec<u8> {
     let mut buf = line.into_bytes();
@@ -55,7 +56,7 @@ pub fn handshake_writeall_macro(line: String) -> Vec<u8> {
     buf
 }
 
-pub fn parse_text_img(line: &str, room_crypto: &RoomCryptoState) -> (String, String) {
+pub fn parse_display_body(line: &str) -> (String, String) {
     let (name, after_name) = if let Some(start) = line.find('[') {
         if let Some(end_rel) = line[start + 1..].find(']') {
             let end = start + 1 + end_rel;
@@ -69,12 +70,7 @@ pub fn parse_text_img(line: &str, room_crypto: &RoomCryptoState) -> (String, Str
         ("???".into(), line)
     };
 
-    let body_slice = after_name.trim_start();
-    let body_plain = room_crypto
-        .open(body_slice)
-        .unwrap_or_else(|| body_slice.to_owned());
-
-    (name, body_plain)
+    (name, after_name.trim_start().to_string())
 }
 
 pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
@@ -141,19 +137,40 @@ pub struct AttachmentMeta {
     pub total_size: u64,
     pub total_chunks: usize,
     pub sha256_hex: String,
+    pub file_key: [u8; 32],
+    pub nonce_base: [u8; 8],
 }
 
 #[derive(Debug, Clone)]
-pub struct AttachmentChunk {
+pub struct EncryptedAttachmentChunk {
     pub transfer_id: String,
     pub index: usize,
-    pub data: Vec<u8>,
+    pub ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub enum AttachmentFrame {
     Meta(AttachmentMeta),
-    Chunk(AttachmentChunk),
+    EncryptedChunk(EncryptedAttachmentChunk),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileManifestV2 {
+    pub transfer_id: String,
+    pub kind: String,
+    pub file_name: String,
+    pub total_size: u64,
+    pub total_chunks: usize,
+    pub sha256_hex: String,
+    pub file_key: Vec<u8>,
+    pub nonce_base: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileChunk2Wire {
+    transfer_id: String,
+    index: usize,
+    ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -219,7 +236,7 @@ pub fn classify_outgoing_input(msg: &str) -> Result<OutgoingPayload> {
 }
 
 pub fn is_attachment_protocol_line(line: &str) -> bool {
-    line.starts_with("/FILEMETA ") || line.starts_with("/FILECHUNK ")
+    line.starts_with("/FILEMANIFEST2 ") || line.starts_with("/FILECHUNK2 ")
 }
 
 pub fn infer_attachment_kind(path: &Path) -> AttachmentKind {
@@ -242,94 +259,168 @@ pub fn file_name_or_default(path: &Path) -> String {
         .unwrap_or_else(|| "attachment.bin".to_string())
 }
 
-pub fn build_attachment_frames_from_bytes(
-    file_name: &str,
-    bytes: &[u8],
-    kind: AttachmentKind,
-) -> Result<Vec<String>> {
-    let transfer_id = Uuid::new_v4().simple().to_string();
-    let total_chunks = if bytes.is_empty() {
-        0
-    } else {
-        bytes.len().div_ceil(ATTACHMENT_CHUNK_SIZE)
-    };
-    let sha256_hex = hex::encode(Sha256::digest(bytes));
-
-    let mut frames = Vec::with_capacity(total_chunks + 1);
-    frames.push(build_attachment_meta_line(
-        &transfer_id,
-        kind,
-        file_name,
-        bytes.len() as u64,
-        total_chunks,
-        &sha256_hex,
-    ));
-
-    for (index, chunk) in bytes.chunks(ATTACHMENT_CHUNK_SIZE).enumerate() {
-        frames.push(build_attachment_chunk_line(&transfer_id, index, chunk));
+pub fn parse_attachment_frame(body: &str) -> Option<AttachmentFrame> {
+    let mut parts = body.split_whitespace();
+    match parts.next()? {
+        "/FILEMANIFEST2" => parse_file_manifest2_payload(parts.next()?).map(AttachmentFrame::Meta),
+        "/FILECHUNK2" => {
+            parse_file_chunk2_payload(parts.next()?).map(AttachmentFrame::EncryptedChunk)
+        }
+        _ => None,
     }
-
-    Ok(frames)
 }
 
-pub fn build_attachment_meta_line(
+pub fn build_file_manifest2_line(
     transfer_id: &str,
     kind: AttachmentKind,
     file_name: &str,
     total_size: u64,
     total_chunks: usize,
     sha256_hex: &str,
-) -> String {
-    let name_b64 = URL_SAFE_NO_PAD.encode(file_name.as_bytes());
-    format!(
-        "/FILEMETA {transfer_id} {} {name_b64} {total_size} {total_chunks} {sha256_hex}",
-        kind.as_protocol_tag()
-    )
+    file_key: &[u8; 32],
+    nonce_base: &[u8; 8],
+) -> Result<String> {
+    let manifest = FileManifestV2 {
+        transfer_id: transfer_id.to_string(),
+        kind: kind.as_protocol_tag().to_string(),
+        file_name: file_name.to_string(),
+        total_size,
+        total_chunks,
+        sha256_hex: sha256_hex.to_string(),
+        file_key: file_key.to_vec(),
+        nonce_base: nonce_base.to_vec(),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&manifest)?);
+    Ok(format!("/FILEMANIFEST2 {encoded}"))
 }
 
-pub fn build_attachment_chunk_line(transfer_id: &str, index: usize, chunk: &[u8]) -> String {
-    let data_b64 = general_purpose::STANDARD.encode(chunk);
-    format!("/FILECHUNK {transfer_id} {index} {data_b64}")
+fn parse_file_manifest2_payload(payload: &str) -> Option<AttachmentMeta> {
+    let manifest: FileManifestV2 =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim()).ok()?).ok()?;
+    let file_key: [u8; 32] = manifest.file_key.try_into().ok()?;
+    let nonce_base: [u8; 8] = manifest.nonce_base.try_into().ok()?;
+    Some(AttachmentMeta {
+        transfer_id: manifest.transfer_id,
+        kind: AttachmentKind::from_protocol_tag(&manifest.kind)?,
+        file_name: manifest.file_name,
+        total_size: manifest.total_size,
+        total_chunks: manifest.total_chunks,
+        sha256_hex: manifest.sha256_hex,
+        file_key,
+        nonce_base,
+    })
 }
 
-pub fn parse_attachment_frame(body: &str) -> Option<AttachmentFrame> {
-    let mut parts = body.split_whitespace();
-    match parts.next()? {
-        "/FILEMETA" => {
-            let transfer_id = parts.next()?.to_string();
-            let kind = AttachmentKind::from_protocol_tag(parts.next()?)?;
-            let file_name = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
-            let total_size = parts.next()?.parse().ok()?;
-            let total_chunks = parts.next()?.parse().ok()?;
-            let sha256_hex = parts.next()?.to_string();
-
-            Some(AttachmentFrame::Meta(AttachmentMeta {
-                transfer_id,
-                kind,
-                file_name,
-                total_size,
-                total_chunks,
-                sha256_hex,
-            }))
-        }
-        "/FILECHUNK" => {
-            let transfer_id = parts.next()?.to_string();
-            let index = parts.next()?.parse().ok()?;
-            let data = general_purpose::STANDARD.decode(parts.next()?).ok()?;
-
-            Some(AttachmentFrame::Chunk(AttachmentChunk {
-                transfer_id,
-                index,
-                data,
-            }))
-        }
-        _ => None,
-    }
+pub fn build_file_chunk2_line(
+    transfer_id: &str,
+    index: usize,
+    chunk: &[u8],
+    file_key: &[u8; 32],
+    nonce_base: &[u8; 8],
+) -> Result<String> {
+    let nonce = file_chunk2_nonce(nonce_base, index)?;
+    let aad = file_chunk2_aad(transfer_id, index);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(file_key));
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: chunk,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow!("Attachment chunk encryption failed"))?;
+    let wire = FileChunk2Wire {
+        transfer_id: transfer_id.to_string(),
+        index,
+        ciphertext,
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&wire)?);
+    Ok(format!("/FILECHUNK2 {encoded}"))
 }
 
-pub fn build_transport_packet_line(packet_id: &str, room_cipher: &str) -> String {
-    let payload_b64 = URL_SAFE_NO_PAD.encode(room_cipher.as_bytes());
+fn parse_file_chunk2_payload(payload: &str) -> Option<EncryptedAttachmentChunk> {
+    let wire: FileChunk2Wire =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim()).ok()?).ok()?;
+    Some(EncryptedAttachmentChunk {
+        transfer_id: wire.transfer_id,
+        index: wire.index,
+        ciphertext: wire.ciphertext,
+    })
+}
+
+pub fn decrypt_file_chunk2(
+    chunk: &EncryptedAttachmentChunk,
+    file_key: &[u8; 32],
+    nonce_base: &[u8; 8],
+) -> Result<Vec<u8>> {
+    let nonce = file_chunk2_nonce(nonce_base, chunk.index)?;
+    let aad = file_chunk2_aad(&chunk.transfer_id, chunk.index);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(file_key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: chunk.ciphertext.as_ref(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| anyhow!("Attachment chunk authentication failed"))
+}
+
+fn file_chunk2_nonce(nonce_base: &[u8; 8], index: usize) -> Result<[u8; 12]> {
+    let index = u32::try_from(index).map_err(|_| anyhow!("Attachment chunk index too large"))?;
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(nonce_base);
+    nonce[8..].copy_from_slice(&index.to_be_bytes());
+    Ok(nonce)
+}
+
+fn file_chunk2_aad(transfer_id: &str, index: usize) -> Vec<u8> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(FILE_CHUNK2_AAD_LABEL);
+    aad.extend_from_slice(transfer_id.as_bytes());
+    aad.extend_from_slice(&(index as u64).to_be_bytes());
+    aad
+}
+
+pub fn build_transport_packet_line(packet_id: &str, payload: &str) -> String {
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
     format!("/PKT {packet_id} {payload_b64}")
+}
+
+pub fn build_rmsg_line(message: &EncryptedMessage) -> Result<String> {
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(message)?);
+    Ok(format!("/RMSG {encoded}"))
+}
+
+pub fn parse_rmsg_line(line: &str) -> Option<EncryptedMessage> {
+    let payload = line.strip_prefix("/RMSG ")?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim()).ok()?).ok()
+}
+
+pub fn build_key_announce_line(announce: &MemberKeyAnnounce) -> Result<String> {
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(announce)?);
+    Ok(format!("/KEY_ANNOUNCE {encoded}"))
+}
+
+pub fn parse_key_announce_line(line: &str) -> Option<MemberKeyAnnounce> {
+    let payload = line.strip_prefix("/KEY_ANNOUNCE ")?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim()).ok()?).ok()
+}
+
+pub fn build_epoch_commit_line(commit: &EpochCommit) -> Result<String> {
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(commit)?);
+    Ok(format!("/EPOCH_COMMIT {encoded}"))
+}
+
+pub fn parse_epoch_commit_line(line: &str) -> Option<EpochCommit> {
+    let payload = line.strip_prefix("/EPOCH_COMMIT ")?;
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload.trim()).ok()?).ok()
+}
+
+pub fn is_epoch_control_line(line: &str) -> bool {
+    line.starts_with("/KEY_ANNOUNCE ") || line.starts_with("/EPOCH_COMMIT ")
 }
 
 pub fn parse_transport_packet_line(line: &str) -> Option<(String, String)> {

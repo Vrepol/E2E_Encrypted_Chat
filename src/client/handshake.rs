@@ -14,8 +14,8 @@ use tokio::{
 
 use super::crypto::{
     compute_invite_proof, compute_invite_token_id, compute_password_auth_proof,
-    derive_invite_transport_key, derive_password_transport_key, pwd_hash, RoomCryptoState,
-    TransportCrypto, TransportOpenResult, TransportSide,
+    derive_invite_transport_key, derive_password_transport_key, pwd_hash, GroupCryptoState,
+    RoomCryptoState, TransportCrypto, TransportOpenResult, TransportSide,
 };
 use super::utils::{
     build_auth_hello_line, build_auth_proof_line, build_invite_hello_line, build_invite_proof_line,
@@ -25,12 +25,14 @@ use super::utils::{
 };
 
 pub type SharedTransportCrypto = Arc<Mutex<TransportCrypto>>;
+pub type SharedGroupCrypto = Arc<Mutex<GroupCryptoState>>;
 
 pub struct ConnectedSession {
     pub lines: Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     pub writer: tokio::net::tcp::OwnedWriteHalf,
     pub server_addr: String,
     pub room_crypto: RoomCryptoState,
+    pub group_crypto: SharedGroupCrypto,
     pub transport: SharedTransportCrypto,
     pub local_member: MemberIdentity,
     pub owner_capability: Option<String>,
@@ -123,12 +125,21 @@ async fn connect_with_invite(
     if owner_capability.is_some() {
         return Err(anyhow!("Server refused invite: {ok_plain}"));
     }
+    let group_crypto = GroupCryptoState::new_single_epoch(
+        room_crypto.room_id().to_string(),
+        member_id.clone(),
+        nickname.to_string(),
+        0,
+        room_crypto.placeholder_epoch_secret(),
+        room_crypto.room_auth_key(),
+    )?;
 
     Ok(ConnectedSession {
         lines,
         writer,
         server_addr,
         room_crypto,
+        group_crypto: Arc::new(Mutex::new(group_crypto)),
         transport: Arc::new(Mutex::new(transport)),
         local_member: MemberIdentity {
             member_id,
@@ -231,12 +242,21 @@ async fn connect_with_password(
         .ok_or_else(|| anyhow!("Invalid encrypted room join response"))?;
     let (member_id, owner_capability) = parse_session_ok_line(&response_plain)
         .ok_or_else(|| anyhow!("server refused: {response_plain}"))?;
+    let group_crypto = GroupCryptoState::new_single_epoch(
+        room_crypto.room_id().to_string(),
+        member_id.clone(),
+        nickname.to_string(),
+        0,
+        room_crypto.placeholder_epoch_secret(),
+        room_crypto.room_auth_key(),
+    )?;
 
     Ok(ConnectedSession {
         lines,
         writer,
         server_addr,
         room_crypto,
+        group_crypto: Arc::new(Mutex::new(group_crypto)),
         transport: Arc::new(Mutex::new(transport)),
         local_member: MemberIdentity {
             member_id,
