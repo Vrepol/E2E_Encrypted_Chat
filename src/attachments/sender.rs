@@ -33,19 +33,28 @@ use crate::{
 pub const ATTACHMENT_CHUNK_SIZE: usize = 32 * 1024;
 pub const ATTACHMENT_WINDOW_SIZE: usize = 3;
 
+#[derive(Clone)]
+struct AttachmentContext {
+    group_id: String,
+    epoch: u64,
+    sender_id: String,
+}
+
 pub struct AttachmentJob {
     pub path: PathBuf,
     pub transfer_id: String,
     pub file_name: String,
     pub total_size: u64,
     pub total_chunks: usize,
+    pub sha256_hex: String,
     pub next_chunk_index: usize,
     pub acked_chunks: usize,
     pub file: File,
     pub meta_sent: bool,
     pub meta_packet_id: String,
-    pub manifest_plain_line: String,
+    pub manifest_plain_line: Option<String>,
     pub manifest_secure_line: Option<String>,
+    manifest_context: Option<AttachmentContext>,
     pub meta_attempts: usize,
     pub meta_last_sent_at: Option<Instant>,
     pub file_key: [u8; 32],
@@ -226,26 +235,18 @@ pub async fn initialize_attachment_job_owned(path: PathBuf) -> Result<Attachment
     let mut nonce_base = [0u8; 8];
     rand::rng().fill_bytes(&mut file_key);
     rand::rng().fill_bytes(&mut nonce_base);
-    let manifest_plain_line = build_file_manifest2_line(
-        &transfer_id,
-        infer_attachment_kind(&path),
-        &file_name,
-        total_size,
-        total_chunks,
-        &sha256_hex,
-        &file_key,
-        &nonce_base,
-    )?;
 
     Ok(AttachmentJob {
         meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
-        manifest_plain_line,
+        manifest_plain_line: None,
         manifest_secure_line: None,
+        manifest_context: None,
         path,
         transfer_id,
         file_name,
         total_size,
         total_chunks,
+        sha256_hex,
         next_chunk_index: 0,
         acked_chunks: 0,
         file,
@@ -297,16 +298,39 @@ async fn process_attachment_meta(
 
     if should_send {
         ack_registry.subscribe(&job.meta_packet_id).await;
-        if job.manifest_secure_line.is_none() {
+        if job.manifest_secure_line.is_none() || job.manifest_plain_line.is_none() {
             let secure_line = {
                 let mut guard = group_crypto
                     .lock()
                     .map_err(|_| anyhow!("Group crypto state unavailable"))?;
+                if guard.my_sender_chain.is_none() {
+                    return Err(anyhow!("Current epoch secret unavailable"));
+                }
+                let context = AttachmentContext {
+                    group_id: guard.group_id.clone(),
+                    epoch: guard.epoch,
+                    sender_id: guard.my_member_id.clone(),
+                };
+                let manifest_plain_line = build_file_manifest2_line(
+                    &context.group_id,
+                    context.epoch,
+                    &context.sender_id,
+                    &job.transfer_id,
+                    infer_attachment_kind(&job.path),
+                    &job.file_name,
+                    job.total_size,
+                    job.total_chunks,
+                    &job.sha256_hex,
+                    &job.file_key,
+                    &job.nonce_base,
+                )?;
                 let encrypted = encrypt_message(
                     &mut guard,
                     SecureMessageType::FileManifest,
-                    job.manifest_plain_line.as_bytes(),
+                    manifest_plain_line.as_bytes(),
                 )?;
+                job.manifest_context = Some(context);
+                job.manifest_plain_line = Some(manifest_plain_line);
                 build_rmsg_line(&encrypted)?
             };
             job.manifest_secure_line = Some(secure_line);
@@ -375,6 +399,10 @@ async fn process_attachment_window(
     }
 
     while job.in_flight.len() < ATTACHMENT_WINDOW_SIZE && job.next_chunk_index < job.total_chunks {
+        let context = job
+            .manifest_context
+            .as_ref()
+            .ok_or_else(|| anyhow!("Attachment manifest context is unavailable"))?;
         let chunk_index = job.next_chunk_index;
         let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
         let read = job.file.read(&mut buf).await?;
@@ -386,8 +414,12 @@ async fn process_attachment_window(
         }
 
         let chunk_line = build_file_chunk2_line(
+            &context.group_id,
+            context.epoch,
+            &context.sender_id,
             &job.transfer_id,
             chunk_index,
+            job.total_chunks,
             &buf[..read],
             &job.file_key,
             &job.nonce_base,

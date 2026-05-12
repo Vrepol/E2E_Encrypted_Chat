@@ -16,8 +16,9 @@ use super::session::ConnectedSession;
 use crate::crypto::invite::{open_invite_blob, parse_invitation};
 use crate::crypto::{
     compute_invite_proof, compute_invite_token_id, compute_password_auth_proof,
-    derive_invite_transport_key, derive_password_transport_key, pwd_hash, GroupCryptoState,
-    RoomCryptoState, TransportCrypto, TransportOpenResult, TransportSide,
+    derive_invite_transport_key, derive_password_transport_key, pwd_hash,
+    random_group_secret_epoch_0, GroupCryptoState, RoomCryptoState, TransportCrypto,
+    TransportOpenResult, TransportSide,
 };
 use crate::protocol::{
     build_auth_hello_line, build_auth_proof_line, build_invite_hello_line, build_invite_proof_line,
@@ -129,12 +130,11 @@ async fn connect_with_invite(
     if owner_capability.is_some() {
         return Err(anyhow!("Server refused invite: {ok_plain}"));
     }
-    let group_crypto = GroupCryptoState::new_single_epoch(
+    let group_crypto = GroupCryptoState::new_pending_epoch(
         room_crypto.room_id().to_string(),
         member_id.clone(),
         nickname.to_string(),
         0,
-        room_crypto.placeholder_epoch_secret(),
         room_crypto.room_auth_key(),
     )?;
 
@@ -277,14 +277,24 @@ async fn finish_password_room_join(
         .ok_or_else(|| anyhow!("Invalid encrypted room join response"))?;
     let (member_id, owner_capability) = parse_session_ok_line(&response_plain)
         .ok_or_else(|| anyhow!("server refused: {response_plain}"))?;
-    let group_crypto = GroupCryptoState::new_single_epoch(
-        room_crypto.room_id().to_string(),
-        member_id.clone(),
-        nickname.to_string(),
-        0,
-        room_crypto.placeholder_epoch_secret(),
-        room_crypto.room_auth_key(),
-    )?;
+    let group_crypto = if action == "CREATE" {
+        GroupCryptoState::new_single_epoch(
+            room_crypto.room_id().to_string(),
+            member_id.clone(),
+            nickname.to_string(),
+            0,
+            random_group_secret_epoch_0(),
+            room_crypto.room_auth_key(),
+        )?
+    } else {
+        GroupCryptoState::new_pending_epoch(
+            room_crypto.room_id().to_string(),
+            member_id.clone(),
+            nickname.to_string(),
+            0,
+            room_crypto.room_auth_key(),
+        )?
+    };
 
     Ok(ConnectedSession {
         lines: start.lines,

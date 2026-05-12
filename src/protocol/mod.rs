@@ -98,6 +98,8 @@ mod tests {
             epoch: 5,
             member_id: "alice".to_string(),
             x25519_public: vec![7; 32],
+            nonce: vec![1; 16],
+            mac: vec![2; 32],
         };
 
         let line = build_key_announce_line(&announce).expect("announce line should build");
@@ -208,6 +210,9 @@ mod tests {
         let sha256_hex = hex::encode(Sha256::digest(payload));
 
         let manifest = build_file_manifest2_line(
+            "room-a",
+            7,
+            "alice-id",
             transfer_id,
             AttachmentKind::File,
             "demo.txt",
@@ -218,14 +223,27 @@ mod tests {
             &nonce_base,
         )
         .expect("manifest should build");
-        let chunk = build_file_chunk2_line(transfer_id, 0, payload, &file_key, &nonce_base)
-            .expect("chunk should build");
+        let chunk = build_file_chunk2_line(
+            "room-a",
+            7,
+            "alice-id",
+            transfer_id,
+            0,
+            1,
+            payload,
+            &file_key,
+            &nonce_base,
+        )
+        .expect("chunk should build");
 
         let parsed_manifest = parse_attachment_frame(&manifest).expect("manifest should parse");
         let parsed_chunk = parse_attachment_frame(&chunk).expect("chunk should parse");
 
         match parsed_manifest {
             AttachmentFrame::Meta(meta) => {
+                assert_eq!(meta.group_id, "room-a");
+                assert_eq!(meta.epoch, 7);
+                assert_eq!(meta.sender_id, "alice-id");
                 assert_eq!(meta.transfer_id, transfer_id);
                 assert_eq!(meta.file_name, "demo.txt");
                 assert_eq!(meta.total_size, payload.len() as u64);

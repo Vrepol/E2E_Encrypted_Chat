@@ -20,15 +20,18 @@ mod tests {
     use crate::client::receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState};
     use crate::crypto::{
         create_invitation, create_invite_blob, decrypt_message, encrypt_message, open_invite_blob,
-        parse_invitation, proposer_order, GroupCryptoState, RoomCryptoState, SecureMessageType,
+        parse_invitation, proposer_order, random_group_secret_epoch_0,
+        random_test_epoch_secret, unwrap_epoch_secret_from_commit, GroupCryptoState,
+        RoomCryptoState, SecureMessageType,
     };
     use crate::protocol::{
         build_ack_line, build_epoch_commit_line, build_file_chunk2_line, build_file_manifest2_line,
         build_local_echo_attachment_line, build_local_echo_text_line,
         build_local_invite_request_line, build_member_list_line, build_rmsg_line,
         build_transport_packet_line, parse_ack_line, parse_local_invite_request_line,
-        parse_local_ui_event, parse_rmsg_line, parse_transport_packet_line, AttachmentKind,
-        LocalUiEvent, MemberIdentity,
+        decrypt_file_chunk2, parse_attachment_frame, parse_local_ui_event, parse_rmsg_line,
+        parse_transport_packet_line, AttachmentFrame, AttachmentKind, LocalUiEvent,
+        MemberIdentity,
     };
     use crate::ui::{
         clipboard::{normalize_clipboard_rgba, parse_clipboard_file_paths},
@@ -38,6 +41,44 @@ mod tests {
     #[test]
     fn test_notify() {
         notifier::notify();
+    }
+
+    fn active_test_state(
+        room_crypto: &RoomCryptoState,
+        member_id: &str,
+        nickname: &str,
+        group_secret: [u8; 32],
+    ) -> GroupCryptoState {
+        GroupCryptoState::new_single_epoch(
+            room_crypto.room_id().to_string(),
+            member_id.to_string(),
+            nickname.to_string(),
+            0,
+            group_secret,
+            room_crypto.room_auth_key(),
+        )
+        .expect("group crypto should initialize")
+    }
+
+    fn pending_test_state(
+        room_crypto: &RoomCryptoState,
+        member_id: &str,
+        nickname: &str,
+    ) -> GroupCryptoState {
+        GroupCryptoState::new_pending_epoch(
+            room_crypto.room_id().to_string(),
+            member_id.to_string(),
+            nickname.to_string(),
+            0,
+            room_crypto.room_auth_key(),
+        )
+        .expect("pending group crypto should initialize")
+    }
+
+    fn install_test_recv_chains(state: &mut GroupCryptoState, group_secret: [u8; 32]) {
+        state
+            .install_test_recv_chains_for_current_roster(group_secret)
+            .expect("test receive chains should initialize");
     }
 
     #[test]
@@ -58,15 +99,8 @@ mod tests {
     #[test]
     fn test_rmsg_line_round_trip() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("group crypto should initialize");
+        let mut alice =
+            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
         alice
             .replace_members([
                 ("alice-id".to_string(), "alice".to_string()),
@@ -85,24 +119,9 @@ mod tests {
     #[test]
     fn test_secure_message_round_trip() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice group crypto should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob group crypto should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
         let roster = [
             ("alice-id".to_string(), "alice".to_string()),
             ("bob-id".to_string(), "bob".to_string()),
@@ -112,12 +131,17 @@ mod tests {
             .expect("alice roster should update");
         bob.replace_members(roster)
             .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
 
         let encrypted = encrypt_message(&mut alice, SecureMessageType::Text, b"phase1 hello")
             .expect("encrypt should succeed");
         let decrypted = decrypt_message(&mut bob, &encrypted).expect("decrypt should succeed");
         assert_eq!(decrypted.plaintext, b"phase1 hello");
-        assert_eq!(alice.my_sender_chain.msg_no, 1);
+        assert_eq!(
+            alice.my_sender_chain.as_ref().map(|chain| chain.msg_no),
+            Some(1)
+        );
         assert_eq!(
             bob.recv_chains
                 .get("alice-id")
@@ -129,24 +153,9 @@ mod tests {
     #[test]
     fn test_filechunk2_is_processed_outside_rmsg() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
         let roster = [
             ("alice-id".to_string(), "alice".to_string()),
             ("bob-id".to_string(), "bob".to_string()),
@@ -156,6 +165,8 @@ mod tests {
             .expect("alice roster should update");
         bob.replace_members(roster)
             .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
 
         let payload = b"phase4 attachment chunk";
         let transfer_id = "transfer-v2";
@@ -163,6 +174,9 @@ mod tests {
         let nonce_base = [9u8; 8];
         let sha256_hex = hex::encode(sha2::Sha256::digest(payload));
         let manifest = build_file_manifest2_line(
+            "room-a",
+            0,
+            "alice-id",
             transfer_id,
             AttachmentKind::File,
             "demo.txt",
@@ -180,8 +194,18 @@ mod tests {
         )
         .expect("manifest should encrypt");
         let manifest_line = build_rmsg_line(&encrypted_manifest).expect("rmsg should build");
-        let chunk_line = build_file_chunk2_line(transfer_id, 0, payload, &file_key, &nonce_base)
-            .expect("chunk should build");
+        let chunk_line = build_file_chunk2_line(
+            "room-a",
+            0,
+            "alice-id",
+            transfer_id,
+            0,
+            1,
+            payload,
+            &file_key,
+            &nonce_base,
+        )
+        .expect("chunk should build");
 
         let group_crypto = Arc::new(Mutex::new(bob));
         let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -226,26 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tampered_secure_message_does_not_advance_recv_chain() {
+    fn test_pending_joiner_cannot_use_epoch_zero_before_commit() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice group crypto should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob group crypto should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = pending_test_state(&room_crypto, "bob-id", "bob");
         let roster = [
             ("alice-id".to_string(), "alice".to_string()),
             ("bob-id".to_string(), "bob".to_string()),
@@ -255,6 +264,494 @@ mod tests {
             .expect("alice roster should update");
         bob.replace_members(roster)
             .expect("bob roster should update");
+
+        let encrypted = encrypt_message(&mut alice, SecureMessageType::Text, b"epoch zero hello")
+            .expect("alice should encrypt");
+        assert!(decrypt_message(&mut bob, &encrypted).is_err());
+        assert!(encrypt_message(&mut bob, SecureMessageType::Text, b"blocked").is_err());
+    }
+
+    #[test]
+    fn test_no_placeholder_secret_in_real_session() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let mut alice = active_test_state(
+            &room_crypto,
+            "alice-id",
+            "alice",
+            random_group_secret_epoch_0(),
+        );
+        let mut bob = pending_test_state(&room_crypto, "bob-id", "bob");
+        let roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(roster)
+            .expect("bob roster should update");
+
+        let epoch_zero = encrypt_message(&mut alice, SecureMessageType::Text, b"epoch zero")
+            .expect("alice should encrypt");
+        assert!(decrypt_message(&mut bob, &epoch_zero).is_err());
+
+        let alice_announce = alice.local_key_announce();
+        let bob_announce = bob.local_key_announce();
+        bob.apply_key_announce(&alice_announce)
+            .expect("bob should learn alice key");
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn bob key");
+        let commit = alice
+            .build_pending_epoch_commit()
+            .expect("alice should build join commit")
+            .expect("alice should have a pending join");
+        assert!(alice
+            .apply_epoch_commit(&commit)
+            .expect("alice should apply join commit"));
+        assert!(bob
+            .apply_epoch_commit(&commit)
+            .expect("bob should apply join commit"));
+
+        let epoch_one = encrypt_message(&mut alice, SecureMessageType::Text, b"epoch one")
+            .expect("alice should encrypt after commit");
+        assert_eq!(
+            decrypt_message(&mut bob, &epoch_one)
+                .expect("bob should decrypt after commit")
+                .plaintext,
+            b"epoch one"
+        );
+    }
+
+    #[test]
+    fn test_key_announce_mac_rejects_tamper() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(roster)
+            .expect("bob roster should update");
+
+        let mut announce = alice.local_key_announce();
+        announce.x25519_public[0] ^= 0x01;
+        assert!(bob.apply_key_announce(&announce).is_err());
+    }
+
+    #[test]
+    fn test_epoch_commit_aad_rejects_context_swap() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let mut alice =
+            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
+        let bob = pending_test_state(&room_crypto, "bob-id", "bob");
+        let roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(roster.clone())
+            .expect("alice roster should update");
+        let mut bob_for_commit = bob.clone();
+        bob_for_commit
+            .replace_members(roster)
+            .expect("bob roster should update");
+        let bob_announce = bob_for_commit.local_key_announce();
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn bob key");
+        let commit = alice
+            .build_pending_epoch_commit()
+            .expect("commit build should succeed")
+            .expect("join commit should exist");
+        let wrapped = commit
+            .wrapped_secrets
+            .iter()
+            .find(|wrapped| wrapped.recipient_id == "bob-id")
+            .expect("bob wrapped secret should exist");
+        let bob_secret = bob_for_commit.current_x25519_secret_for_test();
+
+        let mut tampered = commit.clone();
+        tampered.event_type = crate::crypto::EpochEventType::Rotate;
+        assert!(unwrap_epoch_secret_from_commit(
+            "bob-id",
+            &bob_secret,
+            &room_crypto.room_auth_key(),
+            &tampered,
+            wrapped,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_x25519_rotates_after_epoch() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let mut alice =
+            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
+        let mut bob = pending_test_state(&room_crypto, "bob-id", "bob");
+        let first_roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(first_roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(first_roster)
+            .expect("bob roster should update");
+        let bob_public_before = *bob.current_x25519_public();
+        let bob_secret_before = bob.current_x25519_secret_for_test();
+        let alice_announce = alice.local_key_announce();
+        let bob_announce = bob.local_key_announce();
+        bob.apply_key_announce(&alice_announce)
+            .expect("bob should learn alice key");
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn bob key");
+        let first_commit = alice
+            .build_pending_epoch_commit()
+            .expect("first commit should build")
+            .expect("first commit should exist");
+        assert!(alice
+            .apply_epoch_commit(&first_commit)
+            .expect("alice should apply first commit"));
+        assert!(bob
+            .apply_epoch_commit(&first_commit)
+            .expect("bob should apply first commit"));
+        assert_ne!(bob_public_before, *bob.current_x25519_public());
+
+        let alice_announce = alice.local_key_announce();
+        let bob_announce = bob.local_key_announce();
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn rotated bob key");
+        bob.apply_key_announce(&alice_announce)
+            .expect("bob should learn rotated alice key");
+
+        let mut charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
+        let second_roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+            ("charlie-id".to_string(), "charlie".to_string()),
+        ];
+        alice
+            .replace_members(second_roster.clone())
+            .expect("alice should see charlie");
+        bob.replace_members(second_roster.clone())
+            .expect("bob should see charlie");
+        charlie
+            .replace_members(second_roster)
+            .expect("charlie roster should update");
+        let charlie_announce = charlie.local_key_announce();
+        alice
+            .apply_key_announce(&charlie_announce)
+            .expect("alice should learn charlie key");
+        bob.apply_key_announce(&charlie_announce)
+            .expect("bob should learn charlie key");
+
+        let proposer = proposer_order(
+            "room-a",
+            1,
+            crate::crypto::EpochEventType::Join,
+            "charlie-id",
+            &["alice-id".to_string(), "bob-id".to_string()],
+        )[0]
+        .clone();
+        let second_commit = if proposer == "alice-id" {
+            alice
+                .build_pending_epoch_commit()
+                .expect("alice build should succeed")
+                .expect("alice should build second commit")
+        } else {
+            bob.build_pending_epoch_commit()
+                .expect("bob build should succeed")
+                .expect("bob should build second commit")
+        };
+        let wrapped = second_commit
+            .wrapped_secrets
+            .iter()
+            .find(|wrapped| wrapped.recipient_id == "bob-id")
+            .expect("bob wrapped secret should exist");
+        assert!(unwrap_epoch_secret_from_commit(
+            "bob-id",
+            &bob_secret_before,
+            &room_crypto.room_auth_key(),
+            &second_commit,
+            wrapped,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_sender_chain_root_not_stored() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let mut charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
+        let initial_roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(initial_roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(initial_roster)
+            .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
+        alice.pending_transition = None;
+        bob.pending_transition = None;
+
+        let alice_announce = alice.local_key_announce();
+        let bob_announce = bob.local_key_announce();
+        bob.apply_key_announce(&alice_announce)
+            .expect("bob should learn alice key");
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn bob key");
+        let joined_roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+            ("charlie-id".to_string(), "charlie".to_string()),
+        ];
+        alice
+            .replace_members(joined_roster.clone())
+            .expect("alice should see charlie");
+        bob.replace_members(joined_roster.clone())
+            .expect("bob should see charlie");
+        charlie
+            .replace_members(joined_roster)
+            .expect("charlie roster should update");
+        let charlie_announce = charlie.local_key_announce();
+        alice
+            .apply_key_announce(&charlie_announce)
+            .expect("alice should learn charlie key");
+        bob.apply_key_announce(&charlie_announce)
+            .expect("bob should learn charlie key");
+
+        let proposer = proposer_order(
+            "room-a",
+            0,
+            crate::crypto::EpochEventType::Join,
+            "charlie-id",
+            &["alice-id".to_string(), "bob-id".to_string()],
+        )[0]
+        .clone();
+        let commit = if proposer == "alice-id" {
+            alice
+                .build_pending_epoch_commit()
+                .expect("alice build should succeed")
+                .expect("alice should build join commit")
+        } else {
+            bob.build_pending_epoch_commit()
+                .expect("bob build should succeed")
+                .expect("bob should build join commit")
+        };
+        let late_old_epoch = encrypt_message(
+            &mut bob,
+            SecureMessageType::Text,
+            b"late old epoch from bob",
+        )
+        .expect("bob should encrypt before rekey");
+        if proposer == "alice-id" {
+            assert!(alice
+                .apply_epoch_commit(&commit)
+                .expect("alice should apply commit"));
+        } else {
+            assert!(bob
+                .apply_epoch_commit(&commit)
+                .expect("bob should apply commit"));
+            assert!(alice
+                .apply_epoch_commit(&commit)
+                .expect("alice should apply commit"));
+        }
+        alice.old_epochs[0].recv_chains.remove("bob-id");
+        assert!(decrypt_message(&mut alice, &late_old_epoch).is_err());
+    }
+
+    #[test]
+    fn test_leave_rekey_excludes_removed_member() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let mut carol = active_test_state(&room_crypto, "carol-id", "carol", epoch_secret);
+        let roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+            ("carol-id".to_string(), "carol".to_string()),
+        ];
+        alice
+            .replace_members(roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(roster.clone())
+            .expect("bob roster should update");
+        carol
+            .replace_members(roster)
+            .expect("carol roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
+        install_test_recv_chains(&mut carol, epoch_secret);
+        alice.pending_transition = None;
+        bob.pending_transition = None;
+        carol.pending_transition = None;
+
+        let alice_announce = alice.local_key_announce();
+        let bob_announce = bob.local_key_announce();
+        let carol_announce = carol.local_key_announce();
+        bob.apply_key_announce(&alice_announce)
+            .expect("bob should learn alice");
+        bob.apply_key_announce(&carol_announce)
+            .expect("bob should learn carol");
+        alice
+            .apply_key_announce(&bob_announce)
+            .expect("alice should learn bob");
+        alice
+            .apply_key_announce(&carol_announce)
+            .expect("alice should learn carol");
+        carol
+            .apply_key_announce(&alice_announce)
+            .expect("carol should learn alice");
+        carol
+            .apply_key_announce(&bob_announce)
+            .expect("carol should learn bob");
+
+        let remaining = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("carol-id".to_string(), "carol".to_string()),
+        ];
+        alice
+            .replace_members(remaining.clone())
+            .expect("alice should remove bob");
+        carol
+            .replace_members(remaining)
+            .expect("carol should remove bob");
+
+        let proposer = proposer_order(
+            "room-a",
+            0,
+            crate::crypto::EpochEventType::Leave,
+            "bob-id",
+            &["alice-id".to_string(), "carol-id".to_string()],
+        )[0]
+        .clone();
+        let commit = if proposer == "alice-id" {
+            alice
+                .build_pending_epoch_commit()
+                .expect("alice build should succeed")
+                .expect("alice should build leave commit")
+        } else {
+            carol
+                .build_pending_epoch_commit()
+                .expect("carol build should succeed")
+                .expect("carol should build leave commit")
+        };
+        assert_eq!(
+            commit
+                .wrapped_secrets
+                .iter()
+                .map(|wrapped| wrapped.recipient_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice-id", "carol-id"]
+        );
+
+        if proposer == "alice-id" {
+            assert!(alice
+                .apply_epoch_commit(&commit)
+                .expect("alice should apply leave commit"));
+            assert!(carol
+                .apply_epoch_commit(&commit)
+                .expect("carol should apply leave commit"));
+        } else {
+            assert!(carol
+                .apply_epoch_commit(&commit)
+                .expect("carol should apply leave commit"));
+            assert!(alice
+                .apply_epoch_commit(&commit)
+                .expect("alice should apply leave commit"));
+        }
+        assert!(bob.apply_epoch_commit(&commit).is_err());
+
+        let encrypted = encrypt_message(&mut alice, SecureMessageType::Text, b"after bob leaves")
+            .expect("alice should encrypt after leave rekey");
+        assert!(decrypt_message(&mut bob, &encrypted).is_err());
+    }
+
+    #[test]
+    fn test_attachment_chunk_rejects_wrong_epoch_or_sender() {
+        let payload = b"phase4 attachment chunk";
+        let file_key = [7u8; 32];
+        let nonce_base = [9u8; 8];
+        let sha256_hex = hex::encode(sha2::Sha256::digest(payload));
+        let manifest_line = build_file_manifest2_line(
+            "room-a",
+            3,
+            "alice-id",
+            "transfer-v2",
+            AttachmentKind::File,
+            "demo.txt",
+            payload.len() as u64,
+            1,
+            &sha256_hex,
+            &file_key,
+            &nonce_base,
+        )
+        .expect("manifest should build");
+        let chunk_line = build_file_chunk2_line(
+            "room-a",
+            3,
+            "alice-id",
+            "transfer-v2",
+            0,
+            1,
+            payload,
+            &file_key,
+            &nonce_base,
+        )
+        .expect("chunk should build");
+
+        let AttachmentFrame::Meta(meta) =
+            parse_attachment_frame(&manifest_line).expect("manifest should parse")
+        else {
+            panic!("expected manifest");
+        };
+        let AttachmentFrame::EncryptedChunk(chunk) =
+            parse_attachment_frame(&chunk_line).expect("chunk should parse")
+        else {
+            panic!("expected chunk");
+        };
+
+        let mut wrong_epoch = meta.clone();
+        wrong_epoch.epoch += 1;
+        assert!(decrypt_file_chunk2(&chunk, &wrong_epoch).is_err());
+
+        let mut wrong_sender = meta;
+        wrong_sender.sender_id = "mallory-id".to_string();
+        assert!(decrypt_file_chunk2(&chunk, &wrong_sender).is_err());
+    }
+
+    #[test]
+    fn test_tampered_secure_message_does_not_advance_recv_chain() {
+        let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let roster = [
+            ("alice-id".to_string(), "alice".to_string()),
+            ("bob-id".to_string(), "bob".to_string()),
+        ];
+        alice
+            .replace_members(roster.clone())
+            .expect("alice roster should update");
+        bob.replace_members(roster)
+            .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
 
         let mut encrypted = encrypt_message(&mut alice, SecureMessageType::Text, b"phase1 hello")
             .expect("encrypt should succeed");
@@ -272,24 +769,9 @@ mod tests {
     #[test]
     fn test_key_announce_updates_member_public_key() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
         alice
             .replace_members([
                 ("alice-id".to_string(), "alice".to_string()),
@@ -317,33 +799,10 @@ mod tests {
     #[test]
     fn test_join_rekey_commit_rotates_epoch_and_unblocks_new_member() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
-        let mut charlie = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "charlie-id",
-            "charlie",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("charlie should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let mut charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
 
         let initial_roster = [
             ("alice-id".to_string(), "alice".to_string()),
@@ -354,6 +813,8 @@ mod tests {
             .expect("alice roster should update");
         bob.replace_members(initial_roster)
             .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
         alice.pending_transition = None;
         bob.pending_transition = None;
 
@@ -458,24 +919,9 @@ mod tests {
     #[test]
     fn test_third_joiner_can_accept_commit_from_existing_later_epoch() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
+        let epoch_zero_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_zero_secret);
+        let mut bob = pending_test_state(&room_crypto, "bob-id", "bob");
 
         alice
             .replace_members([("alice-id".to_string(), "alice".to_string())])
@@ -508,15 +954,7 @@ mod tests {
         assert_eq!(alice.epoch, 1);
         assert_eq!(bob.epoch, 1);
 
-        let mut charlie = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "charlie-id",
-            "charlie",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("charlie should initialize");
+        let mut charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
 
         let third_join_roster = [
             ("alice-id".to_string(), "alice".to_string()),
@@ -604,33 +1042,10 @@ mod tests {
     #[test]
     fn test_late_old_epoch_message_after_join_rekey_is_still_accepted() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
-        let mut charlie = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "charlie-id",
-            "charlie",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("charlie should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let mut charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
 
         let initial_roster = [
             ("alice-id".to_string(), "alice".to_string()),
@@ -641,6 +1056,8 @@ mod tests {
             .expect("alice roster should update");
         bob.replace_members(initial_roster)
             .expect("bob roster should update");
+        install_test_recv_chains(&mut alice, epoch_secret);
+        install_test_recv_chains(&mut bob, epoch_secret);
         alice.pending_transition = None;
         bob.pending_transition = None;
 
@@ -704,6 +1121,12 @@ mod tests {
                 .expect("bob build should succeed")
                 .expect("bob should be proposer")
         };
+        let late_old_epoch = encrypt_message(
+            &mut bob,
+            SecureMessageType::Text,
+            b"late old epoch from bob",
+        )
+        .expect("bob should encrypt under epoch zero before the commit is applied");
 
         if proposer == "alice-id" {
             assert!(alice
@@ -721,18 +1144,9 @@ mod tests {
                 .expect("alice apply should succeed"));
         }
 
-        let late_old_epoch = encrypt_message(
-            &mut charlie,
-            SecureMessageType::Text,
-            b"late old epoch from charlie",
-        )
-        .expect("charlie should still encrypt under epoch zero");
         let decrypted_alice = decrypt_message(&mut alice, &late_old_epoch)
             .expect("alice should accept late old epoch");
-        let decrypted_bob =
-            decrypt_message(&mut bob, &late_old_epoch).expect("bob should accept late old epoch");
-        assert_eq!(decrypted_alice.plaintext, b"late old epoch from charlie");
-        assert_eq!(decrypted_bob.plaintext, b"late old epoch from charlie");
+        assert_eq!(decrypted_alice.plaintext, b"late old epoch from bob");
 
         assert!(charlie
             .apply_epoch_commit(&commit)
@@ -743,33 +1157,10 @@ mod tests {
     #[test]
     fn test_joiner_retries_epoch_commit_that_arrives_before_member_list() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "alice-id",
-            "alice",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("alice should initialize");
-        let mut bob = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "bob-id",
-            "bob",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("bob should initialize");
-        let charlie = GroupCryptoState::new_single_epoch(
-            "room-a",
-            "charlie-id",
-            "charlie",
-            0,
-            room_crypto.placeholder_epoch_secret(),
-            room_crypto.room_auth_key(),
-        )
-        .expect("charlie should initialize");
+        let epoch_secret = random_test_epoch_secret();
+        let mut alice = active_test_state(&room_crypto, "alice-id", "alice", epoch_secret);
+        let mut bob = active_test_state(&room_crypto, "bob-id", "bob", epoch_secret);
+        let charlie = pending_test_state(&room_crypto, "charlie-id", "charlie");
 
         let initial_roster = [
             ("alice-id".to_string(), "alice".to_string()),

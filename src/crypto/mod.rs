@@ -7,9 +7,14 @@ pub mod safety;
 pub mod transport;
 
 pub use core::{
-    decrypt_message, encrypt_message, hkdf_expand_label, proposer_order, roster_hash,
-    validate_epoch_commit, wrap_epoch_secret_for_recipient, zeroize, GroupCryptoState,
+    decrypt_message, encrypt_message, hkdf_expand_label, proposer_order,
+    random_group_secret_epoch_0, roster_hash, validate_epoch_commit, zeroize,
+    GroupCryptoState,
 };
+#[cfg(test)]
+pub use core::random_test_epoch_secret;
+#[cfg(test)]
+pub(crate) use core::unwrap_epoch_secret_from_commit;
 pub use group::{
     ChainState, DecryptedMessage, EncryptedMessage, EpochCommit, EpochEventType, EpochSecretPlain,
     MemberCryptoInfo, MemberId, MemberKeyAnnounce, OldEpochState, PendingRosterTransition,

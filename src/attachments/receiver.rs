@@ -15,6 +15,9 @@ pub struct AttachmentReceiveState {
 }
 
 struct IncomingAttachment {
+    group_id: String,
+    epoch: u64,
+    sender_id: String,
     sender: String,
     file_name: String,
     total_size: u64,
@@ -76,6 +79,9 @@ pub fn register_attachment(
     };
 
     let incoming = IncomingAttachment {
+        group_id: meta.group_id,
+        epoch: meta.epoch,
+        sender_id: meta.sender_id,
         sender,
         file_name: meta.file_name,
         total_size: meta.total_size,
@@ -102,14 +108,25 @@ pub fn append_encrypted_chunk(
     encrypted_chunk: EncryptedAttachmentChunk,
     attachment_store: &AttachmentStore,
 ) -> Result<Vec<AttachmentReceiveEvent>, String> {
-    let (file_key, nonce_base) = {
+    let meta = {
         let Some(incoming) = state.incoming.get(&encrypted_chunk.transfer_id) else {
             return Ok(Vec::new());
         };
-        (incoming.file_key, incoming.nonce_base)
+        AttachmentMeta {
+            group_id: incoming.group_id.clone(),
+            epoch: incoming.epoch,
+            sender_id: incoming.sender_id.clone(),
+            transfer_id: encrypted_chunk.transfer_id.clone(),
+            kind: incoming.kind,
+            file_name: incoming.file_name.clone(),
+            total_size: incoming.total_size,
+            total_chunks: incoming.total_chunks,
+            sha256_hex: incoming.sha256_hex.clone(),
+            file_key: incoming.file_key,
+            nonce_base: incoming.nonce_base,
+        }
     };
-    let data = decrypt_file_chunk2(&encrypted_chunk, &file_key, &nonce_base)
-        .map_err(|err| err.to_string())?;
+    let data = decrypt_file_chunk2(&encrypted_chunk, &meta).map_err(|err| err.to_string())?;
     append_chunk(
         state,
         encrypted_chunk.transfer_id,
@@ -242,6 +259,9 @@ mod tests {
 
     fn manifest(name: &str, bytes: &[u8], total_chunks: usize) -> AttachmentMeta {
         AttachmentMeta {
+            group_id: "room-a".to_string(),
+            epoch: 3,
+            sender_id: "alice-id".to_string(),
             transfer_id: "transfer-1".to_string(),
             kind: AttachmentKind::File,
             file_name: name.to_string(),

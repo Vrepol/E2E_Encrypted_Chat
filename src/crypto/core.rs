@@ -18,7 +18,6 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
-const ROOM_STATE_LABEL: &[u8] = b"rust-chat room-state v1";
 const ROOM_JOIN_LABEL: &[u8] = b"rust-chat room-join-credential v1";
 const ROOM_AUTH_LABEL: &[u8] = b"rust-chat room-auth-key v1";
 const TRANSPORT_C2S_INFO: &[u8] = b"rust-chat transport c2s key v1";
@@ -33,12 +32,14 @@ const CHAIN_NEXT_LABEL: &[u8] = b"rust-chat chain-next v1";
 const CHAIN_AEAD_KEY_LABEL: &[u8] = b"rust-chat chain-aead-key v1";
 const CHAIN_NONCE_LABEL: &[u8] = b"rust-chat chain-nonce v1";
 const PROPOSER_SORT_LABEL: &[u8] = b"rust-chat proposer v1";
-#[allow(dead_code)]
 const EPOCH_SECRET_WRAP_LABEL: &[u8] = b"rust-chat epoch-secret-wrap v1";
+const EPOCH_COMMIT_CONTEXT_LABEL: &[u8] = b"rust-chat epoch-commit-context v1";
+const KEY_ANNOUNCE_MAC_LABEL: &[u8] = b"rust-chat key-announce-mac v1";
 const CURRENT_PROTOCOL_VERSION: u8 = 1;
 const DEFAULT_MAX_SKIP: u64 = 64;
 const DEFAULT_SKIPPED_KEY_TTL_SECS: i64 = 300;
 const NONCE96_LEN: usize = 12;
+const KEY_ANNOUNCE_NONCE_LEN: usize = 16;
 
 pub type MemberId = String;
 
@@ -47,15 +48,15 @@ pub struct GroupCryptoState {
     pub group_id: String,
     pub epoch: u64,
     pub my_member_id: MemberId,
-    pub my_sender_chain: ChainState,
+    pub my_sender_chain: Option<ChainState>,
     pub recv_chains: HashMap<MemberId, RecvChainState>,
     pub members: HashMap<MemberId, MemberCryptoInfo>,
     pub old_epochs: Vec<OldEpochState>,
     pub room_auth_key: [u8; 32],
     pub skipped_key_ttl_secs: i64,
     pub default_max_skip: u64,
+    pub key_conflicts: HashSet<MemberId>,
     pub pending_transition: Option<PendingRosterTransition>,
-    sender_chain_root: [u8; 32],
     x25519_secret: [u8; 32],
     x25519_public: [u8; 32],
     roster_initialized: bool,
@@ -95,7 +96,6 @@ pub struct OldEpochState {
     pub members: HashMap<MemberId, MemberCryptoInfo>,
     pub recv_chains: HashMap<MemberId, RecvChainState>,
     pub expires_at: i64,
-    sender_chain_root: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +143,8 @@ pub struct MemberKeyAnnounce {
     pub epoch: u64,
     pub member_id: MemberId,
     pub x25519_public: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub mac: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,7 +179,11 @@ pub struct WrappedEpochSecret {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EpochSecretPlain {
+    pub group_id: String,
+    pub old_epoch: u64,
     pub new_epoch: u64,
+    pub event_type: EpochEventType,
+    pub recipient_id: MemberId,
     pub group_secret: Vec<u8>,
     pub new_roster_hash: String,
 }
@@ -187,6 +193,19 @@ struct ChainStep {
     next_chain_key: [u8; 32],
     aead_key: [u8; 32],
     nonce: [u8; NONCE96_LEN],
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EpochCommitContext {
+    group_id: String,
+    old_epoch: u64,
+    new_epoch: u64,
+    event_type: EpochEventType,
+    affected_member_id: MemberId,
+    old_roster_hash: String,
+    new_roster_hash: String,
+    proposer_id: MemberId,
+    proposer_attempt: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,14 +248,6 @@ impl RoomCryptoState {
         hex::encode(mac.finalize().into_bytes())
     }
 
-    pub fn placeholder_epoch_secret(&self) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(Some(ROOM_STATE_LABEL), &self.room_key);
-        let mut out = [0u8; 32];
-        hk.expand(b"epoch-placeholder", &mut out)
-            .expect("room placeholder epoch");
-        out
-    }
-
     pub fn room_auth_key(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
         let hk = Hkdf::<Sha256>::new(Some(ROOM_AUTH_LABEL), &self.room_key);
@@ -251,7 +262,28 @@ impl GroupCryptoState {
         my_member_id: impl Into<String>,
         my_nickname: impl Into<String>,
         epoch: u64,
-        mut group_secret: [u8; 32],
+        group_secret: [u8; 32],
+        room_auth_key: [u8; 32],
+    ) -> Result<Self> {
+        let group_id = group_id.into();
+        let my_member_id = my_member_id.into();
+        let my_nickname = my_nickname.into();
+        let mut state = Self::new_pending_epoch(
+            group_id.clone(),
+            my_member_id.clone(),
+            my_nickname,
+            epoch,
+            room_auth_key,
+        )?;
+        state.activate_epoch(epoch, group_secret)?;
+        Ok(state)
+    }
+
+    pub fn new_pending_epoch(
+        group_id: impl Into<String>,
+        my_member_id: impl Into<String>,
+        my_nickname: impl Into<String>,
+        epoch: u64,
         room_auth_key: [u8; 32],
     ) -> Result<Self> {
         let group_id = group_id.into();
@@ -259,12 +291,6 @@ impl GroupCryptoState {
         let my_nickname = my_nickname.into();
         let x25519_secret = random_secret32();
         let x25519_public = x25519_public_from_secret(&x25519_secret);
-        let sender_chain_root = derive_sender_chain_root(&group_secret, &group_id, epoch)?;
-        let my_sender_chain = ChainState {
-            chain_key: derive_sender_chain_key(&sender_chain_root, &my_member_id)?,
-            msg_no: 0,
-        };
-        zeroize(&mut group_secret);
 
         let mut members = HashMap::new();
         members.insert(
@@ -280,15 +306,15 @@ impl GroupCryptoState {
             group_id,
             epoch,
             my_member_id,
-            my_sender_chain,
+            my_sender_chain: None,
             recv_chains: HashMap::new(),
             members,
             old_epochs: Vec::new(),
             room_auth_key,
             skipped_key_ttl_secs: DEFAULT_SKIPPED_KEY_TTL_SECS,
             default_max_skip: DEFAULT_MAX_SKIP,
+            key_conflicts: HashSet::new(),
             pending_transition: None,
-            sender_chain_root,
             x25519_secret,
             x25519_public,
             roster_initialized: false,
@@ -319,12 +345,6 @@ impl GroupCryptoState {
                     x25519_public,
                 },
             );
-            if member_id != self.my_member_id {
-                let chain_key = derive_sender_chain_key(&self.sender_chain_root, &member_id)?;
-                self.recv_chains
-                    .entry(member_id)
-                    .or_insert_with(|| RecvChainState::new(chain_key, self.default_max_skip));
-            }
         }
 
         if !next_members.contains_key(&self.my_member_id) {
@@ -349,11 +369,15 @@ impl GroupCryptoState {
             self.pending_transition =
                 detect_roster_transition(previous_members.clone(), next_member_ids.clone());
         } else if !self.roster_initialized {
-            self.pending_transition = detect_initial_join_transition(
-                &self.my_member_id,
-                previous_members,
-                next_member_ids.clone(),
-            );
+            self.pending_transition = if self.my_sender_chain.is_some() {
+                detect_roster_transition(previous_members, next_member_ids.clone())
+            } else {
+                detect_initial_join_transition(
+                    &self.my_member_id,
+                    previous_members,
+                    next_member_ids.clone(),
+                )
+            };
             self.roster_initialized = true;
         }
 
@@ -384,11 +408,22 @@ impl GroupCryptoState {
     }
 
     pub fn local_key_announce(&self) -> MemberKeyAnnounce {
+        let mut nonce = vec![0u8; KEY_ANNOUNCE_NONCE_LEN];
+        rand::rng().fill_bytes(&mut nonce);
         MemberKeyAnnounce {
             group_id: self.group_id.clone(),
             epoch: self.epoch,
             member_id: self.my_member_id.clone(),
             x25519_public: self.x25519_public.to_vec(),
+            mac: compute_key_announce_mac(
+                &self.room_auth_key,
+                &self.group_id,
+                self.epoch,
+                &self.my_member_id,
+                &self.x25519_public,
+                &nonce,
+            ),
+            nonce,
         }
     }
 
@@ -399,29 +434,57 @@ impl GroupCryptoState {
         if announce.x25519_public.len() != 32 {
             return Err(anyhow!("Key announce public key length mismatch"));
         }
+        if announce.mac
+            != compute_key_announce_mac(
+                &self.room_auth_key,
+                &announce.group_id,
+                announce.epoch,
+                &announce.member_id,
+                &announce.x25519_public,
+                &announce.nonce,
+            )
+        {
+            return Err(anyhow!("Key announce MAC mismatch"));
+        }
         let Some(member) = self.members.get_mut(&announce.member_id) else {
             return Ok(false);
         };
         if member.x25519_public.as_deref() == Some(announce.x25519_public.as_slice()) {
             return Ok(false);
         }
+        if member.x25519_public.is_some() {
+            self.key_conflicts.insert(announce.member_id.clone());
+            return Err(anyhow!("Key announce public key conflict"));
+        }
         member.x25519_public = Some(announce.x25519_public.clone());
         Ok(true)
     }
 
     pub fn can_build_join_commit(&self) -> bool {
+        self.can_build_pending_epoch_commit()
+            && self
+                .pending_transition
+                .as_ref()
+                .is_some_and(|pending| pending.event_type == EpochEventType::Join)
+    }
+
+    pub fn can_build_pending_epoch_commit(&self) -> bool {
+        if self.my_sender_chain.is_none() {
+            return false;
+        }
         let Some(pending) = self.pending_transition.as_ref() else {
             return false;
         };
-        if pending.event_type != EpochEventType::Join {
-            return false;
-        }
         let proposer = proposer_order(
             &self.group_id,
             self.epoch,
-            EpochEventType::Join,
+            pending.event_type.clone(),
             &pending.affected_member_id,
-            &pending.old_members,
+            &proposer_candidates_for_event(
+                pending.event_type.clone(),
+                &pending.old_members,
+                &pending.new_members,
+            ),
         );
         if proposer.first() != Some(&self.my_member_id) {
             return false;
@@ -436,19 +499,34 @@ impl GroupCryptoState {
     }
 
     pub fn build_join_epoch_commit(&mut self) -> Result<Option<EpochCommit>> {
-        if !self.can_build_join_commit() {
+        let Some(pending) = self.pending_transition.as_ref() else {
+            return Ok(None);
+        };
+        if pending.event_type != EpochEventType::Join {
+            return Ok(None);
+        }
+        self.build_pending_epoch_commit()
+    }
+
+    pub fn build_pending_epoch_commit(&mut self) -> Result<Option<EpochCommit>> {
+        if !self.can_build_pending_epoch_commit() {
             return Ok(None);
         }
         let pending = self
             .pending_transition
             .clone()
             .ok_or_else(|| anyhow!("Missing pending transition"))?;
+        let candidates = proposer_candidates_for_event(
+            pending.event_type.clone(),
+            &pending.old_members,
+            &pending.new_members,
+        );
         let proposer = proposer_order(
             &self.group_id,
             self.epoch,
-            EpochEventType::Join,
+            pending.event_type.clone(),
             &pending.affected_member_id,
-            &pending.old_members,
+            &candidates,
         );
         if proposer.first() != Some(&self.my_member_id) {
             return Ok(None);
@@ -457,10 +535,16 @@ impl GroupCryptoState {
         let mut group_secret = random_secret32();
         let old_roster_hash = roster_hash(&pending.old_members);
         let new_roster_hash = roster_hash(&pending.new_members);
-        let plain = EpochSecretPlain {
+        let context = EpochCommitContext {
+            group_id: self.group_id.clone(),
+            old_epoch: self.epoch,
             new_epoch: self.epoch.saturating_add(1),
-            group_secret: group_secret.to_vec(),
+            event_type: pending.event_type.clone(),
+            affected_member_id: pending.affected_member_id.clone(),
+            old_roster_hash: old_roster_hash.clone(),
             new_roster_hash: new_roster_hash.clone(),
+            proposer_id: self.my_member_id.clone(),
+            proposer_attempt: 0,
         };
 
         let mut wrapped_secrets = Vec::with_capacity(pending.new_members.len());
@@ -470,26 +554,36 @@ impl GroupCryptoState {
                 .get(recipient_id)
                 .and_then(|member| member.x25519_public.as_ref())
                 .ok_or_else(|| anyhow!("Missing recipient X25519 public key for {recipient_id}"))?;
+            let plain = EpochSecretPlain {
+                group_id: context.group_id.clone(),
+                old_epoch: context.old_epoch,
+                new_epoch: context.new_epoch,
+                event_type: context.event_type.clone(),
+                recipient_id: recipient_id.clone(),
+                group_secret: group_secret.to_vec(),
+                new_roster_hash: context.new_roster_hash.clone(),
+            };
             wrapped_secrets.push(wrap_epoch_secret_for_recipient(
                 recipient_id,
                 recipient_public,
                 &self.x25519_secret,
                 &self.room_auth_key,
+                &context,
                 &plain,
             )?);
         }
         zeroize(&mut group_secret);
 
         Ok(Some(EpochCommit {
-            group_id: self.group_id.clone(),
-            old_epoch: self.epoch,
-            new_epoch: self.epoch.saturating_add(1),
-            event_type: EpochEventType::Join,
-            affected_member_id: pending.affected_member_id,
-            old_roster_hash,
-            new_roster_hash,
-            proposer_id: self.my_member_id.clone(),
-            proposer_attempt: 0,
+            group_id: context.group_id,
+            old_epoch: context.old_epoch,
+            new_epoch: context.new_epoch,
+            event_type: context.event_type,
+            affected_member_id: context.affected_member_id,
+            old_roster_hash: context.old_roster_hash,
+            new_roster_hash: context.new_roster_hash,
+            proposer_id: context.proposer_id,
+            proposer_attempt: context.proposer_attempt,
             wrapped_secrets,
         }))
     }
@@ -525,10 +619,23 @@ impl GroupCryptoState {
             &self.my_member_id,
             &self.x25519_secret,
             &self.room_auth_key,
+            commit,
             wrapped,
         )?;
+        if plain.group_id != commit.group_id {
+            return Err(anyhow!("Wrapped epoch secret group_id mismatch"));
+        }
+        if plain.old_epoch != commit.old_epoch {
+            return Err(anyhow!("Wrapped epoch secret old_epoch mismatch"));
+        }
         if plain.new_epoch != commit.new_epoch {
             return Err(anyhow!("Wrapped epoch secret new_epoch mismatch"));
+        }
+        if plain.event_type != commit.event_type {
+            return Err(anyhow!("Wrapped epoch secret event_type mismatch"));
+        }
+        if plain.recipient_id != self.my_member_id {
+            return Err(anyhow!("Wrapped epoch secret recipient mismatch"));
         }
         if plain.new_roster_hash != commit.new_roster_hash {
             return Err(anyhow!("Wrapped epoch secret roster hash mismatch"));
@@ -547,6 +654,35 @@ impl GroupCryptoState {
         &self.x25519_public
     }
 
+    #[cfg(test)]
+    pub fn current_x25519_secret_for_test(&self) -> [u8; 32] {
+        self.x25519_secret
+    }
+
+    #[cfg(test)]
+    pub fn install_test_recv_chains_for_current_roster(
+        &mut self,
+        mut group_secret: [u8; 32],
+    ) -> Result<()> {
+        let mut sender_chain_root =
+            derive_sender_chain_root(&group_secret, &self.group_id, self.epoch)?;
+        let mut recv_chains = HashMap::new();
+        for member_id in self.members.keys() {
+            if member_id == &self.my_member_id {
+                continue;
+            }
+            let chain_key = derive_sender_chain_key(&sender_chain_root, member_id)?;
+            recv_chains.insert(
+                member_id.clone(),
+                RecvChainState::new(chain_key, self.default_max_skip),
+            );
+        }
+        self.recv_chains = recv_chains;
+        zeroize(&mut sender_chain_root);
+        zeroize(&mut group_secret);
+        Ok(())
+    }
+
     fn can_accept_join_commit_from_later_epoch(
         &self,
         pending: &PendingRosterTransition,
@@ -562,18 +698,20 @@ impl GroupCryptoState {
     }
 
     fn activate_epoch(&mut self, new_epoch: u64, mut group_secret: [u8; 32]) -> Result<()> {
-        let expires_at = unix_timestamp() + self.skipped_key_ttl_secs;
-        self.old_epochs.push(OldEpochState {
-            epoch: self.epoch,
-            members: self.members.clone(),
-            recv_chains: self.recv_chains.clone(),
-            expires_at,
-            sender_chain_root: self.sender_chain_root,
-        });
-        self.old_epochs
-            .retain(|old| old.expires_at > unix_timestamp());
+        if self.my_sender_chain.is_some() {
+            let expires_at = unix_timestamp() + self.skipped_key_ttl_secs;
+            self.old_epochs.push(OldEpochState {
+                epoch: self.epoch,
+                members: self.members.clone(),
+                recv_chains: self.recv_chains.clone(),
+                expires_at,
+            });
+            self.old_epochs
+                .retain(|old| old.expires_at > unix_timestamp());
+        }
 
-        let sender_chain_root = derive_sender_chain_root(&group_secret, &self.group_id, new_epoch)?;
+        let mut sender_chain_root =
+            derive_sender_chain_root(&group_secret, &self.group_id, new_epoch)?;
         let my_sender_chain = ChainState {
             chain_key: derive_sender_chain_key(&sender_chain_root, &self.my_member_id)?,
             msg_no: 0,
@@ -590,10 +728,23 @@ impl GroupCryptoState {
                 RecvChainState::new(chain_key, self.default_max_skip),
             );
         }
+        zeroize(&mut sender_chain_root);
+
+        let mut previous_x25519_secret = self.x25519_secret;
+        zeroize(&mut self.x25519_secret);
+        self.x25519_secret = random_secret32();
+        self.x25519_public = x25519_public_from_secret(&self.x25519_secret);
+        zeroize(&mut previous_x25519_secret);
+        for (member_id, member) in &mut self.members {
+            if member_id == &self.my_member_id {
+                member.x25519_public = Some(self.x25519_public.to_vec());
+            } else {
+                member.x25519_public = None;
+            }
+        }
 
         self.epoch = new_epoch;
-        self.sender_chain_root = sender_chain_root;
-        self.my_sender_chain = my_sender_chain;
+        self.my_sender_chain = Some(my_sender_chain);
         self.recv_chains = next_recv_chains;
         self.pending_transition = None;
         zeroize(&mut group_secret);
@@ -714,13 +865,17 @@ pub fn encrypt_message(
 ) -> Result<EncryptedMessage> {
     state.cleanup_expired_skipped_keys();
 
-    let mut step = derive_chain_step(&state.my_sender_chain.chain_key)?;
+    let sender_chain = state
+        .my_sender_chain
+        .as_mut()
+        .ok_or_else(|| anyhow!("Current epoch secret unavailable"))?;
+    let mut step = derive_chain_step(&sender_chain.chain_key)?;
     let header = SecureMessageHeader {
         version: CURRENT_PROTOCOL_VERSION,
         group_id: state.group_id.clone(),
         epoch: state.epoch,
         sender_id: state.my_member_id.clone(),
-        msg_no: state.my_sender_chain.msg_no,
+        msg_no: sender_chain.msg_no,
         msg_type,
     };
     let aad = serde_json::to_vec(&header)?;
@@ -735,8 +890,8 @@ pub fn encrypt_message(
         )
         .map_err(|_| anyhow!("Secure message encryption failed"))?;
 
-    state.my_sender_chain.chain_key = step.next_chain_key;
-    state.my_sender_chain.msg_no = state.my_sender_chain.msg_no.saturating_add(1);
+    sender_chain.chain_key = step.next_chain_key;
+    sender_chain.msg_no = sender_chain.msg_no.saturating_add(1);
     zeroize(&mut step.aead_key);
     zeroize(&mut step.nonce);
 
@@ -759,11 +914,12 @@ pub fn decrypt_message(
         return Err(anyhow!("Ignoring reflected self message"));
     }
     if message.header.epoch == state.epoch {
+        if state.my_sender_chain.is_none() {
+            return Err(anyhow!("Current epoch secret unavailable"));
+        }
         return decrypt_for_epoch(
             &state.members,
             &mut state.recv_chains,
-            &state.sender_chain_root,
-            state.default_max_skip,
             state.skipped_key_ttl_secs,
             message,
         );
@@ -777,8 +933,6 @@ pub fn decrypt_message(
         return decrypt_for_epoch(
             &old_epoch.members,
             &mut old_epoch.recv_chains,
-            &old_epoch.sender_chain_root,
-            state.default_max_skip,
             state.skipped_key_ttl_secs,
             message,
         );
@@ -851,11 +1005,8 @@ pub fn validate_epoch_commit(
         return Err(anyhow!("Epoch commit new roster hash mismatch"));
     }
 
-    let candidates = match commit.event_type {
-        EpochEventType::Join => old_members.to_vec(),
-        EpochEventType::Leave | EpochEventType::Kick => new_members.to_vec(),
-        EpochEventType::Rotate => old_members.to_vec(),
-    };
+    let candidates =
+        proposer_candidates_for_event(commit.event_type.clone(), old_members, new_members);
     let ordered = proposer_order(
         &commit.group_id,
         commit.old_epoch,
@@ -886,11 +1037,12 @@ pub fn validate_epoch_commit(
     Ok(())
 }
 
-pub fn wrap_epoch_secret_for_recipient(
+pub(crate) fn wrap_epoch_secret_for_recipient(
     recipient_id: &str,
     recipient_x25519_public: &[u8],
     proposer_x25519_secret: &[u8],
     room_auth_key: &[u8; 32],
+    context: &EpochCommitContext,
     plain: &EpochSecretPlain,
 ) -> Result<WrappedEpochSecret> {
     let proposer_secret = bytes32_from_slice(proposer_x25519_secret)?;
@@ -909,11 +1061,18 @@ pub fn wrap_epoch_secret_for_recipient(
     )?;
 
     let plain_bytes = serde_json::to_vec(plain)?;
+    let aad = epoch_commit_context_hash(context, recipient_id);
     let mut nonce = [0u8; NONCE96_LEN];
     rand::rng().fill_bytes(&mut nonce);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrap_key));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plain_bytes.as_ref())
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plain_bytes.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| anyhow!("Epoch secret wrapping failed"))?;
     zeroize(&mut wrap_key);
 
@@ -925,10 +1084,11 @@ pub fn wrap_epoch_secret_for_recipient(
     })
 }
 
-pub fn unwrap_epoch_secret_from_commit(
+pub(crate) fn unwrap_epoch_secret_from_commit(
     my_member_id: &str,
     my_x25519_secret: &[u8],
     room_auth_key: &[u8; 32],
+    commit: &EpochCommit,
     wrapped: &WrappedEpochSecret,
 ) -> Result<EpochSecretPlain> {
     if wrapped.recipient_id != my_member_id {
@@ -950,15 +1110,89 @@ pub fn unwrap_epoch_secret_from_commit(
     )?;
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&wrap_key));
+    let context = EpochCommitContext {
+        group_id: commit.group_id.clone(),
+        old_epoch: commit.old_epoch,
+        new_epoch: commit.new_epoch,
+        event_type: commit.event_type.clone(),
+        affected_member_id: commit.affected_member_id.clone(),
+        old_roster_hash: commit.old_roster_hash.clone(),
+        new_roster_hash: commit.new_roster_hash.clone(),
+        proposer_id: commit.proposer_id.clone(),
+        proposer_attempt: commit.proposer_attempt,
+    };
+    let aad = epoch_commit_context_hash(&context, my_member_id);
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&wrapped.nonce),
-            wrapped.ciphertext.as_ref(),
+            Payload {
+                msg: wrapped.ciphertext.as_ref(),
+                aad: &aad,
+            },
         )
         .map_err(|_| anyhow!("Epoch secret unwrap failed"))?;
     zeroize(&mut wrap_key);
 
     serde_json::from_slice(&plaintext).map_err(|err| anyhow!("Invalid wrapped epoch secret: {err}"))
+}
+
+fn proposer_candidates_for_event(
+    event_type: EpochEventType,
+    old_members: &[MemberId],
+    new_members: &[MemberId],
+) -> Vec<MemberId> {
+    match event_type {
+        EpochEventType::Join => old_members.to_vec(),
+        EpochEventType::Leave | EpochEventType::Kick => new_members.to_vec(),
+        EpochEventType::Rotate => new_members.to_vec(),
+    }
+}
+
+fn compute_key_announce_mac(
+    room_auth_key: &[u8; 32],
+    group_id: &str,
+    epoch: u64,
+    member_id: &str,
+    x25519_public: &[u8],
+    nonce: &[u8],
+) -> Vec<u8> {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(room_auth_key).expect("key announce mac");
+    mac.update(KEY_ANNOUNCE_MAC_LABEL);
+    mac.update(&canonical_bytes(&[
+        group_id.as_bytes(),
+        &epoch.to_be_bytes(),
+        member_id.as_bytes(),
+        x25519_public,
+        nonce,
+    ]));
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn epoch_commit_context_hash(context: &EpochCommitContext, recipient_id: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(EPOCH_COMMIT_CONTEXT_LABEL);
+    hasher.update(canonical_bytes(&[
+        context.group_id.as_bytes(),
+        &context.old_epoch.to_be_bytes(),
+        &context.new_epoch.to_be_bytes(),
+        epoch_event_type_tag(&context.event_type),
+        context.affected_member_id.as_bytes(),
+        context.old_roster_hash.as_bytes(),
+        context.new_roster_hash.as_bytes(),
+        context.proposer_id.as_bytes(),
+        &context.proposer_attempt.to_be_bytes(),
+        recipient_id.as_bytes(),
+    ]));
+    hasher.finalize().to_vec()
+}
+
+fn canonical_bytes(fields: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        out.extend_from_slice(field);
+    }
+    out
 }
 
 fn transport_direction_key(shared_secret: &[u8; 32], info: &[u8]) -> [u8; 32] {
@@ -1070,8 +1304,6 @@ fn open_with_skipped_key(
 fn decrypt_for_epoch(
     members: &HashMap<MemberId, MemberCryptoInfo>,
     recv_chains: &mut HashMap<MemberId, RecvChainState>,
-    sender_chain_root: &[u8; 32],
-    default_max_skip: u64,
     skipped_key_ttl_secs: i64,
     message: &EncryptedMessage,
 ) -> Result<DecryptedMessage> {
@@ -1080,15 +1312,8 @@ fn decrypt_for_epoch(
     }
 
     let recv = recv_chains
-        .entry(message.header.sender_id.clone())
-        .or_insert_with(|| {
-            let chain_key = derive_sender_chain_key(sender_chain_root, &message.header.sender_id)
-                .unwrap_or([0u8; 32]);
-            RecvChainState::new(chain_key, default_max_skip)
-        });
-    if recv.chain_key == [0u8; 32] {
-        return Err(anyhow!("Failed to initialize receive chain"));
-    }
+        .get_mut(&message.header.sender_id)
+        .ok_or_else(|| anyhow!("Missing receive chain for sender"))?;
 
     let aad = serde_json::to_vec(&message.header)?;
     if message.header.msg_no < recv.next_msg_no {
@@ -1253,6 +1478,15 @@ fn random_secret32() -> [u8; 32] {
     let mut secret = [0u8; 32];
     rand::rng().fill_bytes(&mut secret);
     secret
+}
+
+pub fn random_group_secret_epoch_0() -> [u8; 32] {
+    random_secret32()
+}
+
+#[cfg(test)]
+pub fn random_test_epoch_secret() -> [u8; 32] {
+    random_secret32()
 }
 
 fn x25519_public_from_secret(secret: &[u8; 32]) -> [u8; 32] {

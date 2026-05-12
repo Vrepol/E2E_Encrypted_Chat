@@ -261,7 +261,7 @@ fn trigger_phase2_actions(
             return;
         };
         let announce_line = build_key_announce_line(&guard.local_key_announce()).ok();
-        let local_commit = guard.build_join_epoch_commit().ok().flatten();
+        let local_commit = guard.build_pending_epoch_commit().ok().flatten();
         let commit_line = local_commit
             .as_ref()
             .and_then(|commit| build_epoch_commit_line(commit).ok());
@@ -278,7 +278,11 @@ fn trigger_phase2_actions(
 
     if let Some(commit) = local_commit {
         if let Ok(mut guard) = group_crypto.lock() {
-            let _ = guard.apply_epoch_commit(&commit);
+            if guard.apply_epoch_commit(&commit).ok() == Some(true) {
+                if let Ok(line) = build_key_announce_line(&guard.local_key_announce()) {
+                    out_tx.send(line).ok();
+                }
+            }
         }
     }
 }

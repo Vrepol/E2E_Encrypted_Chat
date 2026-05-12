@@ -253,7 +253,9 @@ pub fn drain_messages(
                         .iter()
                         .map(|member| (member.member_id.clone(), member.nickname.clone())),
                 );
-                retry_pending_epoch_commits(receiver_state, &mut guard);
+                if retry_pending_epoch_commits(receiver_state, &mut guard) {
+                    outcome.phase2_action_needed = true;
+                }
             }
             outcome.member_list_changed = true;
             outcome.phase2_action_needed = true;
@@ -278,7 +280,9 @@ pub fn drain_messages(
                 if guard.apply_key_announce(&announce).unwrap_or(false) {
                     outcome.phase2_action_needed = true;
                 }
-                retry_pending_epoch_commits(receiver_state, &mut guard);
+                if retry_pending_epoch_commits(receiver_state, &mut guard) {
+                    outcome.phase2_action_needed = true;
+                }
             }
             if processed >= DRAIN_BATCH_LIMIT {
                 break;
@@ -287,8 +291,12 @@ pub fn drain_messages(
         }
         if let Some(commit) = parse_epoch_commit_line::<EpochCommit>(&raw_body) {
             if let Ok(mut guard) = group_crypto.lock() {
-                if guard.apply_epoch_commit(&commit).is_err() {
-                    queue_pending_epoch_commit(receiver_state, commit);
+                match guard.apply_epoch_commit(&commit) {
+                    Ok(true) => outcome.phase2_action_needed = true,
+                    Ok(false) => {}
+                    Err(_) => {
+                        queue_pending_epoch_commit(receiver_state, commit);
+                    }
                 }
             }
             if processed >= DRAIN_BATCH_LIMIT {
@@ -454,12 +462,17 @@ fn queue_pending_epoch_commit(receiver_state: &mut ReceiverState, commit: EpochC
 fn retry_pending_epoch_commits(
     receiver_state: &mut ReceiverState,
     group_crypto: &mut GroupCryptoState,
-) {
+) -> bool {
+    let mut applied = false;
     let mut idx = 0;
     while idx < receiver_state.pending_epoch_commits.len() {
         let commit = receiver_state.pending_epoch_commits[idx].clone();
         match group_crypto.apply_epoch_commit(&commit) {
-            Ok(true) | Ok(false) => {
+            Ok(true) => {
+                applied = true;
+                receiver_state.pending_epoch_commits.remove(idx);
+            }
+            Ok(false) => {
                 receiver_state.pending_epoch_commits.remove(idx);
             }
             Err(_) => {
@@ -467,6 +480,7 @@ fn retry_pending_epoch_commits(
             }
         }
     }
+    applied
 }
 
 fn format_text_message(sender: &str, body: &str, hms: &str) -> String {

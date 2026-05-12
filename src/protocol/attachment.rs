@@ -6,7 +6,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 
-const FILE_CHUNK2_AAD_LABEL: &[u8] = b"rust-chat filechunk2 v1";
+const FILE_CHUNK2_AAD_LABEL: &[u8] = b"rust-chat filechunk2 v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachmentKind {
@@ -33,6 +33,9 @@ impl AttachmentKind {
 
 #[derive(Debug, Clone)]
 pub struct AttachmentMeta {
+    pub group_id: String,
+    pub epoch: u64,
+    pub sender_id: String,
     pub transfer_id: String,
     pub kind: AttachmentKind,
     pub file_name: String,
@@ -58,6 +61,9 @@ pub enum AttachmentFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileManifestV2 {
+    group_id: String,
+    epoch: u64,
+    sender_id: String,
     transfer_id: String,
     kind: String,
     file_name: String,
@@ -92,6 +98,9 @@ pub fn parse_attachment_frame(body: &str) -> Option<AttachmentFrame> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_file_manifest2_line(
+    group_id: &str,
+    epoch: u64,
+    sender_id: &str,
     transfer_id: &str,
     kind: AttachmentKind,
     file_name: &str,
@@ -102,6 +111,9 @@ pub fn build_file_manifest2_line(
     nonce_base: &[u8; 8],
 ) -> Result<String> {
     let manifest = FileManifestV2 {
+        group_id: group_id.to_string(),
+        epoch,
+        sender_id: sender_id.to_string(),
         transfer_id: transfer_id.to_string(),
         kind: kind.as_protocol_tag().to_string(),
         file_name: file_name.to_string(),
@@ -116,14 +128,18 @@ pub fn build_file_manifest2_line(
 }
 
 pub fn build_file_chunk2_line(
+    group_id: &str,
+    epoch: u64,
+    sender_id: &str,
     transfer_id: &str,
     index: usize,
+    total_chunks: usize,
     chunk: &[u8],
     file_key: &[u8; 32],
     nonce_base: &[u8; 8],
 ) -> Result<String> {
     let nonce = file_chunk2_nonce(nonce_base, index)?;
-    let aad = file_chunk2_aad(transfer_id, index);
+    let aad = file_chunk2_aad(group_id, epoch, sender_id, transfer_id, index, total_chunks);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(file_key));
     let ciphertext = cipher
         .encrypt(
@@ -145,12 +161,18 @@ pub fn build_file_chunk2_line(
 
 pub fn decrypt_file_chunk2(
     chunk: &EncryptedAttachmentChunk,
-    file_key: &[u8; 32],
-    nonce_base: &[u8; 8],
+    meta: &AttachmentMeta,
 ) -> Result<Vec<u8>> {
-    let nonce = file_chunk2_nonce(nonce_base, chunk.index)?;
-    let aad = file_chunk2_aad(&chunk.transfer_id, chunk.index);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(file_key));
+    let nonce = file_chunk2_nonce(&meta.nonce_base, chunk.index)?;
+    let aad = file_chunk2_aad(
+        &meta.group_id,
+        meta.epoch,
+        &meta.sender_id,
+        &chunk.transfer_id,
+        chunk.index,
+        meta.total_chunks,
+    );
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&meta.file_key));
     cipher
         .decrypt(
             Nonce::from_slice(&nonce),
@@ -168,6 +190,9 @@ fn parse_file_manifest2_payload(payload: &str) -> Option<AttachmentMeta> {
     let file_key: [u8; 32] = manifest.file_key.try_into().ok()?;
     let nonce_base: [u8; 8] = manifest.nonce_base.try_into().ok()?;
     Some(AttachmentMeta {
+        group_id: manifest.group_id,
+        epoch: manifest.epoch,
+        sender_id: manifest.sender_id,
         transfer_id: manifest.transfer_id,
         kind: AttachmentKind::from_protocol_tag(&manifest.kind)?,
         file_name: manifest.file_name,
@@ -197,10 +222,24 @@ fn file_chunk2_nonce(nonce_base: &[u8; 8], index: usize) -> Result<[u8; 12]> {
     Ok(nonce)
 }
 
-fn file_chunk2_aad(transfer_id: &str, index: usize) -> Vec<u8> {
+fn file_chunk2_aad(
+    group_id: &str,
+    epoch: u64,
+    sender_id: &str,
+    transfer_id: &str,
+    index: usize,
+    total_chunks: usize,
+) -> Vec<u8> {
     let mut aad = Vec::new();
     aad.extend_from_slice(FILE_CHUNK2_AAD_LABEL);
+    aad.extend_from_slice(&(group_id.len() as u64).to_be_bytes());
+    aad.extend_from_slice(group_id.as_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&(sender_id.len() as u64).to_be_bytes());
+    aad.extend_from_slice(sender_id.as_bytes());
+    aad.extend_from_slice(&(transfer_id.len() as u64).to_be_bytes());
     aad.extend_from_slice(transfer_id.as_bytes());
     aad.extend_from_slice(&(index as u64).to_be_bytes());
+    aad.extend_from_slice(&(total_chunks as u64).to_be_bytes());
     aad
 }
