@@ -1,6 +1,6 @@
 use sha2::{Digest as ShaDigest, Sha256};
 
-use super::utils::MemberIdentity;
+use crate::protocol::MemberIdentity;
 
 pub const SAFETY_PROTOCOL_V0: &str = "rust-chat-safety-v0";
 
@@ -31,8 +31,7 @@ impl SafetyTranscript {
                 x25519_pubkey: None,
             })
             .collect::<Vec<_>>();
-        transcript_members
-            .sort_by(|a, b| canonical_member_bytes(a).cmp(&canonical_member_bytes(b)));
+        transcript_members.sort_by_key(canonical_member_bytes);
 
         Self {
             protocol_version: SAFETY_PROTOCOL_V0.to_string(),
@@ -112,7 +111,7 @@ fn canonical_transcript_bytes(transcript: &SafetyTranscript) -> Vec<u8> {
     push_u64_field(&mut bytes, "group_epoch", transcript.group_epoch);
 
     let mut members = transcript.members.clone();
-    members.sort_by(|a, b| canonical_member_bytes(a).cmp(&canonical_member_bytes(b)));
+    members.sort_by_key(canonical_member_bytes);
     push_u32_field(&mut bytes, "member_count", members.len() as u32);
     for member in members {
         push_bytes_field(&mut bytes, "member", &canonical_member_bytes(&member));
@@ -177,7 +176,7 @@ fn push_bytes_field(buf: &mut Vec<u8>, label: &str, value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{compute_room_safety_code, safety_code_to_digits, SafetyMember, SafetyTranscript};
-    use crate::client::utils::MemberIdentity;
+    use crate::protocol::MemberIdentity;
 
     fn member(member_id: &str, nickname: &str) -> MemberIdentity {
         MemberIdentity {

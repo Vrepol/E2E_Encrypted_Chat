@@ -6,10 +6,10 @@ use std::io::IsTerminal;
 use std::io::{self, Write};
 use supports_color::{self, Stream as ColorStream};
 
-use crate::app_config::{
+use crate::client::local_server::{detect_advertise_candidates, spawn_local_server};
+use crate::config::{
     default_client_server, CLIENT_SERVER_PRESETS, DEFAULT_SERVER_PASSWORD, DEFAULT_SERVER_PORT,
 };
-use crate::client::local_server::{detect_advertise_candidates, spawn_local_server};
 
 pub fn init_color() {
     if std::env::var_os("NO_COLOR").is_some() {
@@ -134,19 +134,17 @@ fn choose_local_advertised_addr(port: u16) -> io::Result<String> {
 }
 pub fn initial_name() -> io::Result<String> {
     // ---------- 询问昵称 ----------
-    let username = loop {
-        println!("{}", "Continue with fake name".purple());
-        print!("{}", "      Or customize here: ".purple());
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let name = input.trim();
-        if !name.is_empty() {
-            break name.to_owned();
-        } else {
+    println!("{}", "Continue with fake name".purple());
+    print!("{}", "      Or customize here: ".purple());
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let username = match input.trim() {
+        "" => {
             let name: String = FirstName(FR_FR).fake();
-            break name.to_owned();
+            name
         }
+        name => name.to_owned(),
     };
     println!(
         "{} {}",
@@ -157,6 +155,7 @@ pub fn initial_name() -> io::Result<String> {
 }
 pub fn initial_serveraddr() -> io::Result<String> {
     // 交互循环直到拿到合法输入
+    let host_port_re = regex::Regex::new(r"^[A-Za-z0-9.\-]+:\d+$").expect("regex should compile");
     let chosen = loop {
         println!("\nAvaliable Servers:");
         for (i, server) in CLIENT_SERVER_PRESETS.iter().enumerate() {
@@ -217,10 +216,7 @@ pub fn initial_serveraddr() -> io::Result<String> {
             }
         }
         // 2️⃣ host:port / IP:port
-        if regex::Regex::new(r"^[A-Za-z0-9.\-]+:\d+$")
-            .unwrap()
-            .is_match(s)
-        {
+        if host_port_re.is_match(s) {
             print!("Server Password: ");
             io::stdout().flush()?;
             let key = get_password_or_default();

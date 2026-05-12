@@ -1,0 +1,448 @@
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use anyhow::{anyhow, Result};
+use rand::RngCore;
+use sha2::{Digest as ShaDigest, Sha256};
+use tokio::{
+    fs::File,
+    io::AsyncReadExt,
+    net::tcp::OwnedWriteHalf,
+    sync::mpsc::UnboundedSender,
+    task::JoinHandle,
+    time::{Duration, Instant},
+};
+
+use crate::{
+    attachments::{kind::infer_attachment_kind, store::AttachmentStore},
+    crypto::{encrypt_message, zeroize, GroupCryptoState, SecureMessageType, TransportCrypto},
+    protocol::{
+        build_file_chunk2_line, build_file_manifest2_line, build_local_echo_attachment_line,
+        build_local_notice_line, build_local_transfer_begin_line, build_local_transfer_done_line,
+        build_local_transfer_failed_line, build_local_transfer_progress_line, build_rmsg_line,
+    },
+    transport::packet::{
+        send_transport_payload_now, AckRegistry, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
+    },
+    util::path::file_name_or_default,
+};
+
+pub const ATTACHMENT_CHUNK_SIZE: usize = 32 * 1024;
+pub const ATTACHMENT_WINDOW_SIZE: usize = 3;
+
+pub struct AttachmentJob {
+    pub path: PathBuf,
+    pub transfer_id: String,
+    pub file_name: String,
+    pub total_size: u64,
+    pub total_chunks: usize,
+    pub next_chunk_index: usize,
+    pub acked_chunks: usize,
+    pub file: File,
+    pub meta_sent: bool,
+    pub meta_packet_id: String,
+    pub manifest_plain_line: String,
+    pub manifest_secure_line: Option<String>,
+    pub meta_attempts: usize,
+    pub meta_last_sent_at: Option<Instant>,
+    pub file_key: [u8; 32],
+    pub nonce_base: [u8; 8],
+    pub in_flight: Vec<InFlightChunk>,
+}
+
+impl Drop for AttachmentJob {
+    fn drop(&mut self) {
+        zeroize(&mut self.file_key);
+        zeroize(&mut self.nonce_base);
+    }
+}
+
+pub struct InFlightChunk {
+    pub packet_id: String,
+    pub chunk_line: String,
+    pub chunk_index: usize,
+    pub attempts: usize,
+    pub last_sent_at: Instant,
+}
+
+pub struct PreparingUpload {
+    pub path: PathBuf,
+    pub task: JoinHandle<Result<AttachmentJob>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn pump_attachment_upload(
+    writer: &mut OwnedWriteHalf,
+    net_tx: &UnboundedSender<String>,
+    group_crypto: &Arc<StdMutex<GroupCryptoState>>,
+    transport: &Arc<StdMutex<TransportCrypto>>,
+    ack_registry: Arc<AckRegistry>,
+    pending_uploads: &mut VecDeque<PathBuf>,
+    preparing_upload: &mut Option<PreparingUpload>,
+    active_upload: &mut Option<AttachmentJob>,
+    attachment_store: Arc<AttachmentStore>,
+) {
+    if active_upload.is_none() {
+        if let Some(preparing) = preparing_upload.as_ref() {
+            if !preparing.task.is_finished() {
+                return;
+            }
+        }
+
+        if let Some(preparing) = preparing_upload.take() {
+            match preparing.task.await {
+                Ok(Ok(job)) => {
+                    net_tx
+                        .send(build_local_transfer_begin_line(
+                            &job.transfer_id,
+                            &job.file_name,
+                            job.total_chunks,
+                            job.total_size,
+                        ))
+                        .ok();
+                    *active_upload = Some(job);
+                }
+                Ok(Err(err)) => {
+                    net_tx
+                        .send(build_local_notice_line(&format!(
+                            "附件初始化失败 {}: {err}",
+                            preparing.path.display()
+                        )))
+                        .ok();
+                }
+                Err(err) => {
+                    net_tx
+                        .send(build_local_notice_line(&format!(
+                            "附件初始化任务失败 {}: {err}",
+                            preparing.path.display()
+                        )))
+                        .ok();
+                }
+            }
+            if active_upload.is_none() {
+                return;
+            }
+        }
+
+        let Some(path) = pending_uploads.pop_front() else {
+            return;
+        };
+        let prep_path = path.clone();
+        *preparing_upload = Some(PreparingUpload {
+            path,
+            task: tokio::spawn(async move { initialize_attachment_job_owned(prep_path).await }),
+        });
+        return;
+    }
+
+    let Some(job) = active_upload.as_mut() else {
+        return;
+    };
+
+    if !job.meta_sent {
+        match process_attachment_meta(writer, group_crypto, transport, ack_registry.clone(), job)
+            .await
+        {
+            Ok(true) => {
+                if job.total_chunks == 0 {
+                    if let Err(err) =
+                        emit_local_attachment_echo(net_tx, attachment_store.as_ref(), job).await
+                    {
+                        net_tx
+                            .send(build_local_notice_line(&format!("附件本地回显失败: {err}")))
+                            .ok();
+                    }
+                    net_tx
+                        .send(build_local_transfer_done_line(&job.transfer_id))
+                        .ok();
+                    *active_upload = None;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                ack_registry.finish(&job.meta_packet_id).await;
+                net_tx
+                    .send(build_local_transfer_failed_line(
+                        &job.transfer_id,
+                        &err.to_string(),
+                    ))
+                    .ok();
+                *active_upload = None;
+            }
+        }
+        return;
+    }
+
+    if let Err(err) =
+        process_attachment_window(writer, net_tx, transport, ack_registry.clone(), job).await
+    {
+        cleanup_attachment_window(ack_registry.clone(), job).await;
+        net_tx
+            .send(build_local_transfer_failed_line(
+                &job.transfer_id,
+                &err.to_string(),
+            ))
+            .ok();
+        *active_upload = None;
+        return;
+    }
+
+    if job.acked_chunks >= job.total_chunks
+        && job.next_chunk_index >= job.total_chunks
+        && job.in_flight.is_empty()
+    {
+        if let Err(err) = emit_local_attachment_echo(net_tx, attachment_store.as_ref(), job).await {
+            net_tx
+                .send(build_local_notice_line(&format!("附件本地回显失败: {err}")))
+                .ok();
+        }
+        net_tx
+            .send(build_local_transfer_done_line(&job.transfer_id))
+            .ok();
+        *active_upload = None;
+    }
+}
+
+pub async fn initialize_attachment_job_owned(path: PathBuf) -> Result<AttachmentJob> {
+    let metadata = tokio::fs::metadata(&path).await?;
+    if !metadata.is_file() {
+        return Err(anyhow!("Path is not a file: {}", path.display()));
+    }
+
+    let total_size = metadata.len();
+    let total_chunks = if total_size == 0 {
+        0
+    } else {
+        usize::try_from(total_size)?.div_ceil(ATTACHMENT_CHUNK_SIZE)
+    };
+    let file_name = file_name_or_default(&path);
+    let sha256_hex = hash_file(&path).await?;
+    let file = File::open(&path).await?;
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut file_key = [0u8; 32];
+    let mut nonce_base = [0u8; 8];
+    rand::rng().fill_bytes(&mut file_key);
+    rand::rng().fill_bytes(&mut nonce_base);
+    let manifest_plain_line = build_file_manifest2_line(
+        &transfer_id,
+        infer_attachment_kind(&path),
+        &file_name,
+        total_size,
+        total_chunks,
+        &sha256_hex,
+        &file_key,
+        &nonce_base,
+    )?;
+
+    Ok(AttachmentJob {
+        meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
+        manifest_plain_line,
+        manifest_secure_line: None,
+        path,
+        transfer_id,
+        file_name,
+        total_size,
+        total_chunks,
+        next_chunk_index: 0,
+        acked_chunks: 0,
+        file,
+        meta_sent: false,
+        meta_attempts: 0,
+        meta_last_sent_at: None,
+        file_key,
+        nonce_base,
+        in_flight: Vec::new(),
+    })
+}
+
+fn packet_id_for_attachment_meta(transfer_id: &str) -> String {
+    format!("att-{transfer_id}-meta")
+}
+
+fn packet_id_for_attachment_chunk(transfer_id: &str, index: usize) -> String {
+    format!("att-{transfer_id}-chunk-{index}")
+}
+
+async fn process_attachment_meta(
+    writer: &mut OwnedWriteHalf,
+    group_crypto: &Arc<StdMutex<GroupCryptoState>>,
+    transport: &Arc<StdMutex<TransportCrypto>>,
+    ack_registry: Arc<AckRegistry>,
+    job: &mut AttachmentJob,
+) -> Result<bool> {
+    let max_attempts = PACKET_RETRY_LIMIT + 1;
+
+    if ack_registry.is_acked(&job.meta_packet_id).await {
+        ack_registry.finish(&job.meta_packet_id).await;
+        job.meta_sent = true;
+        return Ok(true);
+    }
+
+    let should_send = match job.meta_last_sent_at {
+        None => true,
+        Some(last_sent_at)
+            if last_sent_at.elapsed() >= Duration::from_millis(PACKET_ACK_TIMEOUT_MS) =>
+        {
+            if job.meta_attempts >= max_attempts {
+                ack_registry.finish(&job.meta_packet_id).await;
+                return Err(anyhow!("ACK timeout for attachment metadata"));
+            }
+            true
+        }
+        Some(_) => false,
+    };
+
+    if should_send {
+        ack_registry.subscribe(&job.meta_packet_id).await;
+        if job.manifest_secure_line.is_none() {
+            let secure_line = {
+                let mut guard = group_crypto
+                    .lock()
+                    .map_err(|_| anyhow!("Group crypto state unavailable"))?;
+                let encrypted = encrypt_message(
+                    &mut guard,
+                    SecureMessageType::FileManifest,
+                    job.manifest_plain_line.as_bytes(),
+                )?;
+                build_rmsg_line(&encrypted)?
+            };
+            job.manifest_secure_line = Some(secure_line);
+        }
+        let secure_line = job
+            .manifest_secure_line
+            .as_ref()
+            .ok_or_else(|| anyhow!("Attachment manifest is unavailable"))?;
+        send_transport_payload_now(writer, &job.meta_packet_id, secure_line, transport).await?;
+        job.meta_attempts += 1;
+        job.meta_last_sent_at = Some(Instant::now());
+    }
+
+    Ok(false)
+}
+
+async fn process_attachment_window(
+    writer: &mut OwnedWriteHalf,
+    net_tx: &UnboundedSender<String>,
+    transport: &Arc<StdMutex<TransportCrypto>>,
+    ack_registry: Arc<AckRegistry>,
+    job: &mut AttachmentJob,
+) -> Result<()> {
+    let max_attempts = PACKET_RETRY_LIMIT + 1;
+    let mut idx = 0;
+
+    while idx < job.in_flight.len() {
+        let packet_id = job.in_flight[idx].packet_id.clone();
+        if ack_registry.is_acked(&packet_id).await {
+            ack_registry.finish(&packet_id).await;
+            job.acked_chunks += 1;
+            job.in_flight.remove(idx);
+            net_tx
+                .send(build_local_transfer_progress_line(
+                    &job.transfer_id,
+                    job.acked_chunks,
+                    job.total_chunks,
+                ))
+                .ok();
+            continue;
+        }
+
+        if job.in_flight[idx].last_sent_at.elapsed() >= Duration::from_millis(PACKET_ACK_TIMEOUT_MS)
+        {
+            if job.in_flight[idx].attempts >= max_attempts {
+                let failed_chunk = job.in_flight[idx].chunk_index;
+                return Err(anyhow!(
+                    "ACK timeout for chunk {} of {}",
+                    failed_chunk + 1,
+                    job.total_chunks
+                ));
+            }
+
+            send_transport_payload_now(
+                writer,
+                &job.in_flight[idx].packet_id,
+                &job.in_flight[idx].chunk_line,
+                transport,
+            )
+            .await?;
+            job.in_flight[idx].attempts += 1;
+            job.in_flight[idx].last_sent_at = Instant::now();
+        }
+
+        idx += 1;
+    }
+
+    while job.in_flight.len() < ATTACHMENT_WINDOW_SIZE && job.next_chunk_index < job.total_chunks {
+        let chunk_index = job.next_chunk_index;
+        let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
+        let read = job.file.read(&mut buf).await?;
+        if read == 0 {
+            return Err(anyhow!(
+                "Unexpected EOF while reading attachment {}",
+                job.file_name
+            ));
+        }
+
+        let chunk_line = build_file_chunk2_line(
+            &job.transfer_id,
+            chunk_index,
+            &buf[..read],
+            &job.file_key,
+            &job.nonce_base,
+        )?;
+        let packet_id = packet_id_for_attachment_chunk(&job.transfer_id, chunk_index);
+        send_transport_payload_now(writer, &packet_id, &chunk_line, transport).await?;
+        job.in_flight.push(InFlightChunk {
+            packet_id,
+            chunk_line,
+            chunk_index,
+            attempts: 1,
+            last_sent_at: Instant::now(),
+        });
+        job.next_chunk_index += 1;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_attachment_window(ack_registry: Arc<AckRegistry>, job: &AttachmentJob) {
+    for chunk in &job.in_flight {
+        ack_registry.finish(&chunk.packet_id).await;
+    }
+}
+
+async fn emit_local_attachment_echo(
+    net_tx: &UnboundedSender<String>,
+    attachment_store: &AttachmentStore,
+    job: &AttachmentJob,
+) -> Result<()> {
+    let bytes = tokio::fs::read(&job.path).await?;
+    let attachment_id = attachment_store.store_attachment(&job.file_name, &bytes)?;
+    net_tx
+        .send(build_local_echo_attachment_line(
+            &attachment_id,
+            &job.file_name,
+            job.total_size,
+            infer_attachment_kind(&job.path),
+        ))
+        .ok();
+    Ok(())
+}
+
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).await?;
+    let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
+    let mut hasher = Sha256::new();
+
+    loop {
+        let read = file.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}

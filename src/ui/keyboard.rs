@@ -1,23 +1,24 @@
-// client/keyboard.rs
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tui::widgets::ListState;
 use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
-use super::attachment_store::AttachmentStore;
 use super::clipboard::{self, ClipData};
-use super::receiver::ChatMessage;
-use super::ui::{selected_message_index, RenderedChatRow};
-use super::utils::{
-    build_local_invite_request_line, build_local_notice_line, encode_rgba_as_png,
-    normalize_clipboard_rgba, parse_clipboard_file_paths, parse_name_body, MemberIdentity,
-    HELP_TEXT, HELP_TEXT_EN,
+use super::help::{HELP_TEXT, HELP_TEXT_EN};
+use super::tui::{parse_name_body, selected_message_index, RenderedChatRow};
+use crate::attachments::store::AttachmentStore;
+use crate::client::receiver::ChatMessage;
+use crate::protocol::{build_local_invite_request_line, build_local_notice_line, MemberIdentity};
+use crate::ui::clipboard::{
+    encode_rgba_as_png, normalize_clipboard_rgba, parse_clipboard_file_paths,
 };
+
 pub enum ControlFlow {
     Continue,
     Quit,
@@ -28,15 +29,13 @@ fn queue_attachment_paths(out_tx: &UnboundedSender<String>, paths: &[PathBuf]) {
         let _ = out_tx.send(path.to_string_lossy().to_string());
     }
 }
-/// 让 client 把所有可变状态打包进来，便于在这里直接修改。
-
 pub struct KeyCtx<'a> {
     pub input: &'a mut String,
     pub cursor: &'a mut usize,
     pub list_state: &'a mut ListState,
     pub chat_rows: &'a [RenderedChatRow],
     pub messages: &'a mut Vec<ChatMessage>,
-    pub member_list: &'a mut Vec<MemberIdentity>, // 目前未用到，但保留以备扩展
+    pub member_list: &'a mut Vec<MemberIdentity>,
     pub undo_mgr: &'a mut UndoMgr,
     pub out_tx: &'a UnboundedSender<String>,
     pub server_addr: &'a mut String,
@@ -48,10 +47,8 @@ pub struct KeyCtx<'a> {
     pub owner_capability: &'a Option<String>,
 }
 
-/// 处理一次 KeyEvent：改动都通过 ctx 传回；Esc 返回 Quit
 pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
     match key.code {
-        // =============== 剪贴板粘贴 ===============
         KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             match clipboard::get() {
                 Ok(ClipData::Text(txt)) => {
@@ -109,7 +106,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             }
         }
 
-        // =============== 复制选中行 ===============
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(sel) = selected_message_index(ctx.chat_rows, ctx.list_state.selected()) {
                 let (_, _, body) = parse_name_body(&ctx.messages[sel]);
@@ -119,7 +115,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             }
         }
 
-        // =============== 帮助文本 ===============
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let _ = ctx.out_tx.send(HELP_TEXT.to_string());
         }
@@ -127,7 +122,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             let _ = ctx.out_tx.send(HELP_TEXT_EN.to_string());
         }
 
-        // =============== 生成邀请码 ===============
         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let Some(owner_capability) = ctx.owner_capability.as_deref() else {
                 let _ = ctx.out_tx.send(build_local_notice_line(
@@ -150,7 +144,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             let _ = ctx.out_tx.send(request);
         }
 
-        // =============== 普通字符插入 ===============
         KeyCode::Char(ch)
             if !key
                 .modifiers
@@ -164,15 +157,13 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             *ctx.cursor += 1;
         }
 
-        // =============== 光标移动 ===============
         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
             *ctx.cursor = (*ctx.cursor).saturating_sub(3);
         }
-        KeyCode::Left => {
-            if *ctx.cursor > 0 {
-                *ctx.cursor -= 1;
-            }
+        KeyCode::Left if *ctx.cursor > 0 => {
+            *ctx.cursor -= 1;
         }
+        KeyCode::Left => {}
         KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let total = ctx.input.graphemes(true).count();
             if *ctx.cursor < total {
@@ -186,17 +177,15 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             }
         }
 
-        // =============== Backspace / Enter / 清空 / 撤销 ===============
-        KeyCode::Backspace => {
-            if *ctx.cursor > 0 {
-                ctx.undo_mgr
-                    .maybe_push(ctx.input, *ctx.cursor, OpKind::Insert);
-                let start = nth_grapheme_byte_idx(ctx.input, *ctx.cursor - 1);
-                let end = nth_grapheme_byte_idx(ctx.input, *ctx.cursor);
-                ctx.input.replace_range(start..end, "");
-                *ctx.cursor -= 1;
-            }
+        KeyCode::Backspace if *ctx.cursor > 0 => {
+            ctx.undo_mgr
+                .maybe_push(ctx.input, *ctx.cursor, OpKind::Insert);
+            let start = nth_grapheme_byte_idx(ctx.input, *ctx.cursor - 1);
+            let end = nth_grapheme_byte_idx(ctx.input, *ctx.cursor);
+            ctx.input.replace_range(start..end, "");
+            *ctx.cursor -= 1;
         }
+        KeyCode::Backspace => {}
         KeyCode::Enter => {
             ctx.undo_mgr
                 .maybe_push(ctx.input, *ctx.cursor, OpKind::Insert);
@@ -217,7 +206,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             ctx.undo_mgr.undo(ctx.input, ctx.cursor);
         }
 
-        // =============== 列表上下 & Tab 预览 ===============
         KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(i) = ctx.list_state.selected() {
                 ctx.list_state.select(Some(i.saturating_sub(5)));
@@ -253,7 +241,6 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
             }
         }
 
-        // =============== Esc 退出 ===============
         KeyCode::Esc => {
             let _ = ctx.out_tx.send("//~``~//".to_string());
             return ControlFlow::Quit;
@@ -264,16 +251,12 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
     ControlFlow::Continue
 }
 
-// 第 n 个字形单元在字符串中的字节偏移（从原 client.rs 搬过来）
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
     s.grapheme_indices(true)
         .nth(n)
         .map(|(idx, _)| idx)
         .unwrap_or_else(|| s.len())
 }
-
-use std::time::{Duration, Instant};
-/// 一次编辑动作的类别（按你需要再细分）
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum OpKind {
     Insert,
@@ -281,10 +264,10 @@ pub enum OpKind {
 }
 
 pub struct UndoMgr {
-    stack: Vec<(String, usize)>, // (内容快照, 光标)
-    last_save: Instant,          // 上一次压栈时间
-    last_kind: OpKind,           // 上一次操作类型
-    max_depth: usize,            // 可选：栈深上限
+    stack: Vec<(String, usize)>,
+    last_save: Instant,
+    last_kind: OpKind,
+    max_depth: usize,
 }
 
 impl UndoMgr {
@@ -297,24 +280,28 @@ impl UndoMgr {
         }
     }
 
-    /// 条件压栈：>500 ms 或操作类型变了
-    pub fn maybe_push(&mut self, input: &String, cursor: usize, kind: OpKind) {
+    pub fn maybe_push(&mut self, input: &str, cursor: usize, kind: OpKind) {
         let elapsed = self.last_save.elapsed();
         if elapsed > Duration::from_millis(500) || kind != self.last_kind {
-            self.stack.push((input.clone(), cursor));
+            self.stack.push((input.to_owned(), cursor));
             if self.stack.len() > self.max_depth {
-                self.stack.remove(0); // 裁掉最早的
+                self.stack.remove(0);
             }
             self.last_save = Instant::now();
             self.last_kind = kind;
         }
     }
 
-    /// 撤销一步
     pub fn undo(&mut self, input: &mut String, cursor: &mut usize) {
         if let Some((prev, pos)) = self.stack.pop() {
             *input = prev;
             *cursor = pos.min(input.graphemes(true).count());
         }
+    }
+}
+
+impl Default for UndoMgr {
+    fn default() -> Self {
+        Self::new()
     }
 }

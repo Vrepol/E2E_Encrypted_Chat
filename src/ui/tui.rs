@@ -1,8 +1,6 @@
-// src/client/utils/ui.rs
-use super::receiver::ChatMessage;
-use super::safety::SafetyCode;
-use super::utils::parse_name_body;
-use super::utils::MemberIdentity;
+use crate::client::receiver::ChatMessage;
+use crate::protocol::MemberIdentity;
+use crate::ui::help::format_file_size;
 use tui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -19,6 +17,56 @@ pub struct RenderedChatRow {
     pub message_index: usize,
     pub text: String,
     pub color: Color,
+}
+
+pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
+    match msg {
+        ChatMessage::Text(line) => {
+            let (name, after_name) = if let Some(start) = line.find('[') {
+                if let Some(end_rel) = line[start + 1..].find(']') {
+                    let end = start + 1 + end_rel;
+                    let name = line[start + 1..end].to_owned();
+                    let rest = &line[end + 1..];
+                    (name, rest)
+                } else {
+                    ("???".into(), line.as_str())
+                }
+            } else {
+                ("???".into(), line.as_str())
+            };
+
+            let (time, after_time) = if let Some(start) = after_name.find('[') {
+                if let Some(end_rel) = after_name[start + 1..].find(']') {
+                    let end = start + 1 + end_rel;
+                    let time = after_name[start + 1..end].to_owned();
+                    let rest = &after_name[end + 1..];
+                    (time, rest)
+                } else {
+                    ("??:??:??".into(), after_name)
+                }
+            } else {
+                ("??:??:??".into(), after_name)
+            };
+
+            let body_plain = after_time.trim_start().to_owned();
+            (name, time, body_plain)
+        }
+        ChatMessage::Attachment {
+            sender,
+            ts,
+            name,
+            size,
+            kind,
+            ..
+        } => {
+            let label = match kind {
+                crate::protocol::AttachmentKind::Image => "图片",
+                crate::protocol::AttachmentKind::File => "文件",
+            };
+            let body = format!("[{}] {} ({})", label, name, format_file_size(*size));
+            (sender.to_string(), ts.to_string(), body)
+        }
+    }
 }
 
 fn nth_grapheme_byte_idx(s: &str, n: usize) -> usize {
@@ -131,6 +179,7 @@ pub fn selected_message_index(
     rows.get(row).map(|item| item.message_index)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_chat<B: Backend>(
     f: &mut Frame<B>,
     chat_rows: &[RenderedChatRow],
@@ -141,7 +190,7 @@ pub fn draw_chat<B: Backend>(
     cursor: usize,
     username: &str,
     room_id: &str,
-    safety_code: Option<&SafetyCode>,
+    safety_code: Option<&str>,
 ) {
     let size = f.size();
     let chunks = Layout::default()
@@ -234,18 +283,20 @@ pub fn draw_chat<B: Backend>(
     f.set_cursor(chunks[3].x + 1 + cursor_x, chunks[3].y + 1 + cursor_y);
 }
 
-pub fn members_title(safety_code: Option<&SafetyCode>) -> String {
+pub fn members_title(safety_code: Option<&str>) -> String {
     match safety_code {
-        Some(code) => format!("Members | Verify Code: {} >", code.emoji()),
-        //这里需要空一格，不然有点难看
+        Some(code) => format!("Members | Verify Code: {code} >"),
         None => "<Members | Verify Code: ...>".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{input_cursor_position, members_title, wrap_graphemes};
-    use crate::client::safety::SafetyCode;
+    use super::{
+        input_cursor_position, members_title, selected_message_index, wrap_graphemes,
+        RenderedChatRow,
+    };
+    use tui::style::Color;
 
     #[test]
     fn cursor_advances_for_trailing_space() {
@@ -272,16 +323,34 @@ mod tests {
 
     #[test]
     fn members_title_shows_verify_code() {
-        let code = SafetyCode {
-            hash: [
-                0, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
-            ],
-        };
-
         assert_eq!(
-            members_title(Some(&code)),
-            "Members | Verify Code: 🦊 🌙 🧊 🍀"
+            members_title(Some("🦊 🌙 🧊 🍀")),
+            "Members | Verify Code: 🦊 🌙 🧊 🍀 >"
         );
+    }
+
+    #[test]
+    fn selected_message_index_maps_rows_back_to_source_message() {
+        let rows = vec![
+            RenderedChatRow {
+                message_index: 3,
+                text: "header".to_string(),
+                color: Color::Blue,
+            },
+            RenderedChatRow {
+                message_index: 3,
+                text: "body".to_string(),
+                color: Color::Blue,
+            },
+            RenderedChatRow {
+                message_index: 4,
+                text: "other".to_string(),
+                color: Color::Red,
+            },
+        ];
+
+        assert_eq!(selected_message_index(&rows, Some(1)), Some(3));
+        assert_eq!(selected_message_index(&rows, Some(2)), Some(4));
+        assert_eq!(selected_message_index(&rows, Some(9)), None);
     }
 }

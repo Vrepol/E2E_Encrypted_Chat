@@ -1,14 +1,8 @@
-pub mod attachment_store;
-pub mod clipboard;
-pub mod crypto;
+pub mod app;
 pub mod handshake;
 pub mod initialization;
-pub mod keyboard;
+pub mod input;
 pub mod local_server;
 pub mod network;
-pub mod notifier;
 pub mod receiver;
-pub mod safety;
-pub mod sounds;
-pub mod ui;
-pub mod utils;
+pub mod session;

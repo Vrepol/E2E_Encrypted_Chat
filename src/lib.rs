@@ -1,28 +1,38 @@
 // lib.rs
 
-pub mod app_config;
+pub mod attachments;
 pub mod client;
+pub mod config;
+pub mod crypto;
+pub mod protocol;
+pub mod server;
+pub mod transport;
+pub mod ui;
+pub mod util;
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::client::attachment_store::AttachmentStore;
-    use crate::client::crypto::{
-        decrypt_message, encrypt_message, proposer_order, GroupCryptoState, RoomCryptoState,
-        SecureMessageType,
-    };
-    use crate::client::notifier;
-    use crate::client::receiver::AttachmentKind;
+    use sha2::Digest;
+
+    use crate::attachments::store::AttachmentStore;
     use crate::client::receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState};
-    use crate::client::utils::{
-        build_ack_line, build_epoch_commit_line, build_file_chunk2_line,
-        build_file_manifest2_line, build_local_echo_attachment_line, build_local_echo_text_line,
+    use crate::crypto::{
+        create_invitation, create_invite_blob, decrypt_message, encrypt_message, open_invite_blob,
+        parse_invitation, proposer_order, GroupCryptoState, RoomCryptoState, SecureMessageType,
+    };
+    use crate::protocol::{
+        build_ack_line, build_epoch_commit_line, build_file_chunk2_line, build_file_manifest2_line,
+        build_local_echo_attachment_line, build_local_echo_text_line,
         build_local_invite_request_line, build_member_list_line, build_rmsg_line,
-        build_transport_packet_line, create_invitation, create_invite_blob, normalize_clipboard_rgba,
-        open_invite_blob, parse_ack_line, parse_clipboard_file_paths, parse_invitation,
-        parse_local_invite_request_line, parse_local_ui_event, parse_rmsg_line,
-        parse_transport_packet_line, LocalUiEvent, MemberIdentity,
+        build_transport_packet_line, parse_ack_line, parse_local_invite_request_line,
+        parse_local_ui_event, parse_rmsg_line, parse_transport_packet_line, AttachmentKind,
+        LocalUiEvent, MemberIdentity,
+    };
+    use crate::ui::{
+        clipboard::{normalize_clipboard_rgba, parse_clipboard_file_paths},
+        notifier,
     };
 
     #[test]
@@ -67,7 +77,8 @@ mod tests {
         let encrypted = encrypt_message(&mut alice, SecureMessageType::Text, b"hello secure room")
             .expect("sender encryption should succeed");
         let line = build_rmsg_line(&encrypted).expect("rmsg line should build");
-        let parsed = parse_rmsg_line(&line).expect("rmsg line should parse");
+        let parsed = parse_rmsg_line::<crate::crypto::EncryptedMessage>(&line)
+            .expect("rmsg line should parse");
         assert_eq!(parsed, encrypted);
     }
 
@@ -392,7 +403,7 @@ mod tests {
         let proposer = proposer_order(
             "room-a",
             0,
-            crate::client::crypto::EpochEventType::Join,
+            crate::crypto::EpochEventType::Join,
             "charlie-id",
             &["alice-id".to_string(), "bob-id".to_string()],
         )[0]
@@ -544,7 +555,7 @@ mod tests {
         let proposer = proposer_order(
             "room-a",
             1,
-            crate::client::crypto::EpochEventType::Join,
+            crate::crypto::EpochEventType::Join,
             "charlie-id",
             &["alice-id".to_string(), "bob-id".to_string()],
         )[0]
@@ -678,7 +689,7 @@ mod tests {
         let proposer = proposer_order(
             "room-a",
             0,
-            crate::client::crypto::EpochEventType::Join,
+            crate::crypto::EpochEventType::Join,
             "charlie-id",
             &["alice-id".to_string(), "bob-id".to_string()],
         )[0]
@@ -800,7 +811,7 @@ mod tests {
         let proposer = proposer_order(
             "room-a",
             0,
-            crate::client::crypto::EpochEventType::Join,
+            crate::crypto::EpochEventType::Join,
             "charlie-id",
             &["alice-id".to_string(), "bob-id".to_string()],
         )[0]

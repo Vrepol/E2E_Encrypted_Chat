@@ -12,31 +12,18 @@ use tokio::{
     net::TcpStream,
 };
 
-use super::crypto::{
+use super::session::ConnectedSession;
+use crate::crypto::invite::{open_invite_blob, parse_invitation};
+use crate::crypto::{
     compute_invite_proof, compute_invite_token_id, compute_password_auth_proof,
     derive_invite_transport_key, derive_password_transport_key, pwd_hash, GroupCryptoState,
     RoomCryptoState, TransportCrypto, TransportOpenResult, TransportSide,
 };
-use super::utils::{
+use crate::protocol::{
     build_auth_hello_line, build_auth_proof_line, build_invite_hello_line, build_invite_proof_line,
-    build_invite_ready_line, handshake_writeall_macro, open_invite_blob, parse_auth_challenge_line,
-    parse_invitation, parse_invite_challenge_line, parse_invite_ok_line, parse_session_ok_line,
-    MemberIdentity,
+    build_invite_ready_line, line_bytes, parse_auth_challenge_line, parse_invite_challenge_line,
+    parse_invite_ok_line, parse_session_ok_line, MemberIdentity,
 };
-
-pub type SharedTransportCrypto = Arc<Mutex<TransportCrypto>>;
-pub type SharedGroupCrypto = Arc<Mutex<GroupCryptoState>>;
-
-pub struct ConnectedSession {
-    pub lines: Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-    pub writer: tokio::net::tcp::OwnedWriteHalf,
-    pub server_addr: String,
-    pub room_crypto: RoomCryptoState,
-    pub group_crypto: SharedGroupCrypto,
-    pub transport: SharedTransportCrypto,
-    pub local_member: MemberIdentity,
-    pub owner_capability: Option<String>,
-}
 
 pub async fn connect_and_login(
     server_addr_or_invite: &str,
@@ -47,6 +34,25 @@ pub async fn connect_and_login(
     }
 
     connect_with_password(server_addr_or_invite, nickname).await
+}
+
+pub async fn connect_for_test(
+    server_addr: &str,
+    password: &str,
+    nickname: &str,
+    room_id: &str,
+    room_credential: &str,
+    action: &'static str,
+) -> Result<ConnectedSession> {
+    let start = start_password_session(server_addr, password).await?;
+    finish_password_room_join(
+        start,
+        nickname,
+        room_id.to_string(),
+        room_credential.to_string(),
+        action,
+    )
+    .await
 }
 
 async fn connect_with_invite(
@@ -67,7 +73,7 @@ async fn connect_with_invite(
 
     writer
         .write_all(
-            handshake_writeall_macro(build_invite_hello_line(
+            line_bytes(build_invite_hello_line(
                 &hex::encode(token_id),
                 &hex::encode(client_nonce),
             ))
@@ -90,9 +96,7 @@ async fn connect_with_invite(
     let proof = compute_invite_proof(&token_secret, &token_id, &client_nonce, &server_nonce);
 
     writer
-        .write_all(
-            handshake_writeall_macro(build_invite_proof_line(&hex::encode(proof))).as_slice(),
-        )
+        .write_all(line_bytes(build_invite_proof_line(&hex::encode(proof))).as_slice())
         .await?;
 
     let mut transport = TransportCrypto::new(transport_key, TransportSide::Client);
@@ -111,7 +115,7 @@ async fn connect_with_invite(
     let ready_line = build_invite_ready_line(nickname);
     let ready_cipher = transport.seal(&ready_line);
     writer
-        .write_all(handshake_writeall_macro(ready_cipher).as_slice())
+        .write_all(line_bytes(ready_cipher).as_slice())
         .await?;
 
     let ok_cipher = lines
@@ -156,17 +160,40 @@ async fn connect_with_password(
     let mut iter = server_addr_or_invite.splitn(2, '&');
     let server_addr = iter.next().unwrap_or("").to_string();
     let password = iter.next().unwrap_or("");
+    let start = start_password_session(&server_addr, password).await?;
+    let rooms = start.rooms.clone();
+    if rooms.is_empty() {
+        println!("\n{}", "— No Rooms Available —".green().bold());
+    } else {
+        println!(
+            "\n{} \n {}",
+            "— Available Rooms —".green().bold(),
+            rooms.join("; ")
+        );
+    }
+
+    let (room_id, room_credential, action) = prompt_room_selection(&rooms)?;
+    finish_password_room_join(start, nickname, room_id, room_credential, action).await
+}
+
+struct PasswordLoginStart {
+    lines: Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    server_addr: String,
+    transport: TransportCrypto,
+    rooms: Vec<String>,
+}
+
+async fn start_password_session(server_addr: &str, password: &str) -> Result<PasswordLoginStart> {
     let server_pwd_hash = pwd_hash(password);
     let client_nonce = random_nonce32();
 
-    let stream = TcpStream::connect(&server_addr).await?;
+    let stream = TcpStream::connect(server_addr).await?;
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
     writer
-        .write_all(
-            handshake_writeall_macro(build_auth_hello_line(&hex::encode(client_nonce))).as_slice(),
-        )
+        .write_all(line_bytes(build_auth_hello_line(&hex::encode(client_nonce))).as_slice())
         .await?;
 
     let challenge = lines
@@ -184,7 +211,7 @@ async fn connect_with_password(
     let proof = compute_password_auth_proof(&server_pwd_hash, &client_nonce, &server_nonce);
 
     writer
-        .write_all(handshake_writeall_macro(build_auth_proof_line(&hex::encode(proof))).as_slice())
+        .write_all(line_bytes(build_auth_proof_line(&hex::encode(proof))).as_slice())
         .await?;
 
     let mut transport = TransportCrypto::new(transport_key, TransportSide::Client);
@@ -207,38 +234,46 @@ async fn connect_with_password(
     if !rooms_plain.starts_with("ROOMS") {
         return Err(anyhow!("unexpected banner: {rooms_plain}"));
     }
-    let rooms: Vec<String> = rooms_plain
+    let rooms = rooms_plain
         .split_whitespace()
         .skip(1)
         .map(|s| s.to_owned())
         .collect();
-    if rooms.is_empty() {
-        println!("\n{}", "— No Rooms Available —".green().bold());
-    } else {
-        println!(
-            "\n{} \n {}",
-            "— Available Rooms —".green().bold(),
-            rooms.join("; ")
-        );
-    }
 
-    let (room_id, room_credential, action) = prompt_room_selection(&rooms)?;
+    Ok(PasswordLoginStart {
+        lines,
+        writer,
+        server_addr: server_addr.to_string(),
+        transport,
+        rooms,
+    })
+}
+
+async fn finish_password_room_join(
+    mut start: PasswordLoginStart,
+    nickname: &str,
+    room_id: String,
+    room_credential: String,
+    action: &'static str,
+) -> Result<ConnectedSession> {
     let room_crypto = RoomCryptoState::from_room_credential(room_id, room_credential);
     let join_credential = room_crypto.join_credential();
     let join_plain = format!(
         "{action} {} {join_credential} {nickname}",
         room_crypto.room_id()
     );
-    let join_cipher = transport.seal(&join_plain);
-    writer
-        .write_all(handshake_writeall_macro(join_cipher).as_slice())
+    let join_cipher = start.transport.seal(&join_plain);
+    start
+        .writer
+        .write_all(line_bytes(join_cipher).as_slice())
         .await?;
 
-    let response_cipher = lines
+    let response_cipher = start
+        .lines
         .next_line()
         .await?
         .ok_or_else(|| anyhow!("Server closed during room join"))?;
-    let response_plain = expect_fresh_transport_line(&mut transport, &response_cipher)
+    let response_plain = expect_fresh_transport_line(&mut start.transport, &response_cipher)
         .ok_or_else(|| anyhow!("Invalid encrypted room join response"))?;
     let (member_id, owner_capability) = parse_session_ok_line(&response_plain)
         .ok_or_else(|| anyhow!("server refused: {response_plain}"))?;
@@ -252,12 +287,12 @@ async fn connect_with_password(
     )?;
 
     Ok(ConnectedSession {
-        lines,
-        writer,
-        server_addr,
+        lines: start.lines,
+        writer: start.writer,
+        server_addr: start.server_addr,
         room_crypto,
         group_crypto: Arc::new(Mutex::new(group_crypto)),
-        transport: Arc::new(Mutex::new(transport)),
+        transport: Arc::new(Mutex::new(start.transport)),
         local_member: MemberIdentity {
             member_id,
             nickname: nickname.to_string(),
@@ -267,63 +302,61 @@ async fn connect_with_password(
 }
 
 fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static str)> {
-    loop {
-        print!(
-            "{}",
-            "Enter \"/q\" to disconnect, leave blank to join the Public Room,"
-                .yellow()
-                .bold()
-        );
-        print!("{}", "Room ID: ".blue());
+    print!(
+        "{}",
+        "Enter \"/q\" to disconnect, leave blank to join the Public Room,"
+            .yellow()
+            .bold()
+    );
+    print!("{}", "Room ID: ".blue());
+    io::stdout().flush()?;
+    let mut id = String::new();
+    io::stdin().read_line(&mut id)?;
+
+    if id.trim() == "/q" {
+        return Err(anyhow!("Disconnected"));
+    }
+    if id.trim() == "'" {
+        let room_id: String = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(9)
+            .map(char::from)
+            .collect();
+        const CHARSET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
+        let room_credential: String = (0..32)
+            .map(|_| {
+                let idx = rand::rng().random_range(0..CHARSET.len());
+                CHARSET[idx] as char
+            })
+            .collect();
+        return Ok((room_id, room_credential, "CREATE"));
+    }
+
+    let id = if id.trim().is_empty() {
+        "Public"
+    } else {
+        id.trim()
+    };
+    if id != "Public" {
+        print!("{}", "It wouldn't display while typing,".yellow().bold());
+        print!("{}", "Password:".red());
         io::stdout().flush()?;
-        let mut id = String::new();
-        io::stdin().read_line(&mut id)?;
-
-        if id.trim() == "/q" {
-            return Err(anyhow!("Disconnected"));
-        }
-        if id.trim() == "'" {
-            let room_id: String = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(9)
-                .map(char::from)
-                .collect();
-            const CHARSET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
-            let room_credential: String = (0..32)
-                .map(|_| {
-                    let idx = rand::rng().random_range(0..CHARSET.len());
-                    CHARSET[idx] as char
-                })
-                .collect();
-            return Ok((room_id, room_credential, "CREATE"));
-        }
-
-        let id = if id.trim().is_empty() {
-            "Public"
-        } else {
-            id.trim()
-        };
-        if id != "Public" {
-            print!("{}", "It wouldn't display while typing,".yellow().bold());
-            print!("{}", "Password:".red());
-            io::stdout().flush()?;
-            let room_credential = read_password()?;
-            let action = if rooms.contains(&id.to_string()) {
-                "JOIN"
-            } else {
-                "CREATE"
-            };
-            return Ok((id.to_owned(), room_credential, action));
-        }
-
+        let room_credential = read_password()?;
         let action = if rooms.contains(&id.to_string()) {
             "JOIN"
         } else {
             "CREATE"
         };
-        return Ok((id.to_owned(), String::new(), action));
+        return Ok((id.to_owned(), room_credential, action));
     }
+
+    let action = if rooms.contains(&id.to_string()) {
+        "JOIN"
+    } else {
+        "CREATE"
+    };
+    Ok((id.to_owned(), String::new(), action))
 }
 
 fn random_nonce32() -> [u8; 32] {

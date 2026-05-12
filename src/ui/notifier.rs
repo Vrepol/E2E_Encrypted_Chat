@@ -11,14 +11,14 @@ pub fn notify() {
     unsafe {
         let hwnd = GetConsoleWindow();
         if hwnd != HWND(0) {
-            let mut info = FLASHWINFO {
+            let info = FLASHWINFO {
                 cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
                 hwnd,
                 dwFlags: FLASHW_ALL,
                 uCount: 3,
                 dwTimeout: 0,
             };
-            let _ = FlashWindowEx(&mut info);
+            let _ = FlashWindowEx(&info);
         }
     }
     std::thread::spawn(|| {
