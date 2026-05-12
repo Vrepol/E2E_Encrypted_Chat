@@ -9,11 +9,11 @@ pub const DEFAULT_SERVER_PASSWORD: &str = "Vrepol";
 pub const CLIENT_SERVER_PRESETS: &[PresetServer] = &[
     PresetServer {
         name: "Public server",
-        addr: "1.1.1.1:6655",
+        addr: "8.153.67.166:6655",
     },
     PresetServer {
         name: "Tailscale server",
-        addr: "100.100.100.100:6655",
+        addr: "100.123.171.94:6655",
     },
 ];
 
