@@ -1,10 +1,8 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use colored::*;
 use rand::{distr::Alphanumeric, Rng, RngCore};
-use rpassword::read_password;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal},
     sync::{Arc, Mutex},
 };
 use tokio::{
@@ -25,6 +23,7 @@ use crate::protocol::{
     build_invite_ready_line, line_bytes, parse_auth_challenge_line, parse_invite_challenge_line,
     parse_invite_ok_line, parse_session_ok_line, MemberIdentity,
 };
+use crate::ui::banner;
 
 pub async fn connect_and_login(
     server_addr_or_invite: &str,
@@ -162,17 +161,9 @@ async fn connect_with_password(
     let password = iter.next().unwrap_or("");
     let start = start_password_session(&server_addr, password).await?;
     let rooms = start.rooms.clone();
-    if rooms.is_empty() {
-        println!("\n{}", "— No Rooms Available —".green().bold());
-    } else {
-        println!(
-            "\n{} \n {}",
-            "— Available Rooms —".green().bold(),
-            rooms.join("; ")
-        );
-    }
 
-    let (room_id, room_credential, action) = prompt_room_selection(&rooms)?;
+    let (room_id, room_credential, action) =
+        prompt_session_selection(nickname, &start.server_addr, &rooms)?;
     finish_password_room_join(start, nickname, room_id, room_credential, action).await
 }
 
@@ -311,62 +302,128 @@ async fn finish_password_room_join(
     })
 }
 
-fn prompt_room_selection(rooms: &[String]) -> Result<(String, String, &'static str)> {
-    print!(
-        "{}",
-        "Enter \"/q\" to disconnect, leave blank to join the Public Room,"
-            .yellow()
-            .bold()
-    );
-    print!("{}", "Room ID: ".blue());
-    io::stdout().flush()?;
-    let mut id = String::new();
-    io::stdin().read_line(&mut id)?;
+fn prompt_session_selection(
+    nickname: &str,
+    server_addr: &str,
+    rooms: &[String],
+) -> Result<(String, String, &'static str)> {
+    let mut notice: Option<String> = None;
 
-    if id.trim() == "/q" {
-        return Err(anyhow!("Disconnected"));
-    }
-    if id.trim() == "'" {
-        let room_id: String = rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(9)
-            .map(char::from)
-            .collect();
-        const CHARSET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
-        let room_credential: String = (0..32)
-            .map(|_| {
-                let idx = rand::rng().random_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
-            .collect();
-        return Ok((room_id, room_credential, "CREATE"));
-    }
+    loop {
+        render_session_selection(nickname, server_addr, rooms, notice.as_deref())?;
+        let id = read_trimmed_line()?;
 
-    let id = if id.trim().is_empty() {
-        "Public"
-    } else {
-        id.trim()
-    };
-    if id != "Public" {
-        print!("{}", "It wouldn't display while typing,".yellow().bold());
-        print!("{}", "Password:".red());
-        io::stdout().flush()?;
-        let room_credential = read_password()?;
-        let action = if rooms.contains(&id.to_string()) {
-            "JOIN"
+        if id.eq_ignore_ascii_case("/q") {
+            return Err(anyhow!("断开服务器"));
+        }
+
+        let (session_id, session_key, action) = if id.eq_ignore_ascii_case("new") || id == "'" {
+            (random_session_id(), random_session_key(), "CREATE")
         } else {
-            "CREATE"
-        };
-        return Ok((id.to_owned(), room_credential, action));
-    }
+            let session_id = if id.is_empty() {
+                "Public".to_string()
+            } else if let Ok(idx) = id.parse::<usize>() {
+                match rooms.get(idx.saturating_sub(1)) {
+                    Some(room) => room.clone(),
+                    None => {
+                        notice = Some("Unknown session number.".to_string());
+                        continue;
+                    }
+                }
+            } else {
+                id
+            };
+            if session_id.trim().is_empty() {
+                notice = Some("Session ID cannot be empty.".to_string());
+                continue;
+            }
 
-    let action = if rooms.contains(&id.to_string()) {
-        "JOIN"
+            if session_id == "Public" {
+                let action = if rooms.iter().any(|room| room == &session_id) {
+                    "JOIN"
+                } else {
+                    "CREATE"
+                };
+                (session_id, String::new(), action)
+            } else {
+                banner::prompt("Session key", "[hidden]")?;
+                let session_key = read_secret_line()?;
+                if session_key.trim().is_empty() {
+                    notice = Some("Private sessions need a key.".to_string());
+                    continue;
+                }
+                let action = if rooms.iter().any(|room| room == &session_id) {
+                    "JOIN"
+                } else {
+                    "CREATE"
+                };
+                (session_id, session_key, action)
+            }
+        };
+
+        return Ok((session_id, session_key, action));
+    }
+}
+
+fn render_session_selection(
+    nickname: &str,
+    server_addr: &str,
+    rooms: &[String],
+    notice: Option<&str>,
+) -> io::Result<()> {
+    banner::clear_screen()?;
+    banner::print_banner();
+    banner::summary("Profile", nickname);
+    banner::summary("Server", server_addr);
+    if let Some(notice) = notice {
+        banner::warning(notice);
+    }
+    banner::section(
+        "Session",
+        "Join an active session, create one, or press Enter for Public.",
+    );
+    if rooms.is_empty() {
+        banner::note("No active sessions.");
     } else {
-        "CREATE"
-    };
-    Ok((id.to_owned(), String::new(), action))
+        for (idx, room) in rooms.iter().enumerate() {
+            banner::option(idx + 1, room, "");
+        }
+    }
+    banner::option("new", "Create private session", "random ID and key");
+    banner::option("/q", "Disconnect", "");
+    banner::prompt("Session ID", "[Public]")
+}
+
+fn read_trimmed_line() -> io::Result<String> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn read_secret_line() -> io::Result<String> {
+    if io::stdin().is_terminal() {
+        rpassword::read_password()
+    } else {
+        read_trimmed_line()
+    }
+}
+
+fn random_session_id() -> String {
+    rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(9)
+        .map(char::from)
+        .collect()
+}
+
+fn random_session_key() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_@#";
+    (0..32)
+        .map(|_| {
+            let idx = rand::rng().random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 fn random_nonce32() -> [u8; 32] {

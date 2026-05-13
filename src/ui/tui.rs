@@ -19,6 +19,8 @@ pub struct RenderedChatRow {
     pub color: Color,
 }
 
+const LIST_HIGHLIGHT_SYMBOL: &str = "▌ ";
+
 pub fn parse_name_body(msg: &ChatMessage) -> (String, String, String) {
     match msg {
         ChatMessage::Text(line) => {
@@ -128,7 +130,9 @@ fn input_cursor_position(input: &str, cursor: usize, max_width: u16) -> (u16, u1
 }
 
 pub fn chat_inner_width(size: Rect) -> usize {
-    size.width.saturating_sub(4) as usize
+    size.width
+        .saturating_sub(4)
+        .saturating_sub(LIST_HIGHLIGHT_SYMBOL.width() as u16) as usize
 }
 
 pub fn build_chat_rows(
@@ -136,39 +140,82 @@ pub fn build_chat_rows(
     chat_inner_width: usize,
     username: &str,
 ) -> Vec<RenderedChatRow> {
-    const PREFIX_WIDTH: usize = 5;
-    let wrap_width = chat_inner_width.saturating_sub(PREFIX_WIDTH).max(1) as u16;
+    let bubble_width = if chat_inner_width < 24 {
+        chat_inner_width.max(1)
+    } else {
+        (chat_inner_width.saturating_mul(3) / 4).clamp(24, chat_inner_width)
+    };
+    let wrap_width = bubble_width.saturating_sub(2).max(1) as u16;
     let mut rows = Vec::new();
 
     for (message_index, raw) in messages.iter().enumerate() {
         let (name, time, display_body) = parse_name_body(raw);
-        let color = if name == "System" {
+        let is_me = name == username;
+        let is_system = name == "System";
+        let color = if is_system {
             Color::DarkGray
-        } else if name == username {
-            Color::Blue
+        } else if is_me {
+            Color::Cyan
         } else {
-            Color::Red
+            Color::LightMagenta
         };
 
+        if is_system {
+            let system_line = format!("• {time}  {display_body}");
+            for line in wrap_graphemes(&system_line, chat_inner_width.max(1) as u16) {
+                rows.push(RenderedChatRow {
+                    message_index,
+                    text: line,
+                    color,
+                });
+            }
+            continue;
+        }
+
+        let display_name = if is_me { "You" } else { name.as_str() };
+        let title = if is_me {
+            format!("{display_name} · {time} ─╮")
+        } else {
+            format!("╭─ {display_name} · {time}")
+        };
         rows.push(RenderedChatRow {
             message_index,
-            text: format!("┌-[{}]-#{}", name, time),
+            text: align_chat_row(&title, chat_inner_width, is_me),
             color,
         });
 
         let lines = wrap_graphemes(&display_body, wrap_width);
         let last = lines.len().saturating_sub(1);
         for (i, line) in lines.iter().enumerate() {
-            let prefix = if i == last { "└--$" } else { "|   " };
+            let text = format_chat_body_line(line, i == last, is_me);
             rows.push(RenderedChatRow {
                 message_index,
-                text: format!("{} {}", prefix, line),
+                text: align_chat_row(&text, chat_inner_width, is_me),
                 color,
             });
         }
     }
 
     rows
+}
+
+fn format_chat_body_line(line: &str, is_last: bool, align_right: bool) -> String {
+    match (align_right, is_last) {
+        (true, true) => format!("{line} ─╯"),
+        (true, false) => format!("{line} │"),
+        (false, true) => format!("╰─ {line}"),
+        (false, false) => format!("│ {line}"),
+    }
+}
+
+fn align_chat_row(text: &str, max_width: usize, align_right: bool) -> String {
+    if !align_right {
+        return text.to_string();
+    }
+
+    let text_width = text.width();
+    let pad = max_width.saturating_sub(text_width);
+    format!("{}{}", " ".repeat(pad), text)
 }
 
 pub fn selected_message_index(
@@ -207,7 +254,8 @@ pub fn draw_chat<B: Backend>(
     let items: Vec<ListItem> = chat_rows
         .iter()
         .map(|row| {
-            let style = if row.text.starts_with("┌-") {
+            let marker = row.text.trim_start();
+            let style = if marker.starts_with("╭─") || marker.ends_with("─╮") {
                 Style::default().fg(row.color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(row.color)
@@ -221,17 +269,18 @@ pub fn draw_chat<B: Backend>(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(format!("<Room: {}>", room_id))
-                    .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                    .title(format!(" Session {room_id} "))
+                    .border_style(Style::default().fg(Color::Cyan)),
             )
-            .highlight_symbol(">"),
+            .highlight_symbol(LIST_HIGHLIGHT_SYMBOL)
+            .highlight_style(Style::default().bg(Color::Rgb(28, 35, 38))),
         chunks[0],
         list_state,
     );
 
     // —— Members —— //
     let members_text = if member_list.is_empty() {
-        "<空>".to_string()
+        "Waiting for members".to_string()
     } else {
         member_list
             .iter()
@@ -244,14 +293,14 @@ pub fn draw_chat<B: Backend>(
             Block::default()
                 .borders(Borders::ALL)
                 .title(members_title(safety_code))
-                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                .border_style(Style::default().fg(Color::Cyan)),
         ),
         chunks[1],
     );
 
     // —— Transfers —— //
     let transfers_text = if transfer_lines.is_empty() {
-        "No active transfers".to_string()
+        "Idle".to_string()
     } else {
         transfer_lines.join("\n")
     };
@@ -259,8 +308,8 @@ pub fn draw_chat<B: Backend>(
         Paragraph::new(transfers_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Transfers")
-                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                .title(" Transfers ")
+                .border_style(Style::default().fg(Color::Cyan)),
         ),
         chunks[2],
     );
@@ -272,8 +321,8 @@ pub fn draw_chat<B: Backend>(
         Paragraph::new(wrapped_input.join("\n")).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("{} >", username))
-                .style(Style::default().fg(Color::Rgb(0, 135, 0))),
+                .title(format!(" {username} · Enter to send · Esc to leave "))
+                .border_style(Style::default().fg(Color::Cyan)),
         ),
         chunks[3],
     );
@@ -285,18 +334,20 @@ pub fn draw_chat<B: Backend>(
 
 pub fn members_title(safety_code: Option<&str>) -> String {
     match safety_code {
-        Some(code) => format!("Members | Verify Code: {code} >"),
-        None => "<Members | Verify Code: ...>".to_string(),
+        Some(code) => format!(" Members · Verify {code} "),
+        None => " Members · Verify ... ".to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        input_cursor_position, members_title, selected_message_index, wrap_graphemes,
-        RenderedChatRow,
+        build_chat_rows, input_cursor_position, members_title, selected_message_index,
+        wrap_graphemes, RenderedChatRow,
     };
+    use crate::client::receiver::ChatMessage;
     use tui::style::Color;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn cursor_advances_for_trailing_space() {
@@ -325,7 +376,7 @@ mod tests {
     fn members_title_shows_verify_code() {
         assert_eq!(
             members_title(Some("🦊 🌙 🧊 🍀")),
-            "Members | Verify Code: 🦊 🌙 🧊 🍀 >"
+            " Members · Verify 🦊 🌙 🧊 🍀 "
         );
     }
 
@@ -352,5 +403,28 @@ mod tests {
         assert_eq!(selected_message_index(&rows, Some(1)), Some(3));
         assert_eq!(selected_message_index(&rows, Some(2)), Some(4));
         assert_eq!(selected_message_index(&rows, Some(9)), None);
+    }
+
+    #[test]
+    fn own_message_uses_right_edge_corners_without_extra_tail_row() {
+        let rows = build_chat_rows(&[ChatMessage::Text("[me][12:00] hi".to_string())], 24, "me");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].text.ends_with("You · 12:00 ─╮"));
+        assert!(rows[1].text.ends_with("hi ╯"));
+        assert!(rows.iter().all(|row| row.text.width() <= 24));
+    }
+
+    #[test]
+    fn other_message_uses_left_edge_corners_on_last_body_line() {
+        let rows = build_chat_rows(
+            &[ChatMessage::Text("[bob][12:00] hi".to_string())],
+            24,
+            "me",
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "╭─ bob · 12:00");
+        assert_eq!(rows[1].text, "╰ hi");
     }
 }
