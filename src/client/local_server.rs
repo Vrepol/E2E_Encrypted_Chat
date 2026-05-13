@@ -18,10 +18,8 @@ pub struct AdvertiseAddrCandidate {
 fn server_binary_candidates(current_exe: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(dir) = current_exe.parent() {
-        candidates.push(dir.join("mistv-server.exe"));
-        candidates.push(dir.join("mistv-server"));
-        candidates.push(dir.join("server.exe"));
-        candidates.push(dir.join("server"));
+        candidates.push(dir.join("MistV-server.exe"));
+        candidates.push(dir.join("MistV-server"));
     }
     candidates
 }
@@ -34,7 +32,7 @@ fn resolve_server_binary() -> io::Result<PathBuf> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "未找到同目录 mistv-server 可执行文件，请先构建或放置 mistv-server/mistv-server.exe",
+                "未找到同目录 MistV-server 可执行文件，请先构建或放置 MistV-server/MistV-server.exe",
             )
         })
 }

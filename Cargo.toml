@@ -4,11 +4,11 @@ version = "0.9.3"
 edition = "2021"
 
 [[bin]]
-name = "mistv"
+name = "MistV"
 path = "src/bin/client.rs"
 
 [[bin]]
-name = "mistv-server"
+name = "MistV-server"
 path = "src/bin/server.rs"
 
 [dependencies]
