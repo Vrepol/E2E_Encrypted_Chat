@@ -2,9 +2,7 @@
 
 > 终端 + Rust + 端到端加密的轻量聊天应用，包含客户端、服务端、邀请码、房间密钥与附件传输。
 
-<div align="center">
-  <img src="./demo.gif" width="600" alt="Demo GIF"/>
-</div>
+![Demo](./assets/demo.gif)
 
 ## 项目概述
 
