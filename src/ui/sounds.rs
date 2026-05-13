@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+/// 固定模拟“4 声道误加速”效果，不依赖系统实际输出声道数。
+const QUAD_SPEEDUP: f32 = 8.0;
+
 /// 通道：告诉音频线程“要播放几次 beep”
 static BEEP_TX: Lazy<Sender<usize>> = Lazy::new(|| {
     let (tx, rx) = unbounded();
@@ -35,7 +38,9 @@ fn spawn_audio_thread(rx: crossbeam_channel::Receiver<usize>) {
         let host = cpal::default_host();
         let device = host.default_output_device().expect("no output device");
         let cfg = device.default_output_config().expect("bad config");
-        let sr = cfg.sample_rate().0 as f32;
+        let stream_cfg: cpal::StreamConfig = cfg.into();
+        let sr = stream_cfg.sample_rate.0 as f32;
+        let channels = stream_cfg.channels as usize;
 
         // 2. 回调内部维护自己的队列
         let mut play_queue: Vec<(usize, f32)> = Vec::new();
@@ -45,21 +50,21 @@ fn spawn_audio_thread(rx: crossbeam_channel::Receiver<usize>) {
 
         let stream = device
             .build_output_stream(
-                &cfg.into(),
+                &stream_cfg,
                 move |data: &mut [f32], _| {
                     // 收新请求
                     while let Ok(n) = rx.try_recv() {
                         play_queue.push((n, 0.0));
                     }
 
-                    for s in data.iter_mut() {
+                    for frame in data.chunks_mut(channels) {
                         if let Some((left, t)) = play_queue.first_mut() {
                             if *left == 0 {
                                 play_queue.remove(0);
                                 continue;
                             }
                             let pos = *t % cycle;
-                            if pos <= beep_dur {
+                            let sample = if pos <= beep_dur {
                                 let tone = (2.0 * PI * 880.0 * pos).sin() * 0.6
                                     + (2.0 * PI * 1320.0 * pos).sin() * 0.4;
                                 let fade = if pos < 0.005 {
@@ -69,11 +74,14 @@ fn spawn_audio_thread(rx: crossbeam_channel::Receiver<usize>) {
                                 } else {
                                     1.0
                                 };
-                                *s = tone * 0.25 * fade;
+                                tone * 0.25 * fade
                             } else {
-                                *s = 0.0;
+                                0.0
+                            };
+                            for s in frame.iter_mut() {
+                                *s = sample;
                             }
-                            *t += 1.0 / sr;
+                            *t += QUAD_SPEEDUP / sr;
                             // 周期结束，次数--
                             if *t >= cycle {
                                 *left -= 1;
@@ -81,7 +89,9 @@ fn spawn_audio_thread(rx: crossbeam_channel::Receiver<usize>) {
                                 REMAINING.fetch_sub(1, Ordering::SeqCst);
                             }
                         } else {
-                            *s = 0.0;
+                            for s in frame.iter_mut() {
+                                *s = 0.0;
+                            }
                         }
                     }
                 },
