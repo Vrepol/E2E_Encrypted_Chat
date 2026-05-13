@@ -46,6 +46,13 @@ pub struct LocalInviteRequest {
     pub owner_capability: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalAttachmentSend {
+    pub file_name: String,
+    pub kind: AttachmentKind,
+    pub bytes: Vec<u8>,
+}
+
 pub fn build_local_transfer_begin_line(
     transfer_id: &str,
     file_name: &str,
@@ -112,6 +119,35 @@ pub fn build_local_invite_request_line(
     format!(
         "/LOCALINVITE REQUEST {request_id} {server_b64} {room_b64} {room_credential_b64} {owner_b64}"
     )
+}
+
+pub fn build_local_attachment_send_line(
+    file_name: &str,
+    kind: AttachmentKind,
+    bytes: &[u8],
+) -> String {
+    let file_b64 = URL_SAFE_NO_PAD.encode(file_name.as_bytes());
+    let bytes_b64 = URL_SAFE_NO_PAD.encode(bytes);
+    format!(
+        "/LOCALATTACH SEND {file_b64} {} {bytes_b64}",
+        kind.as_protocol_tag()
+    )
+}
+
+pub fn parse_local_attachment_send_line(line: &str) -> Option<LocalAttachmentSend> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "/LOCALATTACH" || parts.next()? != "SEND" {
+        return None;
+    }
+
+    let file_name = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let kind = AttachmentKind::from_protocol_tag(parts.next()?)?;
+    let bytes = URL_SAFE_NO_PAD.decode(parts.next()?).ok()?;
+    Some(LocalAttachmentSend {
+        file_name,
+        kind,
+        bytes,
+    })
 }
 
 pub fn parse_local_invite_request_line(line: &str) -> Option<LocalInviteRequest> {

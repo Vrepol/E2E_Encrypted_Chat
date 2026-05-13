@@ -411,7 +411,7 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert!(rows[0].text.ends_with("You · 12:00 ─╮"));
-        assert!(rows[1].text.ends_with("hi ╯"));
+        assert!(rows[1].text.ends_with("hi ─╯"));
         assert!(rows.iter().all(|row| row.text.width() <= 24));
     }
 
@@ -425,6 +425,6 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "╭─ bob · 12:00");
-        assert_eq!(rows[1].text, "╰ hi");
+        assert_eq!(rows[1].text, "╰─ hi");
     }
 }

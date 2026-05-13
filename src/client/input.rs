@@ -2,15 +2,30 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::protocol::is_attachment_protocol_line;
+use crate::protocol::{
+    is_attachment_protocol_line, parse_local_attachment_send_line, AttachmentKind,
+};
 
 #[derive(Debug, Clone)]
 pub enum OutgoingPayload {
     Text(String),
     AttachmentPath(PathBuf),
+    AttachmentMemory {
+        file_name: String,
+        bytes: Vec<u8>,
+        kind: AttachmentKind,
+    },
 }
 
 pub fn classify_outgoing_input(msg: &str) -> Result<OutgoingPayload> {
+    if let Some(local_attachment) = parse_local_attachment_send_line(msg) {
+        return Ok(OutgoingPayload::AttachmentMemory {
+            file_name: local_attachment.file_name,
+            bytes: local_attachment.bytes,
+            kind: local_attachment.kind,
+        });
+    }
+
     if is_attachment_protocol_line(msg) {
         return Ok(OutgoingPayload::Text(msg.to_string()));
     }
@@ -58,6 +73,7 @@ pub(crate) fn strip_optional_quotes(input: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{classify_outgoing_input, OutgoingPayload};
+    use crate::protocol::{build_local_attachment_send_line, AttachmentKind};
     #[test]
     fn plain_text_stays_text() {
         assert!(matches!(
@@ -104,6 +120,21 @@ mod tests {
         assert!(matches!(
             classify_outgoing_input(&text).expect("classification should succeed"),
             OutgoingPayload::Text(body) if body == text
+        ));
+    }
+
+    #[test]
+    fn local_memory_attachment_becomes_attachment_payload() {
+        let line =
+            build_local_attachment_send_line("clipboard.png", AttachmentKind::Image, b"png-bytes");
+
+        assert!(matches!(
+            classify_outgoing_input(&line).expect("classification should succeed"),
+            OutgoingPayload::AttachmentMemory {
+                file_name,
+                bytes,
+                kind: AttachmentKind::Image,
+            } if file_name == "clipboard.png" && bytes == b"png-bytes"
         ));
     }
 }
