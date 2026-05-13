@@ -1,6 +1,6 @@
-# E2E Encrypted Chat
+# MISTV
 
-> 基于 Rust 的终端聊天程序，支持房间、邀请码、附件传输，以及目前这版自研的端到端加密链路。
+> 基于 Rust 的终端加密会话工具，支持临时 Session、邀请码、附件传输，以及目前这版自研的端到端加密链路。
 
 ![Demo](./assets/demo.gif)
 
@@ -9,30 +9,30 @@
 ### 1. 编译
 
 ```bash
-git clone https://github.com/Vrepol/E2E_Encrypted_Chat.git
-cd E2E_Encrypted_Chat
+git clone https://github.com/Vrepol/MISTV.git
+cd MISTV
 cargo build --release
 ```
 
 编译完成后可执行文件位于：
 
-- `target/release/server`
-- `target/release/client`
+- `target/release/mistv-server`
+- `target/release/mistv-client`
 
-在 Windows 下对应为 `server.exe` 和 `client.exe`。
+在 Windows 下对应为 `mistv-server.exe` 和 `mistv-client.exe`。
 
 ### 2. 启动一个服务器
 
 最直接的方式：
 
 ```bash
-cargo run --bin server -- --port 6655 -k "Password"
+cargo run --bin mistv-server -- --port 6655 -k "Password"
 ```
 
 或者运行编译产物：
 
 ```bash
-./target/release/server --port 6655 -k "Password"
+./target/release/mistv-server --port 6655 -k "Password"
 ```
 
 服务端参数：
@@ -47,13 +47,13 @@ cargo run --bin server -- --port 6655 -k "Password"
 ### 3. 启动客户端
 
 ```bash
-cargo run --bin client
+cargo run --bin mistv-client
 ```
 
 或者：
 
 ```bash
-./target/release/client
+./target/release/mistv-client
 ```
 
 客户端没有命令行参数，启动后直接进入交互式流程。
@@ -80,7 +80,7 @@ cargo run --bin client
 
 如果你只是想在自己机器上先试通一遍，最省事的是用 `host` 模式：
 
-1. 运行 `cargo run --bin client`
+1. 运行 `cargo run --bin mistv-client`
 2. 输入昵称
 3. 在服务器选择界面输入 `host`
 4. 输入本地端口，默认就是 `6655`

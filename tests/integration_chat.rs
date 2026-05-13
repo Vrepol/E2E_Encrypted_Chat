@@ -1,7 +1,7 @@
 use std::{net::TcpListener as StdTcpListener, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use rust_chat::{
+use mistv::{
     attachments::store::AttachmentStore,
     client::{
         handshake, network,
@@ -194,7 +194,7 @@ async fn spawn_server(password: &str) -> (u16, JoinHandle<()>) {
     let port = free_port();
     let password = password.to_string();
     let task = tokio::spawn(async move {
-        let _ = rust_chat::server::app::run(port, password).await;
+        let _ = mistv::server::app::run(port, password).await;
     });
 
     for _ in 0..40 {

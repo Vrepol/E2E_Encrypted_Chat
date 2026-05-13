@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn missing_path_falls_back_to_text() {
-        let missing = std::env::temp_dir().join("rust_chat_missing_path_for_test.txt");
+        let missing = std::env::temp_dir().join("mistv_missing_path_for_test.txt");
         let text = missing.to_string_lossy().to_string();
 
         assert!(matches!(

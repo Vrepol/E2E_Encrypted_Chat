@@ -1334,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_parse_clipboard_file_paths_rejects_mixed_lines() {
-        let temp_path = std::env::temp_dir().join("rust_chat_clipboard_test.txt");
+        let temp_path = std::env::temp_dir().join("mistv_clipboard_test.txt");
         std::fs::write(&temp_path, b"ok").expect("temp file should be created");
 
         let mixed = format!("{}\nnot-a-real-path", temp_path.display());
@@ -1345,8 +1345,8 @@ mod tests {
 
     #[test]
     fn test_parse_clipboard_file_paths_accepts_all_valid_absolute_paths() {
-        let path_a = std::env::temp_dir().join("rust_chat_clipboard_test_a.txt");
-        let path_b = std::env::temp_dir().join("rust_chat_clipboard_test_b.txt");
+        let path_a = std::env::temp_dir().join("mistv_clipboard_test_a.txt");
+        let path_b = std::env::temp_dir().join("mistv_clipboard_test_b.txt");
         std::fs::write(&path_a, b"a").expect("temp file A should be created");
         std::fs::write(&path_b, b"b").expect("temp file B should be created");
 

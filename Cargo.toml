@@ -1,7 +1,16 @@
 [package]
-name = "rust_chat"
-version = "0.1.0"
+name = "mistv"
+version = "0.9.3"
 edition = "2021"
+
+[[bin]]
+name = "mistv"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "mistv-server"
+path = "src/bin/server.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +26,6 @@ cipher   = "0.4.4"          # trait，只几 KB
 sha2     = "0.10"         # 可选：若想用口令派生 32 字节密钥
 unicode-width = "0.2.0"
 textwrap      = { version = "0.16.2", default-features = false, features = ["unicode-width"] }
-winresource = "0.1.22"
 cpal = "0.15"
 unicode-segmentation = "1.11"
 chrono = "0.4"
@@ -46,3 +54,6 @@ windows = { version = "0.52.0", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging"
 ] }
+
+[build-dependencies]
+winresource = "0.1.22"

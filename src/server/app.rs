@@ -33,7 +33,7 @@ pub async fn run(port: u16, password: String) -> Result<()> {
 
     let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr).await?;
-    println!("🛰️  Chat-Server listening on {}", bind_addr);
+    println!("🛰️  MISTV server listening on {}", bind_addr);
 
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
     let invites: Invites = Arc::new(Mutex::new(HashMap::new()));
