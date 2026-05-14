@@ -3,7 +3,7 @@ use crate::protocol::MemberIdentity;
 use crate::ui::help::format_file_size;
 use tui::{
     backend::Backend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -226,6 +226,27 @@ pub fn selected_message_index(
     rows.get(row).map(|item| item.message_index)
 }
 
+fn flash_notice_area(chat_area: Rect, notice: &str) -> Option<Rect> {
+    if chat_area.width <= 2 || chat_area.height <= 2 || notice.trim().is_empty() {
+        return None;
+    }
+
+    let inner_width = chat_area.width.saturating_sub(2);
+    let width = (notice.width() as u16)
+        .saturating_add(4)
+        .min(inner_width)
+        .max(1);
+    let x = chat_area.x + 1 + inner_width.saturating_sub(width) / 2;
+    let y = chat_area.y + chat_area.height.saturating_sub(2);
+
+    Some(Rect {
+        x,
+        y,
+        width,
+        height: 1,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_chat<B: Backend>(
     f: &mut Frame<B>,
@@ -238,6 +259,7 @@ pub fn draw_chat<B: Backend>(
     username: &str,
     room_id: &str,
     safety_code: Option<&str>,
+    flash_notice: Option<&str>,
 ) {
     let size = f.size();
     let chunks = Layout::default()
@@ -277,6 +299,21 @@ pub fn draw_chat<B: Backend>(
         chunks[0],
         list_state,
     );
+
+    if let Some(notice) = flash_notice {
+        if let Some(area) = flash_notice_area(chunks[0], notice) {
+            f.render_widget(
+                Paragraph::new(format!(" {notice} "))
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                area,
+            );
+        }
+    }
 
     // —— Members —— //
     let members_text = if member_list.is_empty() {
@@ -342,10 +379,11 @@ pub fn members_title(safety_code: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_rows, input_cursor_position, members_title, selected_message_index,
-        wrap_graphemes, RenderedChatRow,
+        build_chat_rows, flash_notice_area, input_cursor_position, members_title,
+        selected_message_index, wrap_graphemes, RenderedChatRow,
     };
     use crate::client::receiver::ChatMessage;
+    use tui::layout::Rect;
     use tui::style::Color;
     use unicode_width::UnicodeWidthStr;
 
@@ -403,6 +441,24 @@ mod tests {
         assert_eq!(selected_message_index(&rows, Some(1)), Some(3));
         assert_eq!(selected_message_index(&rows, Some(2)), Some(4));
         assert_eq!(selected_message_index(&rows, Some(9)), None);
+    }
+
+    #[test]
+    fn flash_notice_area_centers_near_bottom_of_chat_panel() {
+        let area = flash_notice_area(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 12,
+            },
+            "Copied",
+        )
+        .expect("toast area should exist");
+
+        assert_eq!(area.y, 10);
+        assert!(area.x > 0);
+        assert!(area.width >= 10);
     }
 
     #[test]

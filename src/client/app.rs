@@ -144,10 +144,14 @@ pub async fn run() -> Result<()> {
         let mut cursor = 0usize;
         let mut list_state = ListState::default();
         let mut undo_mgr = UndoMgr::new();
+        let mut copied_until: Option<Instant> = None;
         let mut chat_rows: Vec<RenderedChatRow>;
         trigger_phase2_actions(&out_tx, &ui_group_crypto);
 
         'ui: loop {
+            if copied_until.is_some_and(|until| until <= Instant::now()) {
+                copied_until = None;
+            }
             let size = terminal.size()?;
             chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
             if let Some(selected) = list_state.selected() {
@@ -173,6 +177,7 @@ pub async fn run() -> Result<()> {
                         &username,
                         &room_id,
                         safety_code.as_deref(),
+                        copied_until.map(|_| "Copied"),
                     ),
                     UiMode::_ImagePreview(_) => {}
                 }
@@ -195,6 +200,7 @@ pub async fn run() -> Result<()> {
                     attachment_dir: room_tempdir.path(),
                     attachment_store: attachment_store.as_ref(),
                     owner_capability: &owner_capability,
+                    copied_until: &mut copied_until,
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
                     break 'ui;

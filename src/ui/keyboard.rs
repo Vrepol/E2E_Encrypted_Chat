@@ -47,6 +47,7 @@ pub struct KeyCtx<'a> {
     pub attachment_dir: &'a Path,
     pub attachment_store: &'a AttachmentStore,
     pub owner_capability: &'a Option<String>,
+    pub copied_until: &'a mut Option<Instant>,
 }
 
 pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
@@ -106,6 +107,8 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                 let (_, _, body) = parse_name_body(&ctx.messages[sel]);
                 if let Err(e) = clipboard::set_text(&body) {
                     eprintln!("⚠️ Failed to paste: {e}");
+                } else {
+                    *ctx.copied_until = Some(Instant::now() + Duration::from_millis(1200));
                 }
             }
         }
