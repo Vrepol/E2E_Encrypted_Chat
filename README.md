@@ -66,7 +66,7 @@ cargo run --bin MistV-server -- --port 6655 -k "Password"
 ### 3. 启动客户端
 
 ```bash
-cargo run --bin mistv-client
+cargo run --bin MistV-client
 ```
 
 或者：
