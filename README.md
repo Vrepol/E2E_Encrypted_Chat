@@ -9,8 +9,8 @@
 ### 1. 编译
 
 ```bash
-git clone https://github.com/Vrepol/MISTV.git
-cd MISTV
+git clone https://github.com/Vrepol/E2E_Encrypted_Chat.git
+cd E2E_Encrypted_Chat
 cargo build --release
 ```
 
