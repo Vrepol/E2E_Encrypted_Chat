@@ -1291,6 +1291,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "mistv"
+version = "0.9.3"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "base64",
+ "chacha20",
+ "chacha20poly1305",
+ "chrono",
+ "cipher",
+ "clap",
+ "colored",
+ "cpal",
+ "crossbeam-channel",
+ "crossterm",
+ "fake",
+ "futures-util",
+ "hex",
+ "hkdf",
+ "hmac",
+ "image",
+ "md-5",
+ "once_cell",
+ "open",
+ "rand 0.9.1",
+ "regex",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "supports-color",
+ "tempfile",
+ "textwrap",
+ "tokio",
+ "tui",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "uuid",
+ "windows 0.52.0",
+ "winresource",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "ndk"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1897,50 +1941,6 @@ checksum = "a7cc970b249fbe527d6e02e0a227762c9108b2f49d81094fe357ffc6d14d7f6f"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "rust_chat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "base64",
- "chacha20",
- "chacha20poly1305",
- "chrono",
- "cipher",
- "clap",
- "colored",
- "cpal",
- "crossbeam-channel",
- "crossterm",
- "fake",
- "futures-util",
- "hex",
- "hkdf",
- "hmac",
- "image",
- "md-5",
- "once_cell",
- "open",
- "rand 0.9.1",
- "regex",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "supports-color",
- "tempfile",
- "textwrap",
- "tokio",
- "tui",
- "unicode-segmentation",
- "unicode-width 0.2.0",
- "uuid",
- "windows 0.52.0",
- "winresource",
- "x25519-dalek",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+pub mod banner;
 pub mod clipboard;
 pub mod help;
 pub mod keyboard;

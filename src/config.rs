@@ -13,7 +13,7 @@ pub const CLIENT_SERVER_PRESETS: &[PresetServer] = &[
     },
     PresetServer {
         name: "Tailscale server",
-        addr: "100.100.100.100:6655",
+        addr: "1.1.1.1:6655",
     },
 ];
 

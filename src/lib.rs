@@ -20,18 +20,16 @@ mod tests {
     use crate::client::receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState};
     use crate::crypto::{
         create_invitation, create_invite_blob, decrypt_message, encrypt_message, open_invite_blob,
-        parse_invitation, proposer_order, random_group_secret_epoch_0,
-        random_test_epoch_secret, unwrap_epoch_secret_from_commit, GroupCryptoState,
-        RoomCryptoState, SecureMessageType,
+        parse_invitation, proposer_order, random_group_secret_epoch_0, random_test_epoch_secret,
+        unwrap_epoch_secret_from_commit, GroupCryptoState, RoomCryptoState, SecureMessageType,
     };
     use crate::protocol::{
         build_ack_line, build_epoch_commit_line, build_file_chunk2_line, build_file_manifest2_line,
         build_local_echo_attachment_line, build_local_echo_text_line,
         build_local_invite_request_line, build_member_list_line, build_rmsg_line,
-        build_transport_packet_line, parse_ack_line, parse_local_invite_request_line,
-        decrypt_file_chunk2, parse_attachment_frame, parse_local_ui_event, parse_rmsg_line,
-        parse_transport_packet_line, AttachmentFrame, AttachmentKind, LocalUiEvent,
-        MemberIdentity,
+        build_transport_packet_line, decrypt_file_chunk2, parse_ack_line, parse_attachment_frame,
+        parse_local_invite_request_line, parse_local_ui_event, parse_rmsg_line,
+        parse_transport_packet_line, AttachmentFrame, AttachmentKind, LocalUiEvent, MemberIdentity,
     };
     use crate::ui::{
         clipboard::{normalize_clipboard_rgba, parse_clipboard_file_paths},
@@ -99,8 +97,12 @@ mod tests {
     #[test]
     fn test_rmsg_line_round_trip() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice =
-            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
+        let mut alice = active_test_state(
+            &room_crypto,
+            "alice-id",
+            "alice",
+            random_test_epoch_secret(),
+        );
         alice
             .replace_members([
                 ("alice-id".to_string(), "alice".to_string()),
@@ -347,8 +349,12 @@ mod tests {
     #[test]
     fn test_epoch_commit_aad_rejects_context_swap() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice =
-            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
+        let mut alice = active_test_state(
+            &room_crypto,
+            "alice-id",
+            "alice",
+            random_test_epoch_secret(),
+        );
         let bob = pending_test_state(&room_crypto, "bob-id", "bob");
         let roster = [
             ("alice-id".to_string(), "alice".to_string()),
@@ -391,8 +397,12 @@ mod tests {
     #[test]
     fn test_x25519_rotates_after_epoch() {
         let room_crypto = RoomCryptoState::from_room_credential("room-a", "room-password");
-        let mut alice =
-            active_test_state(&room_crypto, "alice-id", "alice", random_test_epoch_secret());
+        let mut alice = active_test_state(
+            &room_crypto,
+            "alice-id",
+            "alice",
+            random_test_epoch_secret(),
+        );
         let mut bob = pending_test_state(&room_crypto, "bob-id", "bob");
         let first_roster = [
             ("alice-id".to_string(), "alice".to_string()),
@@ -1324,7 +1334,7 @@ mod tests {
 
     #[test]
     fn test_parse_clipboard_file_paths_rejects_mixed_lines() {
-        let temp_path = std::env::temp_dir().join("rust_chat_clipboard_test.txt");
+        let temp_path = std::env::temp_dir().join("mistv_clipboard_test.txt");
         std::fs::write(&temp_path, b"ok").expect("temp file should be created");
 
         let mixed = format!("{}\nnot-a-real-path", temp_path.display());
@@ -1335,8 +1345,8 @@ mod tests {
 
     #[test]
     fn test_parse_clipboard_file_paths_accepts_all_valid_absolute_paths() {
-        let path_a = std::env::temp_dir().join("rust_chat_clipboard_test_a.txt");
-        let path_b = std::env::temp_dir().join("rust_chat_clipboard_test_b.txt");
+        let path_a = std::env::temp_dir().join("mistv_clipboard_test_a.txt");
+        let path_b = std::env::temp_dir().join("mistv_clipboard_test_b.txt");
         std::fs::write(&path_a, b"a").expect("temp file A should be created");
         std::fs::write(&path_b, b"b").expect("temp file B should be created");
 

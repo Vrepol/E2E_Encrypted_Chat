@@ -7,7 +7,10 @@ use rand::{distr::Alphanumeric, Rng};
 
 use crate::protocol::{build_member_list_line, MemberIdentity};
 
-use super::broadcast::{new_room_broadcast, RoomBroadcast, ServerEvent};
+use super::{
+    broadcast::{new_room_broadcast, RoomBroadcast, ServerEvent},
+    logging::ServerLogger,
+};
 
 pub(crate) struct RoomInfo {
     pub(crate) broadcast: RoomBroadcast,
@@ -25,10 +28,18 @@ pub(crate) struct RoomGuard {
     pub(crate) member_id: String,
     pub(crate) nickname: String,
     pub(crate) broadcast: RoomBroadcast,
+    pub(crate) logger: ServerLogger,
 }
 
 impl Drop for RoomGuard {
     fn drop(&mut self) {
+        self.logger.info(
+            "room",
+            format!(
+                "member left room={} member_id={} nickname={}",
+                self.room_id, self.member_id, self.nickname
+            ),
+        );
         let _ = self.broadcast.high_tx.send(ServerEvent::Plain {
             source_member_id: None,
             plain: format!("⚡ [{}] left.", self.nickname),
@@ -41,8 +52,10 @@ impl Drop for RoomGuard {
                 info.owner_member_id = None;
                 info.owner_capability = None;
             }
-            broadcast_member_list(info);
+            broadcast_member_list(&self.room_id, info, &self.logger);
             if info.members.is_empty() {
+                self.logger
+                    .info("room", format!("room removed room={}", self.room_id));
                 map.remove(&self.room_id);
             }
         }
@@ -113,7 +126,7 @@ pub(crate) fn add_invited_member(
     Some(info.broadcast.clone())
 }
 
-pub(crate) fn broadcast_member_list(info: &RoomInfo) {
+pub(crate) fn broadcast_member_list(room_id: &str, info: &RoomInfo, logger: &ServerLogger) {
     let mut members = info
         .members
         .iter()
@@ -127,6 +140,18 @@ pub(crate) fn broadcast_member_list(info: &RoomInfo) {
             .cmp(&b.nickname)
             .then_with(|| a.member_id.cmp(&b.member_id))
     });
+    logger.info(
+        "room",
+        format!(
+            "broadcast member_list room={} members={}",
+            room_id,
+            members
+                .iter()
+                .map(|member| member.nickname.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
     let _ = info.broadcast.high_tx.send(ServerEvent::Plain {
         source_member_id: None,
         plain: build_member_list_line(&members),
@@ -140,7 +165,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use super::{add_invited_member, create_room, join_room, RoomGuard, Rooms};
+    use super::{add_invited_member, create_room, join_room, RoomGuard, Rooms, ServerLogger};
 
     fn rooms() -> Rooms {
         Arc::new(Mutex::new(HashMap::new()))
@@ -221,6 +246,7 @@ mod tests {
                 member_id: "alice-id".to_string(),
                 nickname: "alice".to_string(),
                 broadcast: broadcast.clone(),
+                logger: ServerLogger::stdout_only(),
             };
             drop(guard);
         }
@@ -238,6 +264,7 @@ mod tests {
             member_id: "bob-id".to_string(),
             nickname: "bob".to_string(),
             broadcast,
+            logger: ServerLogger::stdout_only(),
         };
         drop(guard);
 

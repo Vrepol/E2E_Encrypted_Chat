@@ -23,6 +23,7 @@ use crate::{
         build_file_chunk2_line, build_file_manifest2_line, build_local_echo_attachment_line,
         build_local_notice_line, build_local_transfer_begin_line, build_local_transfer_done_line,
         build_local_transfer_failed_line, build_local_transfer_progress_line, build_rmsg_line,
+        AttachmentKind,
     },
     transport::packet::{
         send_transport_payload_now, AckRegistry, PACKET_ACK_TIMEOUT_MS, PACKET_RETRY_LIMIT,
@@ -41,15 +42,16 @@ struct AttachmentContext {
 }
 
 pub struct AttachmentJob {
-    pub path: PathBuf,
+    pub source: AttachmentSource,
+    pub source_label: String,
     pub transfer_id: String,
     pub file_name: String,
+    pub kind: AttachmentKind,
     pub total_size: u64,
     pub total_chunks: usize,
     pub sha256_hex: String,
     pub next_chunk_index: usize,
     pub acked_chunks: usize,
-    pub file: File,
     pub meta_sent: bool,
     pub meta_packet_id: String,
     pub manifest_plain_line: Option<String>,
@@ -77,8 +79,53 @@ pub struct InFlightChunk {
     pub last_sent_at: Instant,
 }
 
+pub enum AttachmentSource {
+    File { path: PathBuf, file: File },
+    Memory { bytes: Vec<u8>, offset: usize },
+}
+
+impl AttachmentSource {
+    async fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize> {
+        match self {
+            Self::File { file, .. } => Ok(file.read(buf).await?),
+            Self::Memory { bytes, offset } => {
+                let remaining = bytes.len().saturating_sub(*offset);
+                let read = remaining.min(buf.len());
+                buf[..read].copy_from_slice(&bytes[*offset..*offset + read]);
+                *offset += read;
+                Ok(read)
+            }
+        }
+    }
+
+    async fn bytes_for_echo(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::File { path, .. } => Ok(tokio::fs::read(path).await?),
+            Self::Memory { bytes, .. } => Ok(bytes.clone()),
+        }
+    }
+}
+
+pub enum QueuedAttachment {
+    Path(PathBuf),
+    Memory {
+        file_name: String,
+        bytes: Vec<u8>,
+        kind: AttachmentKind,
+    },
+}
+
+impl QueuedAttachment {
+    fn label(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::Memory { file_name, .. } => file_name.clone(),
+        }
+    }
+}
+
 pub struct PreparingUpload {
-    pub path: PathBuf,
+    pub label: String,
     pub task: JoinHandle<Result<AttachmentJob>>,
 }
 
@@ -89,7 +136,7 @@ pub async fn pump_attachment_upload(
     group_crypto: &Arc<StdMutex<GroupCryptoState>>,
     transport: &Arc<StdMutex<TransportCrypto>>,
     ack_registry: Arc<AckRegistry>,
-    pending_uploads: &mut VecDeque<PathBuf>,
+    pending_uploads: &mut VecDeque<QueuedAttachment>,
     preparing_upload: &mut Option<PreparingUpload>,
     active_upload: &mut Option<AttachmentJob>,
     attachment_store: Arc<AttachmentStore>,
@@ -118,7 +165,7 @@ pub async fn pump_attachment_upload(
                     net_tx
                         .send(build_local_notice_line(&format!(
                             "附件初始化失败 {}: {err}",
-                            preparing.path.display()
+                            preparing.label
                         )))
                         .ok();
                 }
@@ -126,7 +173,7 @@ pub async fn pump_attachment_upload(
                     net_tx
                         .send(build_local_notice_line(&format!(
                             "附件初始化任务失败 {}: {err}",
-                            preparing.path.display()
+                            preparing.label
                         )))
                         .ok();
                 }
@@ -136,13 +183,13 @@ pub async fn pump_attachment_upload(
             }
         }
 
-        let Some(path) = pending_uploads.pop_front() else {
+        let Some(item) = pending_uploads.pop_front() else {
             return;
         };
-        let prep_path = path.clone();
+        let label = item.label();
         *preparing_upload = Some(PreparingUpload {
-            path,
-            task: tokio::spawn(async move { initialize_attachment_job_owned(prep_path).await }),
+            label,
+            task: tokio::spawn(async move { initialize_attachment_job(item).await }),
         });
         return;
     }
@@ -215,6 +262,17 @@ pub async fn pump_attachment_upload(
     }
 }
 
+pub async fn initialize_attachment_job(item: QueuedAttachment) -> Result<AttachmentJob> {
+    match item {
+        QueuedAttachment::Path(path) => initialize_attachment_job_owned(path).await,
+        QueuedAttachment::Memory {
+            file_name,
+            bytes,
+            kind,
+        } => initialize_memory_attachment_job(file_name, bytes, kind).await,
+    }
+}
+
 pub async fn initialize_attachment_job_owned(path: PathBuf) -> Result<AttachmentJob> {
     let metadata = tokio::fs::metadata(&path).await?;
     if !metadata.is_file() {
@@ -237,19 +295,65 @@ pub async fn initialize_attachment_job_owned(path: PathBuf) -> Result<Attachment
     rand::rng().fill_bytes(&mut nonce_base);
 
     Ok(AttachmentJob {
+        source_label: path.display().to_string(),
+        source: AttachmentSource::File {
+            path: path.clone(),
+            file,
+        },
         meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
         manifest_plain_line: None,
         manifest_secure_line: None,
         manifest_context: None,
-        path,
         transfer_id,
         file_name,
+        kind: infer_attachment_kind(&path),
         total_size,
         total_chunks,
         sha256_hex,
         next_chunk_index: 0,
         acked_chunks: 0,
-        file,
+        meta_sent: false,
+        meta_attempts: 0,
+        meta_last_sent_at: None,
+        file_key,
+        nonce_base,
+        in_flight: Vec::new(),
+    })
+}
+
+pub async fn initialize_memory_attachment_job(
+    file_name: String,
+    bytes: Vec<u8>,
+    kind: AttachmentKind,
+) -> Result<AttachmentJob> {
+    let total_size = u64::try_from(bytes.len())?;
+    let total_chunks = if bytes.is_empty() {
+        0
+    } else {
+        bytes.len().div_ceil(ATTACHMENT_CHUNK_SIZE)
+    };
+    let sha256_hex = hash_bytes(&bytes);
+    let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+    let mut file_key = [0u8; 32];
+    let mut nonce_base = [0u8; 8];
+    rand::rng().fill_bytes(&mut file_key);
+    rand::rng().fill_bytes(&mut nonce_base);
+
+    Ok(AttachmentJob {
+        source_label: file_name.clone(),
+        source: AttachmentSource::Memory { bytes, offset: 0 },
+        meta_packet_id: packet_id_for_attachment_meta(&transfer_id),
+        manifest_plain_line: None,
+        manifest_secure_line: None,
+        manifest_context: None,
+        transfer_id,
+        file_name,
+        kind,
+        total_size,
+        total_chunks,
+        sha256_hex,
+        next_chunk_index: 0,
+        acked_chunks: 0,
         meta_sent: false,
         meta_attempts: 0,
         meta_last_sent_at: None,
@@ -316,7 +420,7 @@ async fn process_attachment_meta(
                     context.epoch,
                     &context.sender_id,
                     &job.transfer_id,
-                    infer_attachment_kind(&job.path),
+                    job.kind,
                     &job.file_name,
                     job.total_size,
                     job.total_chunks,
@@ -405,11 +509,11 @@ async fn process_attachment_window(
             .ok_or_else(|| anyhow!("Attachment manifest context is unavailable"))?;
         let chunk_index = job.next_chunk_index;
         let mut buf = vec![0u8; ATTACHMENT_CHUNK_SIZE];
-        let read = job.file.read(&mut buf).await?;
+        let read = job.source.read_chunk(&mut buf).await?;
         if read == 0 {
             return Err(anyhow!(
                 "Unexpected EOF while reading attachment {}",
-                job.file_name
+                job.source_label
             ));
         }
 
@@ -450,14 +554,14 @@ async fn emit_local_attachment_echo(
     attachment_store: &AttachmentStore,
     job: &AttachmentJob,
 ) -> Result<()> {
-    let bytes = tokio::fs::read(&job.path).await?;
+    let bytes = job.source.bytes_for_echo().await?;
     let attachment_id = attachment_store.store_attachment(&job.file_name, &bytes)?;
     net_tx
         .send(build_local_echo_attachment_line(
             &attachment_id,
             &job.file_name,
             job.total_size,
-            infer_attachment_kind(&job.path),
+            job.kind,
         ))
         .ok();
     Ok(())
@@ -477,4 +581,54 @@ async fn hash_file(path: &Path) -> Result<String> {
     }
 
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{initialize_memory_attachment_job, ATTACHMENT_CHUNK_SIZE};
+    use crate::protocol::AttachmentKind;
+    use sha2::Digest as _;
+
+    #[tokio::test]
+    async fn memory_attachment_job_reads_from_memory_without_path() {
+        let payload = vec![7u8; ATTACHMENT_CHUNK_SIZE + 3];
+        let expected_hash = hex::encode(sha2::Sha256::digest(&payload));
+        let mut job = initialize_memory_attachment_job(
+            "clipboard.png".to_string(),
+            payload.clone(),
+            AttachmentKind::Image,
+        )
+        .await
+        .expect("memory attachment should initialize");
+
+        assert_eq!(job.file_name, "clipboard.png");
+        assert_eq!(job.kind, AttachmentKind::Image);
+        assert_eq!(job.total_size, payload.len() as u64);
+        assert_eq!(job.total_chunks, 2);
+        assert_eq!(job.sha256_hex, expected_hash);
+
+        let mut first = vec![0u8; ATTACHMENT_CHUNK_SIZE];
+        let read = job
+            .source
+            .read_chunk(&mut first)
+            .await
+            .expect("first chunk should read");
+        assert_eq!(read, ATTACHMENT_CHUNK_SIZE);
+        assert_eq!(&first, &payload[..ATTACHMENT_CHUNK_SIZE]);
+
+        let mut second = vec![0u8; ATTACHMENT_CHUNK_SIZE];
+        let read = job
+            .source
+            .read_chunk(&mut second)
+            .await
+            .expect("second chunk should read");
+        assert_eq!(read, 3);
+        assert_eq!(&second[..3], &payload[ATTACHMENT_CHUNK_SIZE..]);
+    }
 }

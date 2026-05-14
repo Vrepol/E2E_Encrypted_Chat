@@ -1,19 +1,28 @@
-use std::{net::TcpListener as StdTcpListener, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
-use rust_chat::{
+use mistv::{
     attachments::store::AttachmentStore,
     client::{
         handshake, network,
         receiver::{drain_messages, ChatMessage, ReceiverState, TransferUiState},
-        session::SharedGroupCrypto,
+        session::{ConnectedSession, SharedGroupCrypto},
     },
     protocol::{
         build_epoch_commit_line, build_key_announce_line, build_local_invite_request_line,
         MemberIdentity,
     },
+    transport::packet::send_transport_payload_now,
 };
 use tempfile::TempDir;
+use tokio::{
+    io::{BufReader, Lines},
+    net::tcp::OwnedReadHalf,
+};
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 
 struct TestClient {
@@ -30,6 +39,56 @@ struct TestClient {
     username: String,
     room_id: String,
     owner_capability: Option<String>,
+}
+
+struct LogOnlyClient {
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    transport: std::sync::Arc<std::sync::Mutex<mistv::crypto::TransportCrypto>>,
+    _lines: Lines<BufReader<OwnedReadHalf>>,
+}
+
+impl LogOnlyClient {
+    async fn connect(
+        server_addr: &str,
+        password: &str,
+        nickname: &str,
+        room_id: &str,
+        room_credential: &str,
+        action: &'static str,
+    ) -> Result<Self> {
+        let ConnectedSession {
+            lines,
+            writer,
+            transport,
+            ..
+        } = handshake::connect_for_test(
+            server_addr,
+            password,
+            nickname,
+            room_id,
+            room_credential,
+            action,
+        )
+        .await?;
+
+        Ok(Self {
+            writer,
+            transport,
+            _lines: lines,
+        })
+    }
+
+    async fn send_secure_log_line(&mut self, packet_id: &str, note: &str) -> Result<()> {
+        let payload = format!("/RMSG synthetic::{note}");
+        send_transport_payload_now(&mut self.writer, packet_id, &payload, &self.transport).await
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        self.writer.shutdown().await?;
+        Ok(())
+    }
 }
 
 impl TestClient {
@@ -100,7 +159,7 @@ impl TestClient {
                 return;
             };
             let announce_line = build_key_announce_line(&guard.local_key_announce()).ok();
-            let local_commit = guard.build_join_epoch_commit().ok().flatten();
+            let local_commit = guard.build_pending_epoch_commit().ok().flatten();
             let commit_line = local_commit
                 .as_ref()
                 .and_then(|commit| build_epoch_commit_line(commit).ok());
@@ -117,7 +176,11 @@ impl TestClient {
 
         if let Some(commit) = local_commit {
             if let Ok(mut guard) = self.group_crypto.lock() {
-                let _ = guard.apply_epoch_commit(&commit);
+                if guard.apply_epoch_commit(&commit).ok() == Some(true) {
+                    if let Ok(line) = build_key_announce_line(&guard.local_key_announce()) {
+                        self.out_tx.send(line).ok();
+                    }
+                }
             }
         }
     }
@@ -182,32 +245,47 @@ impl TestClient {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("ephemeral port should bind");
-    listener
-        .local_addr()
-        .expect("local addr should exist")
-        .port()
+async fn spawn_server(password: &str) -> (u16, JoinHandle<()>) {
+    spawn_server_with_log(password, None).await
 }
 
-async fn spawn_server(password: &str) -> (u16, JoinHandle<()>) {
-    let port = free_port();
+async fn spawn_server_with_log(password: &str, log_path: Option<PathBuf>) -> (u16, JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral listener should bind");
+    let port = listener
+        .local_addr()
+        .expect("local addr should exist")
+        .port();
     let password = password.to_string();
     let task = tokio::spawn(async move {
-        let _ = rust_chat::server::app::run(port, password).await;
+        let result = match log_path {
+            Some(path) => {
+                mistv::server::app::run_with_listener_and_log_file(listener, password, path).await
+            }
+            None => mistv::server::app::run_with_listener(listener, password).await,
+        };
+        let _ = result;
     });
 
-    for _ in 0..40 {
+    let mut ready = false;
+    for _ in 0..100 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
         {
+            ready = true;
             break;
         }
         sleep(Duration::from_millis(50)).await;
     }
+    assert!(ready, "server on port {port} did not become ready");
 
     (port, task)
+}
+
+fn test_log_path(name: &str) -> PathBuf {
+    Path::new("target").join("test-logs").join(name)
 }
 
 async fn settle_clients(clients: &mut [&mut TestClient], rounds: usize) {
@@ -352,5 +430,86 @@ async fn invite_code_can_be_used_once() -> Result<()> {
     alice.out_tx.send("//~``~//".to_string()).ok();
     bob.out_tx.send("//~``~//".to_string()).ok();
     server_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn three_clients_chat_saves_server_log() -> Result<()> {
+    let password = "integration-three-pass";
+    let log_path = test_log_path("three-person-chat-server.log");
+    let (port, server_task) = spawn_server_with_log(password, Some(log_path.clone())).await;
+    let server_addr = format!("127.0.0.1:{port}");
+
+    let mut alice = LogOnlyClient::connect(
+        &server_addr,
+        password,
+        "alice",
+        "room-trio",
+        "room-trio-key",
+        "CREATE",
+    )
+    .await?;
+    let mut bob = LogOnlyClient::connect(
+        &server_addr,
+        password,
+        "bob",
+        "room-trio",
+        "room-trio-key",
+        "JOIN",
+    )
+    .await?;
+    let mut carol = LogOnlyClient::connect(
+        &server_addr,
+        password,
+        "carol",
+        "room-trio",
+        "room-trio-key",
+        "JOIN",
+    )
+    .await?;
+
+    sleep(Duration::from_millis(300)).await;
+
+    alice
+        .send_secure_log_line("msg-alice-1", "alice:早上好，今天先测一下三人群聊链路。")
+        .await?;
+    sleep(Duration::from_millis(150)).await;
+    bob.send_secure_log_line(
+        "msg-bob-1",
+        "bob:收到，我这边回一条短消息，确认广播顺序正常。",
+    )
+    .await?;
+    sleep(Duration::from_millis(150)).await;
+    carol
+        .send_secure_log_line(
+            "msg-carol-1",
+            "carol:我会重点看服务器日志里的 join、relay 和 member_list。",
+        )
+        .await?;
+    sleep(Duration::from_millis(150)).await;
+    alice
+        .send_secure_log_line(
+            "msg-alice-2",
+            "alice:第二轮我再发一句，方便后面按时间线排查。",
+        )
+        .await?;
+
+    alice.shutdown().await.ok();
+    bob.shutdown().await.ok();
+    carol.shutdown().await.ok();
+    sleep(Duration::from_millis(300)).await;
+    server_task.abort();
+
+    let log = tokio::fs::read_to_string(&log_path).await?;
+    assert!(log.contains("listening addr=127.0.0.1:"));
+    assert!(log.contains("room=room-trio"));
+    assert!(log.contains("nickname=alice"));
+    assert!(log.contains("nickname=bob"));
+    assert!(log.contains("nickname=carol"));
+    assert!(log.contains("broadcast member_list room=room-trio members=alice, bob, carol"));
+    assert!(log.contains("broadcast from=alice priority=High secure_text_frame"));
+    assert!(log.contains("broadcast from=bob priority=High secure_text_frame"));
+    assert!(log.contains("broadcast from=carol priority=High secure_text_frame"));
+
     Ok(())
 }

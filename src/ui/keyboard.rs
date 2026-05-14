@@ -1,6 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -14,7 +13,10 @@ use super::help::{HELP_TEXT, HELP_TEXT_EN};
 use super::tui::{parse_name_body, selected_message_index, RenderedChatRow};
 use crate::attachments::store::AttachmentStore;
 use crate::client::receiver::ChatMessage;
-use crate::protocol::{build_local_invite_request_line, build_local_notice_line, MemberIdentity};
+use crate::protocol::{
+    build_local_attachment_send_line, build_local_invite_request_line, build_local_notice_line,
+    AttachmentKind, MemberIdentity,
+};
 use crate::ui::clipboard::{
     encode_rgba_as_png, normalize_clipboard_rgba, parse_clipboard_file_paths,
 };
@@ -45,6 +47,7 @@ pub struct KeyCtx<'a> {
     pub attachment_dir: &'a Path,
     pub attachment_store: &'a AttachmentStore,
     pub owner_capability: &'a Option<String>,
+    pub copied_until: &'a mut Option<Instant>,
 }
 
 pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
@@ -81,19 +84,12 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                             return ControlFlow::Continue;
                         }
                     };
-                    let file_path = ctx
-                        .attachment_dir
-                        .join(format!("clipboard_{}.png", Uuid::new_v4().simple()));
-                    match fs::write(&file_path, png_buf) {
-                        Ok(_) => {
-                            let _ = ctx.out_tx.send(file_path.to_string_lossy().to_string());
-                        }
-                        Err(e) => {
-                            let _ = ctx
-                                .out_tx
-                                .send(build_local_notice_line(&format!("写入临时图片失败: {e}")));
-                        }
-                    }
+                    let file_name = format!("clipboard_{}.png", Uuid::new_v4().simple());
+                    let _ = ctx.out_tx.send(build_local_attachment_send_line(
+                        &file_name,
+                        AttachmentKind::Image,
+                        &png_buf,
+                    ));
                 }
                 Ok(ClipData::Files(paths)) => {
                     queue_attachment_paths(ctx.out_tx, &paths);
@@ -111,15 +107,17 @@ pub fn handle_key(key: KeyEvent, ctx: &mut KeyCtx) -> ControlFlow {
                 let (_, _, body) = parse_name_body(&ctx.messages[sel]);
                 if let Err(e) = clipboard::set_text(&body) {
                     eprintln!("⚠️ Failed to paste: {e}");
+                } else {
+                    *ctx.copied_until = Some(Instant::now() + Duration::from_millis(1200));
                 }
             }
         }
 
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let _ = ctx.out_tx.send(HELP_TEXT.to_string());
+            let _ = ctx.out_tx.send(build_local_notice_line(HELP_TEXT));
         }
         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let _ = ctx.out_tx.send(HELP_TEXT_EN.to_string());
+            let _ = ctx.out_tx.send(build_local_notice_line(HELP_TEXT_EN));
         }
 
         KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {

@@ -27,10 +27,12 @@ pub use line::{
     parse_transport_packet_line,
 };
 pub use local_event::{
-    build_local_echo_attachment_line, build_local_echo_text_line, build_local_invite_request_line,
-    build_local_notice_line, build_local_transfer_begin_line, build_local_transfer_done_line,
-    build_local_transfer_failed_line, build_local_transfer_progress_line,
-    parse_local_invite_request_line, parse_local_ui_event, LocalInviteRequest, LocalUiEvent,
+    build_local_attachment_send_line, build_local_echo_attachment_line, build_local_echo_text_line,
+    build_local_invite_request_line, build_local_notice_line, build_local_transfer_begin_line,
+    build_local_transfer_done_line, build_local_transfer_failed_line,
+    build_local_transfer_progress_line, parse_local_attachment_send_line,
+    parse_local_invite_request_line, parse_local_ui_event, LocalAttachmentSend, LocalInviteRequest,
+    LocalUiEvent,
 };
 pub use member::{
     build_member_list_line, member_display_name, parse_member_list_line, MemberIdentity,
@@ -43,14 +45,14 @@ mod tests {
     use super::{
         build_ack_line, build_epoch_commit_line, build_file_chunk2_line, build_file_manifest2_line,
         build_invite_error_line, build_invite_token_line, build_key_announce_line,
-        build_local_echo_attachment_line, build_local_echo_text_line,
-        build_local_invite_request_line, build_member_list_line, build_rmsg_line,
-        build_server_invite_request_line, build_transport_packet_line, parse_ack_line,
-        parse_attachment_frame, parse_epoch_commit_line, parse_invite_error_line,
-        parse_invite_token_line, parse_key_announce_line, parse_local_invite_request_line,
-        parse_local_ui_event, parse_member_list_line, parse_rmsg_line,
-        parse_server_invite_request_line, parse_transport_packet_line, AttachmentFrame,
-        AttachmentKind, LocalUiEvent, MemberIdentity,
+        build_local_attachment_send_line, build_local_echo_attachment_line,
+        build_local_echo_text_line, build_local_invite_request_line, build_member_list_line,
+        build_rmsg_line, build_server_invite_request_line, build_transport_packet_line,
+        parse_ack_line, parse_attachment_frame, parse_epoch_commit_line, parse_invite_error_line,
+        parse_invite_token_line, parse_key_announce_line, parse_local_attachment_send_line,
+        parse_local_invite_request_line, parse_local_ui_event, parse_member_list_line,
+        parse_rmsg_line, parse_server_invite_request_line, parse_transport_packet_line,
+        AttachmentFrame, AttachmentKind, LocalUiEvent, MemberIdentity,
     };
     use crate::crypto::{
         EncryptedMessage, EpochCommit, EpochEventType, MemberKeyAnnounce, SecureMessageHeader,
@@ -199,6 +201,14 @@ mod tests {
         assert_eq!(parsed.room_id, "Public");
         assert_eq!(parsed.room_credential, "");
         assert_eq!(parsed.owner_capability, "owner-cap-1");
+
+        let local_attachment =
+            build_local_attachment_send_line("clipboard.png", AttachmentKind::Image, b"png-bytes");
+        let parsed_attachment = parse_local_attachment_send_line(&local_attachment)
+            .expect("local attachment should parse");
+        assert_eq!(parsed_attachment.file_name, "clipboard.png");
+        assert_eq!(parsed_attachment.kind, AttachmentKind::Image);
+        assert_eq!(parsed_attachment.bytes, b"png-bytes");
     }
 
     #[test]

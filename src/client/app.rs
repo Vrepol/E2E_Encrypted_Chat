@@ -26,8 +26,10 @@ use crate::{
     },
     crypto::{compute_room_safety_state, RoomSafetyState, SafetyTranscript},
     protocol::{build_epoch_commit_line, build_key_announce_line, MemberIdentity},
-    ui::keyboard::{handle_key, ControlFlow, KeyCtx, UndoMgr},
-    ui::tui::{build_chat_rows, chat_inner_width, draw_chat, RenderedChatRow},
+    ui::{
+        keyboard::{handle_key, ControlFlow, KeyCtx, UndoMgr},
+        tui::{build_chat_rows, chat_inner_width, draw_chat, RenderedChatRow},
+    },
 };
 
 #[derive(Debug)]
@@ -45,7 +47,7 @@ enum UiMode {
 pub async fn run() -> Result<()> {
     init_color();
     let username = initial_name()?;
-    let mut server_addr = initial_serveraddr()?;
+    let mut server_addr = initial_serveraddr(&username)?;
 
     loop {
         let (net_tx, mut net_rx) = tokio_mpsc::unbounded_channel::<String>();
@@ -53,7 +55,7 @@ pub async fn run() -> Result<()> {
 
         let session = loop {
             if server_addr.is_empty() {
-                server_addr = initial_serveraddr()?;
+                server_addr = initial_serveraddr(&username)?;
             }
             match handshake::connect_and_login(&server_addr, &username).await {
                 Ok(session) => break session,
@@ -142,10 +144,14 @@ pub async fn run() -> Result<()> {
         let mut cursor = 0usize;
         let mut list_state = ListState::default();
         let mut undo_mgr = UndoMgr::new();
+        let mut copied_until: Option<Instant> = None;
         let mut chat_rows: Vec<RenderedChatRow>;
         trigger_phase2_actions(&out_tx, &ui_group_crypto);
 
         'ui: loop {
+            if copied_until.is_some_and(|until| until <= Instant::now()) {
+                copied_until = None;
+            }
             let size = terminal.size()?;
             chat_rows = build_chat_rows(&messages, chat_inner_width(size), &username);
             if let Some(selected) = list_state.selected() {
@@ -171,6 +177,7 @@ pub async fn run() -> Result<()> {
                         &username,
                         &room_id,
                         safety_code.as_deref(),
+                        copied_until.map(|_| "Copied"),
                     ),
                     UiMode::_ImagePreview(_) => {}
                 }
@@ -193,6 +200,7 @@ pub async fn run() -> Result<()> {
                     attachment_dir: room_tempdir.path(),
                     attachment_store: attachment_store.as_ref(),
                     owner_capability: &owner_capability,
+                    copied_until: &mut copied_until,
                 };
                 if let ControlFlow::Quit = handle_key(key, &mut ctx) {
                     break 'ui;
@@ -236,7 +244,7 @@ pub async fn run() -> Result<()> {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         disable_raw_mode()?;
         terminal.show_cursor()?;
-        println!("❌ 退出房间 [{}]", room_id);
+        println!("❌ 退出 Session [{}]", room_id);
         println!(
             "{}",
             "========Press Crtl + C to quit========\n".red().bold()

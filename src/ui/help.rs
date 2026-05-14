@@ -11,7 +11,7 @@ pub const HELP_TEXT: &str = r#"快捷键与命令说明：
 • ←/→          → 移动光标（Ctrl+← 跳3字符，Ctrl+→ 跳至末尾）
 • ↑/↓          → 列表选上下（Ctrl+↑ 跳 5 条，Ctrl+↓ 跳到底部）
 • Tab          → 打开选中行的附件
-• Esc          → 退出房间"#;
+• Esc          → 退出 Session"#;
 
 pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 
@@ -24,7 +24,7 @@ pub const HELP_TEXT_EN: &str = r#"Keyboard Shortcuts and Command Descriptions:
 • ←/→          → Move cursor (Ctrl+← jump 3 characters, Ctrl+→ jump to end)
 • ↑/↓          → Navigate list up/down (Ctrl+↑ jump 5 items, Ctrl+↓ jump to bottom)
 • Tab          → Open the attachment in the selected row
-• Esc          → Exit room"#;
+• Esc          → Exit session"#;
 
 pub fn format_file_size(size: u64) -> String {
     const KB: f64 = 1024.0;

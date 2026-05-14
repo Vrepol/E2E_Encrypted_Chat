@@ -1,4 +1,4 @@
-use std::{collections::HashMap, collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, collections::VecDeque, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use tokio::{
@@ -134,7 +134,7 @@ pub async fn chat_loop(
     let read_invite_registry = invite_registry.clone();
     let read_net_tx = net_tx.clone();
     let read_transport = transport.clone();
-    let mut pending_uploads = VecDeque::<PathBuf>::new();
+    let mut pending_uploads = VecDeque::<sender::QueuedAttachment>::new();
     let mut active_upload = None;
     let mut preparing_upload = None;
 
@@ -253,7 +253,7 @@ async fn handle_outgoing_input(
     transport: SharedTransportCrypto,
     ack_registry: Arc<AckRegistry>,
     invite_registry: Arc<InviteRegistry>,
-    pending_uploads: &mut VecDeque<PathBuf>,
+    pending_uploads: &mut VecDeque<sender::QueuedAttachment>,
 ) -> Result<()> {
     if parse_local_ui_event(text).is_some() {
         net_tx.send(text.to_string()).ok();
@@ -306,7 +306,22 @@ async fn handle_outgoing_input(
             Ok(())
         }
         OutgoingPayload::AttachmentPath(path) => {
-            pending_uploads.push_back(path);
+            pending_uploads.push_back(sender::QueuedAttachment::Path(path));
+            net_tx
+                .send(build_local_notice_line("附件已加入发送队列"))
+                .ok();
+            Ok(())
+        }
+        OutgoingPayload::AttachmentMemory {
+            file_name,
+            bytes,
+            kind,
+        } => {
+            pending_uploads.push_back(sender::QueuedAttachment::Memory {
+                file_name,
+                bytes,
+                kind,
+            });
             net_tx
                 .send(build_local_notice_line("附件已加入发送队列"))
                 .ok();
