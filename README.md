@@ -1,4 +1,4 @@
-# MIST_V
+# MistV
 
 <p align="center">
   <img src="./assets/icon.ico" alt="MIST_V Icon" width="96" />
